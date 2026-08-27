@@ -16,12 +16,14 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 keycode = { workspace = true }
 parking_lot = { workspace = true }
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { workspace = true }
 reis = { workspace = true }
 evdev = { workspace = true }
 zbus = { workspace = true }
+inotify = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { workspace = true }
@@ -29,3 +31,4 @@ core-foundation = { workspace = true }
 objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-app-kit = { workspace = true }
+block2 = "0.6"
