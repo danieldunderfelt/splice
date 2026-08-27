@@ -290,8 +290,11 @@ async fn accept_loop(inner: Arc<NetControlInner>, listener: TcpListener) {
             Ok((sock, remote)) => {
                 let inner = inner.clone();
                 tokio::spawn(async move {
-                    if authorize_inbound(&inner, remote).await {
-                        session::run(inner, sock, session::Role::Listener, None).await;
+                    if let Some(peer_id) = authorize_inbound(&inner, remote).await {
+                        // Bind the transport identity (WhoIs) to the claimed identity
+                        // (Hello.machine.id): a same-user machine cannot impersonate
+                        // another node.
+                        session::run(inner, sock, session::Role::Listener, Some(peer_id)).await;
                     }
                     // Unauthorized: close silently (drop).
                 });
@@ -305,19 +308,14 @@ async fn accept_loop(inner: Arc<NetControlInner>, listener: TcpListener) {
 }
 
 /// WhoIs the remote and authorize against a fresh-enough tailscale status.
-async fn authorize_inbound(inner: &Arc<NetControlInner>, remote: SocketAddr) -> bool {
-    let status = match cached_status(inner).await {
-        Some(s) => s,
-        None => return false,
-    };
-    let who = match inner.ts.whois(remote).await {
-        Ok(w) => w,
-        Err(_) => return false,
-    };
-    matches!(
-        splice_tailscale::authorize(&status, &who),
-        splice_tailscale::AuthDecision::Peer(_)
-    )
+/// Returns the peer's WhoIs identity (StableID) on success.
+async fn authorize_inbound(inner: &Arc<NetControlInner>, remote: SocketAddr) -> Option<MachineId> {
+    let status = cached_status(inner).await?;
+    let who = inner.ts.whois(remote).await.ok()?;
+    match splice_tailscale::authorize(&status, &who) {
+        splice_tailscale::AuthDecision::Peer(id) => Some(MachineId(id)),
+        _ => None,
+    }
 }
 
 /// Tailscale status reused for at most opts.status_ttl (5 s production).

@@ -186,6 +186,12 @@ pub(crate) async fn run(
             if hello.machine.id == self_info.id {
                 return false;
             }
+            // Claimed identity must match the transport identity (WhoIs) when known.
+            if let Some(exp) = &expected {
+                if hello.machine.id != *exp {
+                    return false;
+                }
+            }
             // proto = min(theirs_max, ours_max); refuse only on disjoint ranges.
             let proto = hello.proto_max.min(inner.opts.proto_max);
             if proto < hello.proto_min.max(inner.opts.proto_min) {
