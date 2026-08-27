@@ -1,0 +1,30 @@
+[package]
+name = "splice-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "splice"
+path = "src/main.rs"
+
+[dependencies]
+splice-core = { workspace = true }
+splice-platform = { workspace = true }
+splice-tailscale = { workspace = true }
+splice-proto = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { workspace = true }
+objc2 = { workspace = true }
+objc2-app-kit = { workspace = true }

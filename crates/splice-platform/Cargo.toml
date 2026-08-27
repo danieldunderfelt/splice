@@ -1,0 +1,31 @@
+[package]
+name = "splice-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+splice-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+keycode = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { workspace = true }
+reis = { workspace = true }
+evdev = { workspace = true }
+zbus = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { workspace = true }
+core-foundation = { workspace = true }
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-app-kit = { workspace = true }

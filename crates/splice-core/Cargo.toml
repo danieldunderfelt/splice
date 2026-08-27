@@ -1,0 +1,23 @@
+[package]
+name = "splice-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+splice-proto = { workspace = true }
+splice-platform = { workspace = true }
+splice-tailscale = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
