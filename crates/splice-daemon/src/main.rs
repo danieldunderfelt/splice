@@ -13,9 +13,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let data_dir = splice_core::config::config_dir().context("resolving config dir")?;
-    let platform = splice_platform::create(data_dir.clone())
-        .await
-        .context("initializing platform backend")?;
+    let cfg = splice_core::config::load(&data_dir);
+    let platform = splice_platform::create(splice_platform::PlatformOpts {
+        data_dir: data_dir.clone(),
+        panic_chord: cfg.panic_chord.clone(),
+    })
+    .await
+    .context("initializing platform backend")?;
     let ts = splice_tailscale::Client::discover()
         .await
         .context("connecting to tailscaled (is Tailscale running?)")?;

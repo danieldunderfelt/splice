@@ -17,10 +17,9 @@
 //!   activity.rs  — evdev read-only monitor with inotify hotplug + graceful degrade.
 //!   tokens.rs    — restore-token persistence (atomic write to data_dir/tokens.json).
 
-use crate::{Platform, PlatformError, Result};
-use std::path::PathBuf;
+use crate::{Platform, PlatformError, PlatformOpts, Result};
 
-pub async fn create(_data_dir: PathBuf) -> Result<Platform> {
+pub async fn create(_opts: PlatformOpts) -> Result<Platform> {
     Err(PlatformError::Unavailable(
         "wayland backend not yet implemented".into(),
     ))

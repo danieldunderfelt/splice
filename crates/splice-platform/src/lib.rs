@@ -170,22 +170,32 @@ pub struct Platform {
     pub events: tokio::sync::mpsc::UnboundedReceiver<PlatformEvent>,
 }
 
+/// Options for constructing the platform backend.
+#[derive(Clone, Debug)]
+pub struct PlatformOpts {
+    /// Config directory (portal restore tokens live there).
+    pub data_dir: std::path::PathBuf,
+    /// Panic chord as evdev codes, all held simultaneously. The capture backend detects
+    /// this LOCALLY (must work even if the engine/network is wedged), releases capture,
+    /// then emits [`CaptureEvent::Panic`].
+    pub panic_chord: Vec<u32>,
+}
+
 /// Construct the real platform backend for this OS.
 ///
-/// `data_dir` is the config directory (portal restore tokens live there).
-/// This must be called from the process's main thread on macOS (event tap + run loop init).
-pub async fn create(data_dir: std::path::PathBuf) -> Result<Platform> {
+/// Must be called from the process's main thread on macOS (event tap + run loop init).
+pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     #[cfg(target_os = "macos")]
     {
-        macos::create(data_dir).await
+        macos::create(opts).await
     }
     #[cfg(target_os = "linux")]
     {
-        wayland::create(data_dir).await
+        wayland::create(opts).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = data_dir;
+        let _ = opts;
         Err(PlatformError::Unavailable("unsupported OS".into()))
     }
 }

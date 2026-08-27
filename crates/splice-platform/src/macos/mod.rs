@@ -19,10 +19,9 @@
 //!   ffi.rs      — small extern "C" decls: IOPMAssertion*, CGS SetsCursorInBackground,
 //!                 IsSecureEventInputEnabled, kCGSSessionSecureInputPID lookup.
 
-use crate::{Platform, PlatformError, Result};
-use std::path::PathBuf;
+use crate::{Platform, PlatformError, PlatformOpts, Result};
 
-pub async fn create(_data_dir: PathBuf) -> Result<Platform> {
+pub async fn create(_opts: PlatformOpts) -> Result<Platform> {
     Err(PlatformError::Unavailable(
         "macos backend not yet implemented".into(),
     ))

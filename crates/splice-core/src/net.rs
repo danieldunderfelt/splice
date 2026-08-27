@@ -61,11 +61,11 @@ pub struct PeerHandle {
 /// targets whenever discovery updates.
 pub struct NetManager {
     pub events: mpsc::UnboundedReceiver<PeerEvent>,
-    // implemented by the net agent: internal task handles, dial-target updates, etc.
 }
 
 impl NetManager {
-    /// `self_info` describes this machine for Hellos. `bind_ip` is our tailscale IP.
+    /// `self_info` describes this machine for Hellos (the engine keeps it updated via
+    /// [`NetControl::update_self`]). `bind_ip` is our tailscale IP.
     pub async fn spawn(
         _self_info: splice_proto::MachineInfo,
         _bind_ip: std::net::IpAddr,
@@ -75,11 +75,47 @@ impl NetManager {
     }
 }
 
-/// Engine-side control for the net layer.
+/// Engine-side control for the net layer. Cheap to clone; methods enqueue, never block.
+#[derive(Clone)]
 pub struct NetControl {
-    // implemented by net agent:
-    // - update_dial_targets(Vec<(MachineId, IpAddr)>)
-    // - peer_handle(&MachineId) -> Option<PeerHandle-ish sender>
-    // - broadcast(Frame)
-    // - set_active(MachineId, bool)  // heartbeat cadence hint
+    pub(crate) inner: std::sync::Arc<NetControlInner>,
+}
+
+pub(crate) struct NetControlInner {
+    // implemented by net agent (dial-target set, peer map, self-info cell, …)
+}
+
+impl NetControl {
+    /// Replace the set of peers we should be connected to (from discovery): id + IP.
+    /// The manager dials (respecting the smaller-id-dials rule), redials with backoff
+    /// while a target remains listed, and drops connections to unlisted peers.
+    pub fn update_dial_targets(&self, targets: Vec<(MachineId, std::net::IpAddr)>) {
+        let _ = targets;
+        todo!("implemented by net agent")
+    }
+
+    /// Refresh the MachineInfo used in future Hellos AND broadcast MachineUpdate to
+    /// connected peers (display hotplug).
+    pub fn update_self(&self, info: splice_proto::MachineInfo) {
+        let _ = info;
+        todo!("implemented by net agent")
+    }
+
+    /// Send to one connected peer. Returns false if not connected (frame dropped).
+    pub fn send_to(&self, id: &MachineId, frame: Frame) -> bool {
+        let _ = (id, frame);
+        todo!("implemented by net agent")
+    }
+
+    /// Send to every connected peer.
+    pub fn broadcast(&self, frame: Frame) {
+        let _ = frame;
+        todo!("implemented by net agent")
+    }
+
+    /// Heartbeat cadence hint: active session with this peer → 1 s pings; idle → 5 s.
+    pub fn set_active(&self, id: &MachineId, active: bool) {
+        let _ = (id, active);
+        todo!("implemented by net agent")
+    }
 }
