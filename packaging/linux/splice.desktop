@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Splice
+Exec=splice
+Icon=input-mouse
+Categories=Utility;
+Terminal=false

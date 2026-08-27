@@ -1,0 +1,11 @@
+[Unit]
+Description=Splice software KVM
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/splice
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

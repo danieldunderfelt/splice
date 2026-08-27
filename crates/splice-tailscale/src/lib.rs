@@ -132,27 +132,8 @@ pub fn authorize(status: &Status, who: &WhoIs) -> AuthDecision {
     AuthDecision::Peer(who.node_stable_id.clone())
 }
 
-mod discovery {
-    use super::*;
-
-    pub async fn discover_endpoint() -> Result<Endpoint> {
-        // Implemented by the tailscale agent task; see docs/research/tailscale.md.
-        Err(TsError::Unreachable("endpoint discovery not yet implemented".into()))
-    }
-}
-
-mod http {
-    use super::*;
-
-    pub async fn get_status(_ep: &Endpoint) -> Result<Status> {
-        Err(TsError::Unreachable("not yet implemented".into()))
-    }
-
-    pub async fn get_whois(_ep: &Endpoint, addr: SocketAddr) -> Result<WhoIs> {
-        let _ = addr;
-        Err(TsError::Unreachable("not yet implemented".into()))
-    }
-}
+mod discovery;
+mod http;
 
 #[cfg(test)]
 mod tests {
@@ -174,19 +155,28 @@ mod tests {
         let st = status_with("SELF1", 42);
         let self_who = WhoIs {
             node_stable_id: "SELF1".into(),
-            user: WhoIsUser { id: 42, login_name: "me".into() },
+            user: WhoIsUser {
+                id: 42,
+                login_name: "me".into(),
+            },
         };
         assert_eq!(authorize(&st, &self_who), AuthDecision::RejectSelf);
 
         let foreign = WhoIs {
             node_stable_id: "PEER9".into(),
-            user: WhoIsUser { id: 7, login_name: "someone".into() },
+            user: WhoIsUser {
+                id: 7,
+                login_name: "someone".into(),
+            },
         };
         assert_eq!(authorize(&st, &foreign), AuthDecision::RejectUnknown);
 
         let peer = WhoIs {
             node_stable_id: "PEER9".into(),
-            user: WhoIsUser { id: 42, login_name: "me".into() },
+            user: WhoIsUser {
+                id: 42,
+                login_name: "me".into(),
+            },
         };
         assert_eq!(authorize(&st, &peer), AuthDecision::Peer("PEER9".into()));
     }

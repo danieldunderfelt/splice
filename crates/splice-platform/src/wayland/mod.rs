@@ -17,10 +17,78 @@
 //!   activity.rs  — evdev read-only monitor with inotify hotplug + graceful degrade.
 //!   tokens.rs    — restore-token persistence (atomic write to data_dir/tokens.json).
 
-use crate::{Platform, PlatformError, PlatformOpts, Result};
+mod activity;
+mod capture;
+mod clipboard;
+mod emulate;
+mod portal;
+mod tokens;
 
-pub async fn create(_opts: PlatformOpts) -> Result<Platform> {
-    Err(PlatformError::Unavailable(
-        "wayland backend not yet implemented".into(),
-    ))
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
+
+use tokens::TokenStore;
+
+use crate::{HealthReport, Platform, PlatformError, PlatformEvent, PlatformOpts, Result};
+
+/// State every Wayland submodule needs: the event sink and the health report (which is
+/// only published on transitions, not on every update).
+pub struct WaylandShared {
+    tx: UnboundedSender<PlatformEvent>,
+    health: Mutex<HealthReport>,
+}
+
+impl WaylandShared {
+    pub fn emit(&self, ev: PlatformEvent) {
+        let _ = self.tx.send(ev);
+    }
+
+    /// Applies `f` to the health report and publishes it only if something changed.
+    pub fn set_health(&self, f: impl FnOnce(&mut HealthReport)) {
+        let mut health = self.health.lock();
+        let before = health.clone();
+        f(&mut health);
+        if *health != before {
+            let report = health.clone();
+            drop(health);
+            self.emit(PlatformEvent::Health(report));
+        }
+    }
+}
+
+pub async fn create(opts: PlatformOpts) -> Result<Platform> {
+    let conn = zbus::Connection::session()
+        .await
+        .map_err(|e| PlatformError::Unavailable(format!("no D-Bus session bus: {e}")))?;
+    // Token persistence writes into data_dir; it must exist for first-run consent to stick.
+    let _ = std::fs::create_dir_all(&opts.data_dir);
+    let tokens = Arc::new(TokenStore::load(&opts.data_dir));
+
+    let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let shared = Arc::new(WaylandShared {
+        tx,
+        health: Mutex::new(HealthReport::default()),
+    });
+
+    // emulate before clipboard: RequestClipboard must precede RemoteDesktop Start (that
+    // ordering lives inside emulate's session setup); clipboard consumes the session
+    // watch channel emulate produces.
+    let (emulate, clip_session_rx) =
+        emulate::create(shared.clone(), tokens.clone(), conn.clone());
+    let clipboard = clipboard::create(shared.clone(), conn.clone(), clip_session_rx);
+    let capture = capture::create(shared.clone(), tokens, conn, opts.panic_chord);
+    activity::spawn(shared.clone());
+
+    // Displays start EMPTY: the capture task emits DisplaysChanged with the first
+    // GetZones snapshot once the portal session is up — that can require user consent,
+    // so create() must not block on it. The engine reacts to the event.
+    Ok(Platform {
+        capture,
+        emulate,
+        clipboard,
+        displays: Vec::new(),
+        events,
+    })
 }
