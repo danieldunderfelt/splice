@@ -122,9 +122,10 @@ pub struct Inner {
     target_ledger: HeldLedger,
     /// Links over enabled+reachable machines (arming/crossing decisions).
     links: Vec<EdgeLink>,
-    /// Links over all enabled machines (UI edge strips, crossable or not).
+    /// Geometric links over every placed machine, independent of temporary
+    /// enabled/connectivity state. These keep OS capture barriers stable.
     geo_links: Vec<EdgeLink>,
-    /// Outgoing links, index-aligned with the armed EdgeSpec ids.
+    /// Outgoing geometric links, index-aligned with the armed EdgeSpec ids.
     armed: Vec<EdgeLink>,
     health: HealthReport,
     tailscale_error: Option<String>,
@@ -448,6 +449,12 @@ impl Inner {
                 self.on_clipboard_changed(mimes, inline_text);
             }
             PlatformEvent::DisplaysChanged { displays } => {
+                tracing::info!(
+                    machine = %self.self_info.id,
+                    hostname = %self.self_info.hostname,
+                    displays = ?displays,
+                    "local display geometry updated"
+                );
                 self.self_info.displays = displays;
                 if let Some(net) = &self.net {
                     net.update_self(self.self_info.clone());
@@ -464,14 +471,20 @@ impl Inner {
     // ----- focus FSM: source side -----
 
     async fn on_edge_hit(&mut self, edge_id: u32, along: f64) {
-        if self.focus != Focus::Local || !self.cfg.master_enabled {
-            return;
-        }
         let Some(link) = self.armed.get(edge_id as usize).cloned() else {
+            self.reject_edge_hit("unknown barrier id").await;
             return;
         };
         let target = link.to.clone();
-        if !self.machine_enabled(&target) || !self.peer_usable(&target) {
+        let link_is_active = self.links.iter().any(|candidate| candidate == &link);
+        if self.focus != Focus::Local
+            || !self.cfg.master_enabled
+            || !self.machine_enabled(&self.self_info.id)
+            || !self.machine_enabled(&target)
+            || !self.peer_usable(&target)
+            || !link_is_active
+        {
+            self.reject_edge_hit("edge is not currently crossable").await;
             return;
         }
         self.claim_source();
@@ -483,8 +496,16 @@ impl Inner {
         let pos = layout::clamp_into_displays(&self.displays_of(&target), landing_pos(&link, local));
         self.session += 1;
         self.active_session = self.session;
-        if let Some(net) = &self.net {
-            net.send_to(&target, Frame::Enter { session: self.active_session, pos });
+        let entered = self
+            .net
+            .as_ref()
+            .is_some_and(|net| net.send_to(&target, Frame::Enter {
+                session: self.active_session,
+                pos,
+            }));
+        if !entered {
+            self.reject_edge_hit("peer session disappeared before Enter").await;
+            return;
         }
         let _ = self.capture.begin_capture().await;
         if let Some(net) = &self.net {
@@ -494,6 +515,13 @@ impl Inner {
         self.virtual_pos = pos;
         self.source_ledger = HeldLedger::default();
         self.touch_ui();
+    }
+
+    /// InputCapture activates before the engine can validate replicated state.
+    /// Every rejected activation must therefore explicitly hand the pointer back.
+    async fn reject_edge_hit(&self, reason: &'static str) {
+        tracing::debug!(reason, "releasing rejected edge activation");
+        let _ = self.capture.end_capture(None).await;
     }
 
     async fn on_capture_input(&mut self, ev: InputEvent) {
@@ -579,8 +607,20 @@ impl Inner {
             let landing = layout::clamp_into_displays(&self.displays_of(&next), landing);
             self.session += 1;
             self.active_session = self.session;
+            let entered = self.net.as_ref().is_some_and(|net| {
+                net.send_to(
+                    &next,
+                    Frame::Enter { session: self.active_session, pos: landing },
+                )
+            });
+            if !entered {
+                let _ = self.capture.end_capture(Some(self.last_local_pos)).await;
+                self.focus = Focus::Local;
+                self.source_ledger.drain_releases();
+                self.touch_ui();
+                return;
+            }
             if let Some(net) = &self.net {
-                net.send_to(&next, Frame::Enter { session: self.active_session, pos: landing });
                 net.set_active(&next, true);
             }
             // Capture stays on across the hop.
@@ -659,10 +699,12 @@ impl Inner {
     // ----- source arbitration -----
 
     fn claim_source(&mut self) {
-        // Every physical activity refreshes the claim, even when we already
-        // believe we are source. Two machines can both retain self-claims after
-        // a network interruption; suppressing this broadcast made that split
-        // permanent and caused the target to reject the following Enter frame.
+        // The current claim is explicitly exchanged on every peer connection.
+        // Once we hold it, physical-event bursts do not need to create thousands
+        // of new Lamport values or redraw the UI continuously.
+        if self.claim.as_ref().is_some_and(|c| c.writer == self.self_info.id) {
+            return;
+        }
         self.claim_lamport += 1;
         let stamp = Stamp { lamport: self.claim_lamport, writer: self.self_info.id.clone() };
         self.claim = Some(stamp.clone());
@@ -692,6 +734,12 @@ impl Inner {
     async fn on_peer_event(&mut self, ev: PeerEvent) {
         match ev {
             PeerEvent::Connected { id, hello, caps, .. } => {
+                tracing::info!(
+                    peer = %id,
+                    hostname = %hello.hostname,
+                    displays = ?hello.displays,
+                    "peer connected"
+                );
                 let peer = self.peers.entry(id.clone()).or_default();
                 peer.info = Some(hello);
                 peer.caps = caps;
@@ -749,6 +797,12 @@ impl Inner {
             Frame::LayoutSync(doc) => {
                 self.layout_lamport = self.layout_lamport.max(doc.stamp.lamport);
                 if self.layout.as_ref().is_none_or(|l| doc.stamp > l.stamp) {
+                    tracing::info!(
+                        writer = %doc.stamp.writer,
+                        lamport = doc.stamp.lamport,
+                        machines = ?doc.machines,
+                        "adopting peer layout"
+                    );
                     self.layout = Some(doc);
                     self.mark_cfg_dirty();
                     self.touch_ui();
@@ -756,6 +810,12 @@ impl Inner {
             }
             Frame::MachineUpdate(info) => {
                 let id = info.id.clone();
+                tracing::info!(
+                    peer = %id,
+                    hostname = %info.hostname,
+                    displays = ?info.displays,
+                    "peer display geometry updated"
+                );
                 self.peers.entry(id.clone()).or_default().info = Some(info);
                 self.auto_place(&id);
                 self.touch_ui();
@@ -770,9 +830,17 @@ impl Inner {
                     }
                 }
             }
-            Frame::Leave { .. } => {
+            Frame::Leave { session, reason } => {
                 if self.focus == Focus::Driven(from.clone()) {
                     self.end_driven(&from).await;
+                } else if self.focus == Focus::Remote(from.clone())
+                    && session == self.active_session
+                {
+                    // A target may refuse Enter after observing newer replicated
+                    // state or an emulation failure. Treat that refusal as an
+                    // immediate source-side teardown.
+                    self.end_remote(&from, reason, Some(self.last_local_pos), true)
+                        .await;
                 }
             }
             Frame::ReleaseAll => self.release_target_side().await,
@@ -809,11 +877,18 @@ impl Inner {
     }
 
     async fn on_enter(&mut self, from: MachineId, session: u64, pos: Vec2) {
-        if !self.cfg.master_enabled || matches!(self.focus, Focus::Remote(_)) {
+        if !self.cfg.master_enabled
+            || !self.machine_enabled(&self.self_info.id)
+            || !self.machine_enabled(&from)
+            || !self.peer_usable(&from)
+            || matches!(self.focus, Focus::Remote(_))
+        {
+            self.refuse_enter(&from, session);
             return;
         }
-        // Only the current source holder may drive us; with no claim seen yet, accept.
-        if self.claim.as_ref().is_some_and(|c| c.writer != from) {
+        // Only the current, explicitly replicated source holder may drive us.
+        if !self.claim.as_ref().is_some_and(|c| c.writer == from) {
+            self.refuse_enter(&from, session);
             return;
         }
         if let Focus::Driven(old) = self.focus.clone() {
@@ -823,7 +898,11 @@ impl Inner {
                 self.end_driven(&old).await;
             }
         }
-        let _ = self.emulate.enter(pos).await;
+        if let Err(err) = self.emulate.enter(pos).await {
+            tracing::warn!(source = %from, error = %err, "cannot enter target emulation");
+            self.refuse_enter(&from, session);
+            return;
+        }
         self.focus = Focus::Driven(from.clone());
         self.active_session = session;
         self.target_ledger = HeldLedger::default();
@@ -831,6 +910,15 @@ impl Inner {
             net.set_active(&from, true);
         }
         self.touch_ui();
+    }
+
+    fn refuse_enter(&self, source: &MachineId, session: u64) {
+        if let Some(net) = &self.net {
+            net.send_to(
+                source,
+                Frame::Leave { session, reason: LeaveReason::Reconfigured },
+            );
+        }
     }
 
     // ----- layout doc -----
@@ -1080,67 +1168,90 @@ impl Inner {
 
     // ----- recompute & helpers -----
 
-    /// Recompute links from layout + reachability, tear down remote sessions that
-    /// lost their target, and re-arm capture edges.
+    /// Recompute the derived state from layout + reachability. Focus validity,
+    /// crossable links and OS barriers are all projections of authoritative state.
     async fn recompute(&mut self) {
-        if let Focus::Remote(target) = self.focus.clone() {
-            if !self.cfg.master_enabled
-                || !self.machine_enabled(&target)
-                || !self.peer_usable(&target)
-            {
-                self.end_remote(
-                    &target,
-                    LeaveReason::Reconfigured,
-                    Some(self.last_local_pos),
-                    true,
-                )
-                .await;
-            }
-        }
+        self.reconcile_focus().await;
         let mut geo: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         let mut active: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         if let Some(doc) = &self.layout {
             for (id, placement) in &doc.machines {
-                if !placement.enabled {
-                    continue;
-                }
-                let reachable =
-                    *id == self.self_info.id || self.peer_usable(id);
+                let reachable = *id == self.self_info.id || self.peer_usable(id);
                 let displays = self.displays_of(id);
                 geo.insert(
                     id.clone(),
                     MachineGeom {
                         id: id.clone(),
                         displays: displays.clone(),
-                        placement: placement.clone(),
+                        placement: MachinePlacement {
+                            offset: placement.offset,
+                            // Geometry is deliberately independent of the logical
+                            // enable bit; compute_links filters disabled placements.
+                            enabled: true,
+                        },
                         reachable: true,
                     },
                 );
-                active.insert(
-                    id.clone(),
-                    MachineGeom {
-                        id: id.clone(),
-                        displays,
-                        placement: placement.clone(),
-                        reachable,
-                    },
-                );
+                if placement.enabled {
+                    active.insert(
+                        id.clone(),
+                        MachineGeom {
+                            id: id.clone(),
+                            displays,
+                            placement: placement.clone(),
+                            reachable,
+                        },
+                    );
+                }
             }
         }
         self.geo_links = layout::compute_links(&geo);
         self.links = layout::compute_links(&active);
         self.armed = self
-            .links
+            .geo_links
             .iter()
             .filter(|link| link.from == self.self_info.id)
             .cloned()
             .collect();
-        let specs = if self.cfg.master_enabled && self.focus == Focus::Local {
-            layout::edge_specs_for(&self.links, &self.self_info.id)
-        } else {
-            Vec::new()
-        };
+        // Barrier geometry follows physical placement only. Focus, enable toggles and
+        // peer liveness are enforced above/on EdgeHit and must not recreate a portal
+        // session (v1 portals prompt again for every new session).
+        let specs = layout::edge_specs_for(&self.geo_links, &self.self_info.id);
         let _ = self.capture.set_edges(specs).await;
+    }
+
+    /// Enforce the focus FSM invariants after every command, platform batch and
+    /// replicated peer event. No individual event handler owns special teardown rules.
+    async fn reconcile_focus(&mut self) {
+        match self.focus.clone() {
+            Focus::Local => {}
+            Focus::Remote(target) => {
+                let valid = self.cfg.master_enabled
+                    && self.machine_enabled(&self.self_info.id)
+                    && self.machine_enabled(&target)
+                    && self.peer_usable(&target)
+                    && self.claim.as_ref().is_some_and(|c| c.writer == self.self_info.id);
+                if !valid {
+                    self.end_remote(
+                        &target,
+                        LeaveReason::Reconfigured,
+                        Some(self.last_local_pos),
+                        true,
+                    )
+                    .await;
+                }
+            }
+            Focus::Driven(source) => {
+                let valid = self.cfg.master_enabled
+                    && self.machine_enabled(&self.self_info.id)
+                    && self.machine_enabled(&source)
+                    && self.peer_usable(&source)
+                    && self.claim.as_ref().is_some_and(|c| c.writer == source);
+                if !valid {
+                    self.end_driven(&source).await;
+                }
+            }
+        }
     }
 
     fn peer_usable(&self, id: &MachineId) -> bool {
@@ -1325,7 +1436,8 @@ fn format_chord(codes: &[u32]) -> String {
     let name = |code: u32| match code {
         ev::KEY_LEFTCTRL | ev::KEY_RIGHTCTRL => "Ctrl".to_string(),
         ev::KEY_LEFTALT | ev::KEY_RIGHTALT => "Alt".to_string(),
-        ev::KEY_LEFTSHIFT | ev::KEY_RIGHTSHIFT => "Shift".to_string(),
+        ev::KEY_LEFTSHIFT => "Left Shift".to_string(),
+        ev::KEY_RIGHTSHIFT => "Right Shift".to_string(),
         ev::KEY_LEFTMETA | ev::KEY_RIGHTMETA => "Meta".to_string(),
         ev::KEY_ESC => "Esc".to_string(),
         ev::KEY_DELETE => "Del".to_string(),

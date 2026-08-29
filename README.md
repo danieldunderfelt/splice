@@ -83,7 +83,7 @@ The installer copies the binary to `~/.local/bin/splice` and enables the `app-sp
 
 Splice also synchronizes text and images when **Clipboard sync** is enabled. Use the per-machine pointer-speed controls to adjust remote movement.
 
-Press `Ctrl+Alt+Shift+Escape` to release captured input. You can also choose **Disconnect all** from the app or tray menu.
+Press `Left Shift+Right Shift+Escape` to release captured input. You can also choose **Disconnect all** from the app or tray menu.
 
 ## Test
 

@@ -3525,10 +3525,12 @@ dependencies = [
  "reis",
  "serde",
  "serde_json",
+ "smithay-client-toolkit 0.19.2",
  "splice-proto",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wayland-client",
  "zbus",
 ]
 

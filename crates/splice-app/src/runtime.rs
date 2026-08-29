@@ -384,7 +384,7 @@ pub mod preview {
                 secure_input: Some("1Password".into()),
                 ..HealthReport::default()
             },
-            panic_chord: "Ctrl+Alt+Shift+Esc".into(),
+            panic_chord: "Left Shift+Right Shift+Esc".into(),
             sensitivity: BTreeMap::new(),
             tailscale_error: None,
         };

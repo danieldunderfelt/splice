@@ -21,16 +21,25 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        use splice_platform::keymap::ev;
         Config {
             master_enabled: true,
             clipboard_sync: true,
-            panic_chord: vec![ev::KEY_LEFTCTRL, ev::KEY_LEFTALT, ev::KEY_LEFTSHIFT, ev::KEY_ESC],
+            panic_chord: default_panic_chord(),
             layout: None,
             edge_dwell_ms: 0,
             corner_dead_zone: 16,
         }
     }
+}
+
+fn default_panic_chord() -> Vec<u32> {
+    use splice_platform::keymap::ev;
+    vec![ev::KEY_LEFTSHIFT, ev::KEY_RIGHTSHIFT, ev::KEY_ESC]
+}
+
+fn legacy_panic_chord() -> Vec<u32> {
+    use splice_platform::keymap::ev;
+    vec![ev::KEY_LEFTCTRL, ev::KEY_LEFTALT, ev::KEY_LEFTSHIFT, ev::KEY_ESC]
 }
 
 /// Resolve the Splice config directory (`~/.config/splice` / `~/Library/Application
@@ -45,13 +54,22 @@ pub fn config_dir() -> anyhow::Result<PathBuf> {
 
 pub fn load(dir: &Path) -> Config {
     let path = dir.join("config.json");
-    match std::fs::read(&path) {
+    let mut config = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             tracing::warn!("config.json unreadable ({e}); using defaults");
             Config::default()
         }),
         Err(_) => Config::default(),
+    };
+    // The original default overlaps desktop/session shortcuts and was unreliable
+    // under capture. Preserve custom chords, but migrate that exact shipped value.
+    if config.panic_chord == legacy_panic_chord() {
+        config.panic_chord = default_panic_chord();
+        if let Err(err) = save(dir, &config) {
+            tracing::warn!(error = %err, "cannot persist panic-chord migration");
+        }
     }
+    config
 }
 
 /// Atomic save: write tmp, rename over.
@@ -77,6 +95,25 @@ mod tests {
         save(&dir, &cfg).unwrap();
         let back = load(&dir);
         assert!(!back.clipboard_sync);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrates_only_the_legacy_default_panic_chord() {
+        use splice_platform::keymap::ev;
+        let dir = std::env::temp_dir().join(format!(
+            "splice-config-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.panic_chord = legacy_panic_chord();
+        save(&dir, &cfg).unwrap();
+        assert_eq!(load(&dir).panic_chord, default_panic_chord());
+
+        cfg.panic_chord = vec![ev::KEY_LEFTCTRL, ev::KEY_ESC];
+        save(&dir, &cfg).unwrap();
+        assert_eq!(load(&dir).panic_chord, vec![ev::KEY_LEFTCTRL, ev::KEY_ESC]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

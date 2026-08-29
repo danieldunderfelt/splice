@@ -3,12 +3,12 @@
 //! "aaa"/"bbb" make "aaa" the rule-following dialer; both dial ports are wired
 //! explicitly after each engine reports its bound address.
 
-use splice_core::engine::{Engine, EngineHandle};
+use splice_core::engine::{Command, Engine, EngineHandle};
 use splice_core::net::{NetOpts, TsApi};
 use splice_core::ui_state::{UiConnection, UiFocus};
 use splice_platform::mock::{self, MockHandle};
 use splice_platform::{CaptureEvent, EdgeSide, EdgeSpec, PlatformEvent};
-use splice_proto::{InputEvent, MachineId};
+use splice_proto::{InputEvent, MachineId, Vec2I};
 use splice_tailscale::{Node, Status, TsError, WhoIs, WhoIsUser};
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const USER: u64 = 7;
 const TEXT_MIME: &str = "text/plain;charset=utf-8";
 
@@ -54,12 +53,16 @@ impl TsApi for FakeTs {
 }
 
 fn node(id: &str) -> Node {
+    node_at(id, Ipv4Addr::LOCALHOST)
+}
+
+fn node_at(id: &str, ip: Ipv4Addr) -> Node {
     Node {
         stable_id: id.into(),
         hostname: format!("host-{id}"),
         os: "linux".into(),
         user_id: USER,
-        ips: vec![LOCAL],
+        ips: vec![IpAddr::V4(ip)],
         online: true,
         cur_addr: "127.0.0.1:41641".into(),
         ..Default::default()
@@ -100,15 +103,23 @@ struct Rig {
 }
 
 async fn spawn_rig(id: &str, peer: &Node) -> Rig {
+    spawn_rig_with(node(id), vec![peer.clone()]).await
+}
+
+async fn spawn_rig_with(self_node: Node, peers: Vec<Node>) -> Rig {
     let (platform, mock) = mock::create(mock::one_display());
+    let whois = peers
+        .iter()
+        .filter_map(|peer| peer.ips.first().map(|ip| (*ip, (peer.stable_id.clone(), USER))))
+        .collect();
     let ts = FakeTs {
-        self_node: node(id),
-        peers: vec![peer.clone()],
-        whois: Arc::new(HashMap::from([(LOCAL, (peer.stable_id.clone(), USER))])),
+        self_node: self_node.clone(),
+        peers,
+        whois: Arc::new(whois),
     };
     let opts = test_opts();
     let dial_ports = opts.dial_ports.clone();
-    let dir = temp_dir(id);
+    let dir = temp_dir(&self_node.stable_id);
     let handle = Engine::spawn_with(
         platform,
         Arc::new(ts),
@@ -120,6 +131,49 @@ async fn spawn_rig(id: &str, peer: &Node) -> Rig {
     .expect("spawn engine");
     let addr = handle.bound_addr().await.expect("bootstrap binds a listener");
     Rig { handle, mock, dial_ports, addr }
+}
+
+async fn spawn_trio() -> (Rig, Rig, Rig) {
+    let na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let nc = node_at("ccc", Ipv4Addr::new(127, 0, 0, 3));
+    let a = spawn_rig_with(na.clone(), vec![nb.clone(), nc.clone()]).await;
+    let b = spawn_rig_with(nb.clone(), vec![na.clone(), nc.clone()]).await;
+    let c = spawn_rig_with(nc, vec![na, nb]).await;
+    for (rig, peers) in [
+        (&a, [(&mid("bbb"), &b), (&mid("ccc"), &c)]),
+        (&b, [(&mid("aaa"), &a), (&mid("ccc"), &c)]),
+        (&c, [(&mid("aaa"), &a), (&mid("bbb"), &b)]),
+    ] {
+        let mut ports = rig.dial_ports.write().unwrap();
+        for (id, peer) in peers {
+            ports.insert(id.clone(), peer.addr.port());
+        }
+    }
+    // aaa is lexicographically first and establishes the two hub links needed
+    // for replication. (Loopback cannot model three distinct Tailscale WhoIs
+    // source identities for the optional bbb<->ccc connection.)
+    wait_until("trio hub sessions connect", || {
+        connected_to(&a, "bbb")
+            && connected_to(&a, "ccc")
+            && connected_to(&b, "aaa")
+            && connected_to(&c, "aaa")
+    })
+    .await;
+    a.handle.send(Command::SetPlacement(mid("aaa"), Vec2I { x: 0, y: 0 }));
+    a.handle.send(Command::SetPlacement(mid("bbb"), Vec2I { x: 1920, y: 0 }));
+    a.handle.send(Command::SetPlacement(mid("ccc"), Vec2I { x: 3840, y: 0 }));
+    wait_until("trio layout converges", || {
+        let state = a.handle.state();
+        let state = state.borrow();
+        state.machines.iter().find(|m| m.id == mid("bbb")).is_some_and(|m| {
+            m.offset == Vec2I { x: 1920, y: 0 }
+        }) && state.machines.iter().find(|m| m.id == mid("ccc")).is_some_and(|m| {
+            m.offset == Vec2I { x: 3840, y: 0 }
+        })
+    })
+    .await;
+    (a, b, c)
 }
 
 async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -344,6 +398,118 @@ async fn source_claims_created_before_connection_converge() {
     wait_until("fresh activity makes aaa source everywhere", || {
         a.handle.state().borrow().source == Some(mid("aaa"))
             && b.handle.state().borrow().source == Some(mid("aaa"))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disabling_focused_target_returns_both_sides_to_source_and_keeps_barrier_stable() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+    let barriers = a.mock.state.lock().edges.clone();
+
+    a.handle.send(Command::SetMachineEnabled(mid("bbb"), false));
+    wait_until("disabled target is local on both sides", || {
+        matches!(focus_of(&a), UiFocus::Local)
+            && matches!(focus_of(&b), UiFocus::Local)
+            && !a.mock.state.lock().capturing
+    })
+    .await;
+    wait_until("disable replicated to target", || {
+        b.handle
+            .state()
+            .borrow()
+            .machines
+            .iter()
+            .find(|m| m.id == mid("bbb"))
+            .is_some_and(|m| !m.enabled)
+    })
+    .await;
+    assert_eq!(
+        a.mock.state.lock().edges,
+        barriers,
+        "enable/focus state must not recreate physical portal barriers"
+    );
+}
+
+#[tokio::test]
+async fn disabling_source_ends_the_whole_two_machine_session() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+
+    a.handle.send(Command::SetMachineEnabled(mid("aaa"), false));
+    wait_until("disabled source tears down both roles", || {
+        matches!(focus_of(&a), UiFocus::Local)
+            && matches!(focus_of(&b), UiFocus::Local)
+            && !a.mock.state.lock().capturing
+            && b.mock.state.lock().left >= 1
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_barrier_activation_is_immediately_released() {
+    let (a, _b) = spawn_pair().await;
+    wait_until("A has physical barrier", || !a.mock.state.lock().edges.is_empty()).await;
+    let edge = a.mock.state.lock().edges[0].clone();
+    a.handle.send(Command::SetMachineEnabled(mid("bbb"), false));
+    wait_until("B disabled on A", || {
+        a.handle
+            .state()
+            .borrow()
+            .machines
+            .iter()
+            .find(|m| m.id == mid("bbb"))
+            .is_some_and(|m| !m.enabled)
+    })
+    .await;
+
+    // Model the portal's ordering: it captures first, then reports EdgeHit.
+    a.mock.state.lock().capturing = true;
+    let ends_before = a.mock.state.lock().capture_ends.len();
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+            edge_id: edge.id,
+            along: f64::from(edge.from + edge.to) / 2.0,
+        }))
+        .unwrap();
+    wait_until("rejected activation released", || {
+        let state = a.mock.state.lock();
+        !state.capturing && state.capture_ends.len() > ends_before
+    })
+    .await;
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+}
+
+#[tokio::test]
+async fn disabling_unfocused_third_machine_preserves_active_pair() {
+    let (a, b, c) = spawn_trio().await;
+    drive_a_to_b(&a, &b).await;
+
+    a.handle.send(Command::SetMachineEnabled(mid("ccc"), false));
+    wait_until("third-machine disable converges", || {
+        [&a, &c].iter().all(|rig| {
+            rig.handle
+                .state()
+                .borrow()
+                .machines
+                .iter()
+                .find(|m| m.id == mid("ccc"))
+                .is_some_and(|m| !m.enabled)
+        })
+    })
+    .await;
+    assert!(matches!(focus_of(&a), UiFocus::Remote(id) if id == mid("bbb")));
+    assert!(matches!(focus_of(&b), UiFocus::Driven(id) if id == mid("aaa")));
+    assert!(a.mock.state.lock().capturing);
+
+    // Disabling the focused target still returns focus to the source.
+    a.handle.send(Command::SetMachineEnabled(mid("bbb"), false));
+    wait_until("focused target disable tears down active pair", || {
+        matches!(focus_of(&a), UiFocus::Local)
+            && matches!(focus_of(&b), UiFocus::Local)
+            && !a.mock.state.lock().capturing
     })
     .await;
 }

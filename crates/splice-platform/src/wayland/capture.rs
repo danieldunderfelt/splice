@@ -9,6 +9,7 @@
 //!   so `begin_capture` is a no-op and forwarding starts at `Activated`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -17,7 +18,7 @@ use reis::ei;
 use reis::ei::button::ButtonState;
 use reis::ei::keyboard::KeyState;
 use reis::event::{DeviceCapability, EiEvent};
-use splice_proto::{DisplayRect, InputEvent, PointerButton, Vec2};
+use splice_proto::{InputEvent, PointerButton, Vec2};
 use tokio::sync::{mpsc, Notify};
 use zbus::zvariant::{OwnedFd, Value};
 
@@ -43,6 +44,23 @@ const BTN_LEFT: u32 = 0x110;
 enum Command {
     ApplyEdges(Vec<EdgeSpec>),
     EndCapture { warp_to: Option<Vec2> },
+    Panic,
+}
+
+/// A locally-owned emergency release path used by the physical evdev monitor.
+/// It talks directly to the portal pump and does not depend on the engine/network.
+#[derive(Clone)]
+pub struct PanicRelease {
+    cmd: mpsc::UnboundedSender<Command>,
+    active: Arc<AtomicBool>,
+}
+
+impl PanicRelease {
+    pub fn trigger(&self) {
+        if self.active.load(Ordering::Acquire) {
+            let _ = self.cmd.send(Command::Panic);
+        }
+    }
 }
 
 pub struct WaylandCapture {
@@ -58,6 +76,7 @@ impl Capture for WaylandCapture {
         if *current == edges {
             return Ok(());
         }
+        tracing::info!(edges = ?edges, "capture barrier geometry changed");
         *current = edges;
         drop(current);
         self.edges_dirty.notify_one();
@@ -79,10 +98,11 @@ pub fn create(
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
-) -> Arc<WaylandCapture> {
+) -> (Arc<WaylandCapture>, PanicRelease) {
     let edges = Arc::new(RwLock::new(Vec::new()));
     let edges_dirty = Arc::new(Notify::new());
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let active = Arc::new(AtomicBool::new(false));
 
     {
         let edges = edges.clone();
@@ -105,6 +125,7 @@ pub fn create(
     // callbacks), so the portal/reis pump cannot be tokio::spawn'd. It runs on a
     // dedicated current-thread runtime where block_on needs no Send bound.
     let edges_handle = edges.clone();
+    let active_for_thread = active.clone();
     let _ = std::thread::Builder::new()
         .name("splice-capture".into())
         .spawn(move || {
@@ -118,10 +139,21 @@ pub fn create(
                     return;
                 }
             };
-            rt.block_on(run(shared, tokens, conn, panic_chord, edges, cmd_rx));
+            rt.block_on(run(
+                shared,
+                tokens,
+                conn,
+                panic_chord,
+                edges,
+                active_for_thread,
+                cmd_rx,
+            ));
         });
 
-    Arc::new(WaylandCapture { edges: edges_handle, edges_dirty, cmd })
+    (
+        Arc::new(WaylandCapture { edges: edges_handle, edges_dirty, cmd: cmd.clone() }),
+        PanicRelease { cmd, active },
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -133,17 +165,6 @@ struct Zone {
 }
 
 impl Zone {
-    fn display(&self, index: usize) -> DisplayRect {
-        DisplayRect {
-            id: index.to_string(),
-            x: self.x,
-            y: self.y,
-            w: self.w,
-            h: self.h,
-            scale: 1.0,
-        }
-    }
-
     fn contains(&self, x: f64, y: f64) -> bool {
         let (x0, y0) = (self.x as f64, self.y as f64);
         x >= x0 && x < x0 + self.w as f64 && y >= y0 && y < y0 + self.h as f64
@@ -319,6 +340,11 @@ async fn establish(
         enabled: false,
         applied_edges: Vec::new(),
     };
+    tracing::info!(
+        zone_set = session.zone_set,
+        zones = ?session.zones,
+        "input capture zones discovered"
+    );
     apply_barriers(conn, &mut session, edges).await?;
     Ok(session)
 }
@@ -413,11 +439,21 @@ async fn run(
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
     edges: Arc<RwLock<Vec<EdgeSpec>>>,
+    active: Arc<AtomicBool>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
     // First attempt is immediate; subsequent ones are rate-limited.
     let mut last_recreate = Instant::now() - RECREATE_MIN_INTERVAL;
     loop {
+        // Do not create a v1 InputCapture session until a real adjacent machine
+        // produces a barrier. On GNOME v1, CreateSession itself presents consent.
+        while edges.read().is_empty() {
+            match cmd_rx.recv().await {
+                Some(Command::ApplyEdges(_)) => {}
+                Some(Command::EndCapture { .. } | Command::Panic) => {}
+                None => return,
+            }
+        }
         let since = last_recreate.elapsed();
         if since < RECREATE_MIN_INTERVAL {
             tokio::time::sleep((RECREATE_MIN_INTERVAL - since).max(RECREATE_MIN_BACKOFF)).await;
@@ -428,11 +464,16 @@ async fn run(
         match establish(&conn, &tokens, &current_edges).await {
             Ok(session) => {
                 shared.set_health(|h| h.capture = None);
-                let displays: Vec<DisplayRect> =
-                    session.zones.iter().enumerate().map(|(i, z)| z.display(i)).collect();
-                shared.emit(PlatformEvent::DisplaysChanged { displays });
                 let end =
-                    run_session(&shared, &conn, session, &panic_chord, &edges, &mut cmd_rx)
+                    run_session(
+                        &shared,
+                        &conn,
+                        session,
+                        &panic_chord,
+                        &edges,
+                        active.clone(),
+                        &mut cmd_rx,
+                    )
                         .await;
                 if matches!(end, SessionEnd::Reconfigure) {
                     continue;
@@ -467,8 +508,16 @@ async fn run_session(
     mut session: Session,
     panic_chord: &[u32],
     edges: &Arc<RwLock<Vec<EdgeSpec>>>,
+    active_flag: Arc<AtomicBool>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
 ) -> SessionEnd {
+    struct ClearActive(Arc<AtomicBool>);
+    impl Drop for ClearActive {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _clear_active = ClearActive(active_flag.clone());
     let session_proxy = match portal::session_proxy(conn, &session.session_path).await {
         Ok(p) => p,
         Err(err) => {
@@ -513,6 +562,7 @@ async fn run_session(
                     continue;
                 }
                 let edge_list = edges.read().clone();
+                let activation_id = portal::get::<u32>(&opts, "activation_id").unwrap_or(0);
                 // cursor_position usually overshoots past the barrier; only the
                 // along-axis coordinate is used, clamped to the armed span.
                 let pos = portal::get::<(f64, f64)>(&opts, "cursor_position").unwrap_or((0.0, 0.0));
@@ -522,6 +572,14 @@ async fn run_session(
                 };
                 let Some(edge) = edge else {
                     tracing::warn!("activated with no matching barrier");
+                    capture = Some(ActiveCapture {
+                        activation_id,
+                        forwarding: true,
+                        released: false,
+                    });
+                    active_flag.store(true, Ordering::Release);
+                    release(&session, &mut capture, None).await;
+                    active_flag.store(false, Ordering::Release);
                     continue;
                 };
                 let along = match edge.side {
@@ -530,10 +588,11 @@ async fn run_session(
                 }
                 .clamp(edge.from as f64, (edge.to - 1).max(edge.from) as f64);
                 capture = Some(ActiveCapture {
-                    activation_id: portal::get::<u32>(&opts, "activation_id").unwrap_or(0),
+                    activation_id,
                     forwarding: true,
                     released: false,
                 });
+                active_flag.store(true, Ordering::Release);
                 pressed.clear();
                 shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }));
             }
@@ -548,6 +607,7 @@ async fn run_session(
                     .as_ref()
                     .is_some_and(|c| c.released && Some(c.activation_id) == activation_id);
                 capture = None;
+                active_flag.store(false, Ordering::Release);
                 pressed.clear();
                 if !was_released {
                     shared.emit(PlatformEvent::Capture(CaptureEvent::Broken {
@@ -599,7 +659,17 @@ async fn run_session(
                     }
                     Command::EndCapture { warp_to } => {
                         release(&session, &mut capture, warp_to).await;
+                        active_flag.store(false, Ordering::Release);
                         pressed.clear();
+                    }
+                    Command::Panic => {
+                        if capture.as_ref().is_some_and(|c| c.forwarding) {
+                            tracing::warn!("panic chord pressed");
+                            release(&session, &mut capture, None).await;
+                            active_flag.store(false, Ordering::Release);
+                            pressed.clear();
+                            shared.emit(PlatformEvent::Capture(CaptureEvent::Panic));
+                        }
                     }
                 }
             }

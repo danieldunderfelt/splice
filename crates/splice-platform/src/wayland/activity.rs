@@ -7,7 +7,7 @@
 //! group (docs/linux-setup.md): on EACCES the health report names the fix once and
 //! everything else keeps running.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,7 @@ use inotify::{EventOwned, EventStream, Inotify, WatchMask};
 use tokio::sync::mpsc;
 
 use super::WaylandShared;
+use super::capture::PanicRelease;
 use crate::PlatformEvent;
 
 const INPUT_DIR: &str = "/dev/input";
@@ -30,12 +31,19 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 const HOTPLUG_RETRIES: u32 = 3;
 const HOTPLUG_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-pub fn spawn(shared: Arc<WaylandShared>) {
-    let _ = tokio::spawn(run(shared));
+pub fn spawn(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u32>) {
+    let _ = tokio::spawn(run(shared, panic, panic_chord));
 }
 
-async fn run(shared: Arc<WaylandShared>) {
-    let (activity_tx, mut activity_rx) = mpsc::unbounded_channel::<()>();
+#[derive(Debug)]
+enum PhysicalEvent {
+    Activity,
+    Key { device: PathBuf, code: u32, pressed: bool },
+    DeviceGone(PathBuf),
+}
+
+async fn run(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u32>) {
+    let (activity_tx, mut activity_rx) = mpsc::unbounded_channel::<PhysicalEvent>();
     let eacces_reported = Arc::new(AtomicBool::new(false));
     let mut known: HashSet<PathBuf> = HashSet::new();
 
@@ -55,9 +63,37 @@ async fn run(shared: Arc<WaylandShared>) {
     // Leading-edge debounce: the first event after a quiet period emits immediately,
     // bursts collapse into one event per window.
     let mut last_emit = Instant::now().checked_sub(DEBOUNCE).unwrap_or_else(Instant::now);
+    let mut held: HashMap<PathBuf, HashSet<u32>> = HashMap::new();
+    let mut panic_latched = false;
     loop {
         tokio::select! {
-            _ = activity_rx.recv() => {
+            event = activity_rx.recv() => {
+                let Some(event) = event else { return };
+                match event {
+                    PhysicalEvent::Activity => {}
+                    PhysicalEvent::Key { device, code, pressed } => {
+                        let keys = held.entry(device).or_default();
+                        if pressed {
+                            keys.insert(code);
+                        } else {
+                            keys.remove(&code);
+                        }
+                        let chord_down = !panic_chord.is_empty()
+                            && panic_chord.iter().all(|wanted| {
+                                held.values().any(|keys| keys.contains(wanted))
+                            });
+                        if chord_down && !panic_latched {
+                            panic_latched = true;
+                            panic.trigger();
+                        } else if !chord_down {
+                            panic_latched = false;
+                        }
+                    }
+                    PhysicalEvent::DeviceGone(device) => {
+                        held.remove(&device);
+                        panic_latched = false;
+                    }
+                }
                 let now = Instant::now();
                 if now.duration_since(last_emit) >= DEBOUNCE {
                     last_emit = now;
@@ -122,7 +158,7 @@ fn enumerate() -> Vec<PathBuf> {
 /// permission race on hotplugged nodes.
 fn spawn_reader(
     path: PathBuf,
-    activity: mpsc::UnboundedSender<()>,
+    activity: mpsc::UnboundedSender<PhysicalEvent>,
     shared: &Arc<WaylandShared>,
     eacces_reported: &Arc<AtomicBool>,
     retries: u32,
@@ -172,13 +208,38 @@ fn spawn_reader(
         loop {
             match stream.next_event().await {
                 Ok(ev) => {
-                    if matches!(ev.event_type(), EventType::KEY | EventType::RELATIVE)
-                        && activity.send(()).is_err()
-                    {
-                        return;
+                    match ev.event_type() {
+                        EventType::KEY => {
+                            // value 2 is autorepeat: activity, but not a state transition.
+                            let event = match ev.value() {
+                                0 => Some(PhysicalEvent::Key {
+                                    device: path.clone(),
+                                    code: ev.code() as u32,
+                                    pressed: false,
+                                }),
+                                1 => Some(PhysicalEvent::Key {
+                                    device: path.clone(),
+                                    code: ev.code() as u32,
+                                    pressed: true,
+                                }),
+                                _ => Some(PhysicalEvent::Activity),
+                            };
+                            if event.is_some_and(|event| activity.send(event).is_err()) {
+                                return;
+                            }
+                        }
+                        EventType::RELATIVE => {
+                            if activity.send(PhysicalEvent::Activity).is_err() {
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                Err(_) => return,
+                Err(_) => {
+                    let _ = activity.send(PhysicalEvent::DeviceGone(path.clone()));
+                    return;
+                }
             }
         }
     });

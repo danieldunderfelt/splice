@@ -139,8 +139,11 @@ locally-observed input imply sourceness.
 
 ## Displays / zones
 
-Use portal `GetZones` as the display source of truth (logical pixels; matches barrier space).
-Don't use wl_output. Fractional scale is already applied in logical coords.
+Use `zxdg_output_v1` logical position and size for pre-consent discovery and display hotplug.
+This lets peers target the machine while an InputCapture prompt is open. Portal `GetZones`
+remains the source of truth for release clamping and barrier-space validation once the session
+exists. Do not use legacy `wl_output.geometry` as logical geometry; fractional scale is already
+applied by xdg-output and portal logical coordinates.
 
 ## Gotchas summary
 

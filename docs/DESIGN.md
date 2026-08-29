@@ -59,7 +59,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
 5. **Held-input safety, both sides independently.** Both source and target track held keys/buttons.
    Release everything on: Leave, disconnect, degrade, capture loss, Secure Input start/end, panic
    chord. `Frame::ReleaseAll` exists as a belt-and-braces remote trigger.
-6. **Local panic chord** (default `Ctrl+Alt+Shift+Escape`, configurable): unconditionally ends
+6. **Local panic chord** (default `Left Shift+Right Shift+Escape`, configurable): unconditionally ends
    capture, re-associates the mouse, shows the cursor, sends Leave+ReleaseAll to all peers.
    Handled entirely locally in the capture backend — must work even if networking is wedged.
 7. **Tailscale is discovery + identity + transport.** Host tailscaled (never embedded tsnet).

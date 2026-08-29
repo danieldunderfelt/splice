@@ -6,7 +6,7 @@
 //! (never Disable(), never churn, single-use restore tokens) are load-bearing.
 //!
 //! Structure (implement in these modules):
-//!   capture.rs   — InputCapture session, zones→DisplayRect, EdgeSpec→barriers,
+//!   capture.rs   — InputCapture session, portal zones, EdgeSpec→barriers,
 //!                  Activated/Deactivated/ZonesChanged handling, reis receiver pump,
 //!                  KDE barrier-id fallback, panic-chord detection from captured keys.
 //!   emulate.rs   — RemoteDesktop session + reis sender pump, device management,
@@ -15,12 +15,14 @@
 //!   clipboard.rs — Clipboard portal on the RemoteDesktop session: SetSelection /
 //!                  SelectionOwnerChanged / SelectionRead / SelectionTransfer+Write.
 //!   activity.rs  — evdev read-only monitor with inotify hotplug + graceful degrade.
+//!   displays.rs  — pre-consent xdg-output logical geometry + hotplug monitor.
 //!   tokens.rs    — restore-token persistence (atomic write to data_dir/tokens.json).
 
 mod activity;
 mod capture;
 mod clipboard;
 mod emulate;
+mod displays;
 mod portal;
 mod tokens;
 
@@ -72,23 +74,26 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         health: Mutex::new(HealthReport::default()),
     });
 
+    // xdg-output is available before any portal consent. This breaks the
+    // permission deadlock: peers can see and drive this machine while its
+    // InputCapture dialog is still open.
+    let displays = displays::spawn(shared.clone())?;
+
     // emulate before clipboard: RequestClipboard must precede RemoteDesktop Start (that
     // ordering lives inside emulate's session setup); clipboard consumes the session
     // watch channel emulate produces.
     let (emulate, clip_session_rx) =
         emulate::create(shared.clone(), tokens.clone(), conn.clone());
     let clipboard = clipboard::create(shared.clone(), conn.clone(), clip_session_rx);
-    let capture = capture::create(shared.clone(), tokens, conn, opts.panic_chord);
-    activity::spawn(shared.clone());
+    let (capture, panic_release) =
+        capture::create(shared.clone(), tokens, conn, opts.panic_chord.clone());
+    activity::spawn(shared.clone(), panic_release, opts.panic_chord);
 
-    // Displays start EMPTY: the capture task emits DisplaysChanged with the first
-    // GetZones snapshot once the portal session is up — that can require user consent,
-    // so create() must not block on it. The engine reacts to the event.
     Ok(Platform {
         capture,
         emulate,
         clipboard,
-        displays: Vec::new(),
+        displays,
         events,
     })
 }

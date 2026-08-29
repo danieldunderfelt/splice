@@ -61,7 +61,7 @@ pub struct UiState {
     pub source: Option<MachineId>,
     pub focus: UiFocus,
     pub health: HealthReport,
-    /// Human-readable panic chord, e.g. "Ctrl+Alt+Shift+Esc".
+    /// Human-readable panic chord, e.g. "Left Shift+Right Shift+Esc".
     pub panic_chord: String,
     /// Per-link sensitivity, keyed by LayoutDoc::link_key.
     pub sensitivity: std::collections::BTreeMap<String, f64>,
@@ -80,7 +80,7 @@ impl UiState {
             source: None,
             focus: UiFocus::Local,
             health: HealthReport::default(),
-            panic_chord: "Ctrl+Alt+Shift+Esc".into(),
+            panic_chord: "Left Shift+Right Shift+Esc".into(),
             sensitivity: Default::default(),
             tailscale_error: None,
         }
