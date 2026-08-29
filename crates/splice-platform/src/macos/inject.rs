@@ -192,8 +192,10 @@ impl Core {
     }
 
     fn post_motion(&self, st: &mut State, dx: f64, dy: f64) {
-        let displays = self.shared.displays.read().clone();
-        st.pos = clamp_to_displays(CGPoint::new(st.pos.x + dx, st.pos.y + dy), &displays);
+        st.pos = {
+            let displays = self.shared.displays.read();
+            clamp_to_displays(CGPoint::new(st.pos.x + dx, st.pos.y + dy), &displays)
+        };
         let (etype, button) = self.motion_type(&st.held_buttons);
         let Some(ev) = self.mouse(etype, st.pos, button) else {
             return;

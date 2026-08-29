@@ -11,6 +11,14 @@ repository_root="$(cd -- "${script_directory}/../.." && pwd)"
 build_directory="${repository_root}/build"
 app_path="${build_directory}/Splice.app"
 binary_path="${repository_root}/target/release/splice"
+package_id="$(cd "$repository_root" && cargo pkgid -p splice-app)"
+app_version="${package_id##*#}"
+app_version="${app_version##*@}"
+
+if [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+    printf 'Could not determine the app version from Cargo: %s\n' "$package_id" >&2
+    exit 1
+fi
 
 printf '%s\n' 'Building splice-app in release mode...'
 (
@@ -28,7 +36,7 @@ rm -rf -- "$app_path"
 mkdir -p "$app_path/Contents/MacOS"
 install -m 0755 "$binary_path" "$app_path/Contents/MacOS/splice"
 
-cat > "$app_path/Contents/Info.plist" <<'PLIST'
+cat > "$app_path/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -42,9 +50,9 @@ cat > "$app_path/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>${app_version}</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>${app_version}</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>

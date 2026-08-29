@@ -49,7 +49,8 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
    transitions (back to source, onward to a third machine). Getting the cursor back NEVER depends
    on the remote machine's capture stack working. (Kills: lan-mouse's stuck-cursor class.)
 2. **TCP with TCP_NODELAY, one connection per peer pair.** Guaranteed delivery for
-   Enter/Leave/key-up. Motion coalesced to ≤500 Hz. (Kills: stuck keys from lost UDP key-ups.)
+   Enter/Leave/key-up. Motion is sent immediately and coalesced only when capture events are
+   already queued. (Kills: stuck keys from lost UDP key-ups.)
 3. **Physical evdev scancodes on the wire, never characters, never layout groups.** Each machine
    applies its own keyboard layout. (Kills: Deskflow's 11-year AltGr bug class; lan-mouse's
    layout-group leak.)

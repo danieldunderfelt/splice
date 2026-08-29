@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
@@ -266,7 +267,8 @@ async fn session_loop(
     active: Arc<AtomicBool>,
     seq: u64,
 ) -> bool {
-    let (mut rd, mut wr) = sock.into_split();
+    let (rd, mut wr) = sock.into_split();
+    let mut rd = BufReader::with_capacity(16 * 1024, rd);
     let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Frame, ProtoError>>(64);
     let reader = tokio::spawn(async move {
         let mut read_buf = Vec::with_capacity(256);
@@ -294,6 +296,7 @@ async fn session_loop(
     let mut last_rtt_emit: Option<Instant> = None;
     let mut next_ping = Instant::now() + cadence(&inner, &active);
     let mut write_buf = Vec::with_capacity(256);
+    let event_peer = Arc::new(peer.clone());
 
     let reason: String = loop {
         tokio::select! {
@@ -356,7 +359,7 @@ async fn session_loop(
                 // Hello/Welcome outside the handshake are protocol noise; drop them.
                 Some(Ok(Frame::Hello(_) | Frame::Welcome(_))) => {}
                 Some(Ok(f)) => {
-                    let _ = inner.events.send(PeerEvent::Frame(peer.clone(), f));
+                    let _ = inner.events.send(PeerEvent::Frame(event_peer.clone(), f));
                 }
                 Some(Err(e)) => break format!("read: {e}"),
                 None => break "reader stopped".to_string(),

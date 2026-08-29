@@ -102,8 +102,9 @@ libei receiver specifics (reis):
    layouts assumed compatible; documented limitation). One key event per key per frame;
    press+release of same key in one frame is a violation. Release all held keys before
    `stop_emulating`.
-6. Frames: every batch of events needs `frame()`. Without it nothing happens. One motion +
-   one frame per received Motion (coalescing happens source-side).
+6. Frames: every batch of events needs `frame()`. Without it nothing happens. Motion is sent
+   immediately when the queue is empty; consecutive queued motion commands are summed into one
+   motion + frame so an EIS scheduling pause cannot create a stale playback backlog.
 7. Scroll: smooth px → `scroll()`; ScrollLines → accumulate to full ±120 then
    `scroll_discrete()` (GNOME silently drops sub-120 remainders; use trunc not floor);
    ScrollStop → `scroll_stop(cancel)`.

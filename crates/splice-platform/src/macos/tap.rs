@@ -331,9 +331,7 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         return CallbackResult::Keep;
     }
 
-    for ev in translate(etype, event, key_edge) {
-        st.emit(CaptureEvent::Input(ev));
-    }
+    translate(etype, event, key_edge).emit(st);
     CallbackResult::Drop
 }
 
@@ -364,11 +362,30 @@ fn key_edge_of(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Optio
     }
 }
 
+enum Translated {
+    None,
+    One(InputEvent),
+    Two(InputEvent, InputEvent),
+}
+
+impl Translated {
+    fn emit(self, st: &TapState) {
+        match self {
+            Self::None => {}
+            Self::One(event) => st.emit(CaptureEvent::Input(event)),
+            Self::Two(first, second) => {
+                st.emit(CaptureEvent::Input(first));
+                st.emit(CaptureEvent::Input(second));
+            }
+        }
+    }
+}
+
 fn translate(
     etype: CGEventType,
     event: &CGEvent,
     key_edge: Option<(u32, bool)>,
-) -> Vec<InputEvent> {
+) -> Translated {
     match etype {
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
@@ -378,30 +395,30 @@ fn translate(
             let dx = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
             let dy = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
             if dx == 0.0 && dy == 0.0 {
-                vec![]
+                Translated::None
             } else {
-                vec![InputEvent::Motion { dx, dy }]
+                Translated::One(InputEvent::Motion { dx, dy })
             }
         }
-        CGEventType::LeftMouseDown => vec![button(PointerButton::Left, true)],
-        CGEventType::LeftMouseUp => vec![button(PointerButton::Left, false)],
-        CGEventType::RightMouseDown => vec![button(PointerButton::Right, true)],
-        CGEventType::RightMouseUp => vec![button(PointerButton::Right, false)],
+        CGEventType::LeftMouseDown => Translated::One(button(PointerButton::Left, true)),
+        CGEventType::LeftMouseUp => Translated::One(button(PointerButton::Left, false)),
+        CGEventType::RightMouseDown => Translated::One(button(PointerButton::Right, true)),
+        CGEventType::RightMouseUp => Translated::One(button(PointerButton::Right, false)),
         CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => {
             let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
             let pressed = matches!(etype, CGEventType::OtherMouseDown);
-            vec![button(other_button(n), pressed)]
+            Translated::One(button(other_button(n), pressed))
         }
         CGEventType::ScrollWheel => scroll(event),
         CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
-            let Some((code, pressed)) = key_edge else { return vec![] };
+            let Some((code, pressed)) = key_edge else { return Translated::None };
             // DESIGN keymap note: CapsLock is a lock state, not an edge — never forwarded.
             if code == keymap::ev::KEY_CAPSLOCK {
-                return vec![];
+                return Translated::None;
             }
-            vec![InputEvent::Key { code, pressed }]
+            Translated::One(InputEvent::Key { code, pressed })
         }
-        _ => vec![],
+        _ => Translated::None,
     }
 }
 
@@ -418,10 +435,10 @@ fn other_button(n: i64) -> PointerButton {
     }
 }
 
-fn scroll(event: &CGEvent) -> Vec<InputEvent> {
+fn scroll(event: &CGEvent) -> Translated {
     // Momentum is the target's job (DESIGN 15); forward only finger-driven scroll.
     if event.get_integer_value_field(ffi::FIELD_SCROLL_MOMENTUM_PHASE) != 0 {
-        return vec![];
+        return Translated::None;
     }
     let phase = event.get_integer_value_field(ffi::FIELD_SCROLL_PHASE);
     // Device direction: the target applies its own natural-scroll preference.
@@ -432,24 +449,26 @@ fn scroll(event: &CGEvent) -> Vec<InputEvent> {
             * sign;
         let dx = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2)
             * sign;
-        let mut out = Vec::new();
-        if dx != 0.0 || dy != 0.0 {
-            out.push(InputEvent::ScrollPixels { dx, dy });
+        let motion = (dx != 0.0 || dy != 0.0).then_some(InputEvent::ScrollPixels { dx, dy });
+        let stopped = phase == ffi::SCROLL_PHASE_ENDED || phase == ffi::SCROLL_PHASE_CANCELLED;
+        let stop = stopped.then_some(InputEvent::ScrollStop {
+            cancel: phase == ffi::SCROLL_PHASE_CANCELLED,
+        });
+        match (motion, stop) {
+            (Some(first), Some(second)) => Translated::Two(first, second),
+            (Some(event), None) | (None, Some(event)) => Translated::One(event),
+            (None, None) => Translated::None,
         }
-        if phase == ffi::SCROLL_PHASE_ENDED || phase == ffi::SCROLL_PHASE_CANCELLED {
-            out.push(InputEvent::ScrollStop { cancel: phase == ffi::SCROLL_PHASE_CANCELLED });
-        }
-        out
     } else {
         let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
         if dx == 0 && dy == 0 {
-            return vec![];
+            return Translated::None;
         }
-        vec![InputEvent::Scroll120 {
+        Translated::One(InputEvent::Scroll120 {
             dx: (dx as f64 * sign) as i32 * 120,
             dy: (dy as f64 * sign) as i32 * 120,
-        }]
+        })
     }
 }
 

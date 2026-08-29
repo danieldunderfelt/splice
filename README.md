@@ -2,6 +2,8 @@
 
 Splice shares one mouse, keyboard, and clipboard across macOS and Linux computers on the same Tailscale network. It discovers peers automatically. Move the pointer across an arranged screen edge to control another computer.
 
+The current release is Splice 1.0.
+
 Splice is under active development. Linux support targets Fedora 44 or later in a GNOME or KDE Wayland session.
 
 ## Prerequisites

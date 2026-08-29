@@ -28,7 +28,7 @@ const CFG_DEBOUNCE: Duration = Duration::from_secs(1);
 const CLIP_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Snap tolerance for SetPlacement (DESIGN/UI: 8 px magnetism).
 const SNAP_TOLERANCE: i32 = 8;
-const MOTION_BATCH_INTERVAL: Duration = Duration::from_millis(2);
+const MAX_PLATFORM_BATCH_EVENTS: usize = 64;
 
 #[derive(Clone, PartialEq)]
 enum Focus {
@@ -117,6 +117,7 @@ pub struct Inner {
     session: u64,
     active_session: u64,
     virtual_pos: Vec2,
+    active_sensitivity: f64,
     /// Local cursor position when capture began; warp target for orderly teardowns.
     last_local_pos: Vec2,
     source_ledger: HeldLedger,
@@ -132,7 +133,7 @@ pub struct Inner {
     tailscale_error: Option<String>,
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
-    last_motion_batch: Option<Instant>,
+    platform_batch: Vec<PlatformEvent>,
 
     clip_lamport: u64,
     clip_seen: Option<Stamp>,
@@ -188,6 +189,7 @@ impl Inner {
             session: 0,
             active_session: 0,
             virtual_pos: Vec2 { x: 0.0, y: 0.0 },
+            active_sensitivity: 1.0,
             last_local_pos: Vec2 { x: 0.0, y: 0.0 },
             source_ledger: HeldLedger::default(),
             target_ledger: HeldLedger::default(),
@@ -198,7 +200,7 @@ impl Inner {
             tailscale_error: None,
             ui_deadline: None,
             cfg_deadline: None,
-            last_motion_batch: None,
+            platform_batch: Vec::with_capacity(16),
             clip_lamport: 0,
             clip_seen: None,
             last_applied_inline: None,
@@ -412,60 +414,20 @@ impl Inner {
     /// Drain the platform channel and merge runs of consecutive Motion events into
     /// one (sum deltas) before handling, so slow frames coalesce on the wire.
     async fn on_platform_batch(&mut self, first: PlatformEvent) -> bool {
-        let mut events = Vec::with_capacity(8);
-        events.push(first);
-        while let Ok(ev) = self.platform_events.try_recv() {
-            events.push(ev);
-        }
-        let has_motion = events.iter().any(|ev| {
-            matches!(
-                ev,
-                PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion { .. }))
-            )
-        });
-        if has_motion {
-            if let Some(deadline) = self
-                .last_motion_batch
-                .and_then(|last| last.checked_add(MOTION_BATCH_INTERVAL))
-                .filter(|deadline| *deadline > Instant::now())
-            {
-                while let Ok(Some(ev)) =
-                    tokio::time::timeout_at(deadline.into(), self.platform_events.recv()).await
-                {
-                    events.push(ev);
-                }
+        let mut events = std::mem::take(&mut self.platform_batch);
+        push_platform_event(&mut events, first);
+        for _ in 1..MAX_PLATFORM_BATCH_EVENTS {
+            match self.platform_events.try_recv() {
+                Ok(ev) => push_platform_event(&mut events, ev),
+                Err(_) => break,
             }
-            self.last_motion_batch = Some(Instant::now());
-        }
-        let mut merged: Vec<PlatformEvent> = Vec::with_capacity(events.len());
-        for ev in events {
-            if let PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion {
-                dx: dx2,
-                dy: dy2,
-            })) = ev
-            {
-                if let Some(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion {
-                    dx,
-                    dy,
-                }))) = merged.last_mut()
-                {
-                    *dx += dx2;
-                    *dy += dy2;
-                    continue;
-                }
-                merged.push(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion {
-                    dx: dx2,
-                    dy: dy2,
-                })));
-                continue;
-            }
-            merged.push(ev);
         }
         let mut recompute = false;
-        for ev in merged {
+        for ev in events.drain(..) {
             recompute |= matches!(&ev, PlatformEvent::DisplaysChanged { .. });
             self.on_platform_event(ev).await;
         }
+        self.platform_batch = events;
         recompute
     }
 
@@ -571,6 +533,9 @@ impl Inner {
         }
         self.focus = Focus::Remote(target);
         self.virtual_pos = pos;
+        if let Focus::Remote(target) = &self.focus {
+            self.active_sensitivity = self.sensitivity(target);
+        }
         self.source_ledger = HeldLedger::default();
         self.touch_ui();
     }
@@ -583,40 +548,47 @@ impl Inner {
     }
 
     async fn on_capture_input(&mut self, ev: InputEvent) {
-        let Focus::Remote(target) = self.focus.clone() else {
-            return;
-        };
         match ev {
-            InputEvent::Motion { dx, dy } => self.on_remote_motion(&target, dx, dy).await,
+            InputEvent::Motion { dx, dy } => self.on_remote_motion(dx, dy).await,
             other => {
+                if !matches!(self.focus, Focus::Remote(_)) {
+                    return;
+                }
                 self.source_ledger.observe(&other);
-                if let Some(net) = &self.net {
-                    net.send_to(
-                        &target,
-                        Frame::Input { session: self.active_session, ev: other },
-                    );
+                if let (Some(net), Focus::Remote(target)) = (&self.net, &self.focus) {
+                    net.send_to(target, Frame::Input { session: self.active_session, ev: other });
                 }
             }
         }
     }
 
-    async fn on_remote_motion(&mut self, target: &MachineId, dx: f64, dy: f64) {
-        let sens = self.sensitivity(target);
-        let dx = dx * sens;
-        let dy = dy * sens;
+    async fn on_remote_motion(&mut self, dx: f64, dy: f64) {
+        let dx = dx * self.active_sensitivity;
+        let dy = dy * self.active_sensitivity;
         let next = Vec2 { x: self.virtual_pos.x + dx, y: self.virtual_pos.y + dy };
-        let displays = self.displays_of(target);
-        if !layout::union_contains(&displays, next) {
-            if let Some(link) = self.find_crossing(target, next) {
-                self.cross_link(target, &link, next).await;
-                return;
+        let (inside, crossing) = match &self.focus {
+            Focus::Remote(target) => {
+                let inside = layout::union_contains(self.display_slice_of(target), next);
+                let crossing = (!inside).then(|| self.find_crossing(target, next)).flatten();
+                (inside, crossing)
             }
-            // No link through this span: the cursor sticks at the union boundary.
-            self.virtual_pos = layout::clamp_into_displays(&displays, next);
-        } else {
-            self.virtual_pos = next;
+            _ => return,
+        };
+        if let Some(link) = crossing {
+            self.cross_link(link, next).await;
+            return;
         }
-        if let Some(net) = &self.net {
+        if inside {
+            self.virtual_pos = next;
+        } else {
+            self.virtual_pos = match &self.focus {
+                Focus::Remote(target) => {
+                    layout::clamp_into_displays(self.display_slice_of(target), next)
+                }
+                _ => return,
+            };
+        }
+        if let (Some(net), Focus::Remote(target)) = (&self.net, &self.focus) {
             net.send_to(
                 target,
                 Frame::Input { session: self.active_session, ev: InputEvent::Motion { dx, dy } },
@@ -650,19 +622,20 @@ impl Inner {
 
     /// The cursor left `target` through `link`: back to us, or onward to a third
     /// machine. The triggering motion is consumed by the transition, not forwarded.
-    async fn cross_link(&mut self, target: &MachineId, link: &EdgeLink, pos: Vec2) {
-        let landing = position_inside_to_edge(link, pos);
+    async fn cross_link(&mut self, link: EdgeLink, pos: Vec2) {
+        let landing = position_inside_to_edge(&link, pos);
         if link.to == self.self_info.id {
             let warp = layout::clamp_into_displays(&self.self_info.displays, landing);
-            self.send_leave(target, LeaveReason::Crossed, false);
+            self.send_leave(&link.from, LeaveReason::Crossed, false);
             let _ = self.capture.end_capture(Some(warp)).await;
             self.focus = Focus::Local;
+            self.active_sensitivity = 1.0;
             self.source_ledger.drain_releases();
             self.touch_ui();
         } else {
             let next = link.to.clone();
-            self.send_leave(target, LeaveReason::Crossed, false);
-            let landing = layout::clamp_into_displays(&self.displays_of(&next), landing);
+            self.send_leave(&link.from, LeaveReason::Crossed, false);
+            let landing = layout::clamp_into_displays(self.display_slice_of(&next), landing);
             self.session += 1;
             self.active_session = self.session;
             let entered = self.net.as_ref().is_some_and(|net| {
@@ -674,6 +647,7 @@ impl Inner {
             if !entered {
                 let _ = self.capture.end_capture(Some(self.last_local_pos)).await;
                 self.focus = Focus::Local;
+                self.active_sensitivity = 1.0;
                 self.source_ledger.drain_releases();
                 self.touch_ui();
                 return;
@@ -684,6 +658,9 @@ impl Inner {
             // Capture stays on across the hop.
             self.focus = Focus::Remote(next);
             self.virtual_pos = landing;
+            if let Focus::Remote(target) = &self.focus {
+                self.active_sensitivity = self.sensitivity(target);
+            }
             self.touch_ui();
         }
     }
@@ -720,6 +697,7 @@ impl Inner {
         self.send_leave(target, reason, release_all);
         let _ = self.capture.end_capture(warp).await;
         self.focus = Focus::Local;
+        self.active_sensitivity = 1.0;
         self.touch_ui();
     }
 
@@ -855,7 +833,7 @@ impl Inner {
         }
     }
 
-    async fn on_frame(&mut self, from: MachineId, frame: Frame) {
+    async fn on_frame(&mut self, from: Arc<MachineId>, frame: Frame) {
         match frame {
             Frame::SourceClaim { stamp } => self.on_source_claim(stamp).await,
             Frame::LayoutSync(doc) => {
@@ -884,34 +862,38 @@ impl Inner {
                 self.auto_place(&id);
                 self.touch_ui();
             }
-            Frame::Enter { session, pos } => self.on_enter(from, session, pos).await,
+            Frame::Enter { session, pos } => {
+                self.on_enter((*from).clone(), session, pos).await;
+            }
             Frame::Input { session, ev } => {
                 if let Focus::Driven(src) = &self.focus {
                     // Stale sessions (after Leave/re-Enter) are discarded.
-                    if *src == from && session == self.active_session {
+                    if src == from.as_ref() && session == self.active_session {
                         self.target_ledger.observe(&ev);
                         let _ = self.emulate.inject(ev).await;
                     }
                 }
             }
             Frame::Leave { session, reason } => {
-                if self.focus == Focus::Driven(from.clone()) {
-                    self.end_driven(&from).await;
-                } else if self.focus == Focus::Remote(from.clone())
+                if matches!(&self.focus, Focus::Driven(source) if source == from.as_ref()) {
+                    self.end_driven(from.as_ref()).await;
+                } else if matches!(&self.focus, Focus::Remote(target) if target == from.as_ref())
                     && session == self.active_session
                 {
                     // A target may refuse Enter after observing newer replicated
                     // state or an emulation failure. Treat that refusal as an
                     // immediate source-side teardown.
-                    self.end_remote(&from, reason, Some(self.last_local_pos), true)
+                    self.end_remote(from.as_ref(), reason, Some(self.last_local_pos), true)
                         .await;
                 }
             }
             Frame::ReleaseAll => self.release_target_side().await,
             Frame::ClipOffer { id, stamp, mimes, inline_text } => {
-                self.on_clip_offer(from, id, stamp, mimes, inline_text).await;
+                self.on_clip_offer((*from).clone(), id, stamp, mimes, inline_text).await;
             }
-            Frame::ClipRequest { id, mime } => self.on_clip_request(from, id, mime).await,
+            Frame::ClipRequest { id, mime } => {
+                self.on_clip_request((*from).clone(), id, mime).await;
+            }
             Frame::ClipChunk { id, mime, data, last } => {
                 let key = (id, mime);
                 let mut pending = self.pending_fetches.lock();
@@ -1282,6 +1264,10 @@ impl Inner {
         // session (v1 portals prompt again for every new session).
         let specs = layout::edge_specs_for(&self.geo_links, &self.self_info.id);
         let _ = self.capture.set_edges(specs).await;
+        self.active_sensitivity = match &self.focus {
+            Focus::Remote(target) => self.sensitivity(target),
+            _ => 1.0,
+        };
     }
 
     /// Enforce the focus FSM invariants after every command, platform batch and
@@ -1330,14 +1316,18 @@ impl Inner {
     }
 
     fn displays_of(&self, id: &MachineId) -> Vec<DisplayRect> {
+        self.display_slice_of(id).to_vec()
+    }
+
+    fn display_slice_of(&self, id: &MachineId) -> &[DisplayRect] {
         if *id == self.self_info.id {
-            return self.self_info.displays.clone();
+            return &self.self_info.displays;
         }
         self.peers
             .get(id)
             .and_then(|p| p.info.as_ref())
-            .map(|info| info.displays.clone())
-            .unwrap_or_default()
+            .map(|info| info.displays.as_slice())
+            .unwrap_or(&[])
     }
 
     fn sensitivity(&self, target: &MachineId) -> f64 {
@@ -1470,6 +1460,28 @@ impl Inner {
             sensitivity: doc.as_ref().map(|d| d.sensitivity.clone()).unwrap_or_default(),
             tailscale_error: self.tailscale_error.clone(),
         }
+    }
+}
+
+fn push_platform_event(events: &mut Vec<PlatformEvent>, ev: PlatformEvent) {
+    if let PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion {
+        dx: next_dx,
+        dy: next_dy,
+    })) = ev
+    {
+        if let Some(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion { dx, dy }))) =
+            events.last_mut()
+        {
+            *dx += next_dx;
+            *dy += next_dy;
+        } else {
+            events.push(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion {
+                dx: next_dx,
+                dy: next_dy,
+            })));
+        }
+    } else {
+        events.push(ev);
     }
 }
 

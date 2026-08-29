@@ -545,25 +545,62 @@ async fn run_session(
                 return;
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { return };
-                match cmd {
-                    Command::Enter(pos) => {
-                        do_enter(&session, &mut devices, &mut active, screensaver, pos);
-                        *entered = Some(pos);
-                    }
-                    Command::Inject(ev) => {
-                        if active.emulating && !screensaver.is_locked() {
-                            inject(&session, &devices, &mut active, ev);
+                let Some(mut command) = cmd else { return };
+                loop {
+                    let following = match command {
+                        Command::Enter(pos) => {
+                            do_enter(&session, &mut devices, &mut active, screensaver, pos);
+                            *entered = Some(pos);
+                            None
                         }
-                    }
-                    Command::Leave => {
-                        do_leave(&session, &mut devices, &mut active, screensaver);
-                        *entered = None;
-                    }
-                    Command::ReleaseAll => {
-                        release_held(&session, &devices, &mut active);
-                        let _ = session.connection.flush();
-                    }
+                        Command::Inject(InputEvent::Motion { mut dx, mut dy }) => {
+                            let mut following = None;
+                            while let Ok(next) = cmd_rx.try_recv() {
+                                match next {
+                                    Command::Inject(InputEvent::Motion {
+                                        dx: next_dx,
+                                        dy: next_dy,
+                                    }) => {
+                                        dx += next_dx;
+                                        dy += next_dy;
+                                    }
+                                    next => {
+                                        following = Some(next);
+                                        break;
+                                    }
+                                }
+                            }
+                            if active.emulating && !screensaver.is_locked() {
+                                inject(
+                                    &session,
+                                    &devices,
+                                    &mut active,
+                                    InputEvent::Motion { dx, dy },
+                                );
+                            }
+                            following
+                        }
+                        Command::Inject(ev) => {
+                            if active.emulating && !screensaver.is_locked() {
+                                inject(&session, &devices, &mut active, ev);
+                            }
+                            None
+                        }
+                        Command::Leave => {
+                            do_leave(&session, &mut devices, &mut active, screensaver);
+                            *entered = None;
+                            None
+                        }
+                        Command::ReleaseAll => {
+                            release_held(&session, &devices, &mut active);
+                            let _ = session.connection.flush();
+                            None
+                        }
+                    };
+                    let Some(next) = following else {
+                        break;
+                    };
+                    command = next;
                 }
             }
             event = session.ei_stream.next() => {

@@ -8,7 +8,7 @@ use splice_core::net::{NetOpts, TsApi};
 use splice_core::ui_state::{UiConnection, UiFocus};
 use splice_platform::mock::{self, MockHandle};
 use splice_platform::{CaptureEvent, EdgeSide, EdgeSpec, PlatformEvent};
-use splice_proto::{InputEvent, MachineId, Vec2I};
+use splice_proto::{InputEvent, LayoutDoc, MachineId, Vec2I};
 use splice_tailscale::{Node, Status, TsError, WhoIs, WhoIsUser};
 use std::collections::HashMap;
 use std::future::Future;
@@ -301,6 +301,45 @@ async fn motion_forwarding_and_edge_back() {
     })
     .await;
     wait_until("A back to Local focus", || matches!(focus_of(&a), UiFocus::Local)).await;
+}
+
+#[tokio::test]
+async fn active_motion_uses_updated_cached_sensitivity() {
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    let link_key = LayoutDoc::link_key(&mid("aaa"), &mid("bbb"));
+    a.handle.send(Command::SetSensitivity { link_key: link_key.clone(), factor: 1.5 });
+    wait_until("sensitivity update is published", || {
+        a.handle.state().borrow().sensitivity.get(&link_key) == Some(&1.5)
+    })
+    .await;
+    let into = into_sign(&edge);
+    push_motion(&a, 20.0 * into, 4.0);
+    let want = InputEvent::Motion { dx: 30.0 * into, dy: 6.0 };
+    wait_until("updated sensitivity is applied", || injected(&b).contains(&want)).await;
+}
+
+#[tokio::test]
+async fn motion_burst_preserves_total_delta() {
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    let into = into_sign(&edge);
+    for _ in 0..32 {
+        push_motion(&a, into, 1.0);
+    }
+    wait_until("motion burst reaches the target", || {
+        let (dx, dy) = injected(&b)
+            .into_iter()
+            .filter_map(|event| match event {
+                InputEvent::Motion { dx, dy } => Some((dx, dy)),
+                _ => None,
+            })
+            .fold((0.0, 0.0), |(sum_x, sum_y), (dx, dy)| {
+                (sum_x + dx, sum_y + dy)
+            });
+        dx == 32.0 * into && dy == 32.0
+    })
+    .await;
 }
 
 #[tokio::test]

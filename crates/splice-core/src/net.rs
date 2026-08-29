@@ -48,7 +48,7 @@ pub enum PeerEvent {
         caps: Vec<String>,
         addr: SocketAddr,
     },
-    Frame(MachineId, Frame),
+    Frame(Arc<MachineId>, Frame),
     /// 3 missed heartbeats — treat as input-unsafe but keep the link.
     Degraded(MachineId),
     /// Recovered from Degraded.

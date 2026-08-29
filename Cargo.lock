@@ -3450,7 +3450,7 @@ dependencies = [
 
 [[package]]
 name = "splice-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "splice-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "splice-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "splice-core",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "splice-platform"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3536,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "splice-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -3547,7 +3547,7 @@ dependencies = [
 
 [[package]]
 name = "splice-tailscale"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
