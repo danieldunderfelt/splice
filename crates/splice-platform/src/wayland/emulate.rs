@@ -49,29 +49,34 @@ enum Command {
 }
 
 pub struct WaylandEmulate {
-    cmd: mpsc::UnboundedSender<Command>,
+    cmd: mpsc::Sender<Command>,
 }
 
 #[async_trait::async_trait]
 impl Emulate for WaylandEmulate {
     async fn enter(&self, pos: Vec2) -> Result<()> {
-        let _ = self.cmd.send(Command::Enter(pos));
-        Ok(())
+        self.send(Command::Enter(pos)).await
     }
 
     async fn inject(&self, ev: InputEvent) -> Result<()> {
-        let _ = self.cmd.send(Command::Inject(ev));
-        Ok(())
+        self.send(Command::Inject(ev)).await
     }
 
     async fn leave(&self) -> Result<()> {
-        let _ = self.cmd.send(Command::Leave);
-        Ok(())
+        self.send(Command::Leave).await
     }
 
     async fn release_all(&self) -> Result<()> {
-        let _ = self.cmd.send(Command::ReleaseAll);
-        Ok(())
+        self.send(Command::ReleaseAll).await
+    }
+}
+
+impl WaylandEmulate {
+    async fn send(&self, command: Command) -> Result<()> {
+        self.cmd
+            .send(command)
+            .await
+            .map_err(|_| crate::PlatformError::Unavailable("input emulation stopped".into()))
     }
 }
 
@@ -80,7 +85,7 @@ pub fn create(
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
 ) -> (Arc<WaylandEmulate>, watch::Receiver<Option<ClipSession>>) {
-    let (cmd, cmd_rx) = mpsc::unbounded_channel();
+    let (cmd, cmd_rx) = mpsc::channel(64);
     let (clip_tx, clip_rx) = watch::channel(None);
     let screensaver = Arc::new(ScreenSaver::new(conn.clone()));
 
@@ -427,7 +432,7 @@ async fn run(
     shared: Arc<WaylandShared>,
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
-    mut cmd_rx: mpsc::UnboundedReceiver<Command>,
+    mut cmd_rx: mpsc::Receiver<Command>,
     clip_tx: watch::Sender<Option<ClipSession>>,
     screensaver: Arc<ScreenSaver>,
 ) {
@@ -497,7 +502,7 @@ async fn run_session(
     shared: &Arc<WaylandShared>,
     conn: &zbus::Connection,
     mut session: Session,
-    cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+    cmd_rx: &mut mpsc::Receiver<Command>,
     screensaver: &Arc<ScreenSaver>,
     entered: &mut Option<Vec2>,
     resume: Option<Vec2>,

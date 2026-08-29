@@ -262,7 +262,7 @@ async fn enter_maps_position_and_captures() {
     assert_eq!(entered.len(), 1);
     // 1:1 along the shared span; landing on B's boundary facing A.
     assert_eq!(entered[0].y, along);
-    assert!(entered[0].x == 0.0 || entered[0].x == 1920.0, "entered at {entered:?}");
+    assert!(entered[0].x == 1.0 || entered[0].x == 1919.0, "entered at {entered:?}");
 
     wait_until("A reports focus Remote(bbb)", || {
         matches!(focus_of(&a), UiFocus::Remote(t) if t.0 == "bbb")
@@ -294,7 +294,7 @@ async fn motion_forwarding_and_edge_back() {
     let Some(Some(warp)) = ends.last().copied() else {
         panic!("expected an orderly end_capture with a warp target, got {ends:?}");
     };
-    assert!((0.0..=1920.0).contains(&warp.x) && (0.0..=1080.0).contains(&warp.y));
+    assert!((0.0..1920.0).contains(&warp.x) && (0.0..1080.0).contains(&warp.y));
     wait_until("B released and left", || {
         let st = b.mock.state.lock();
         st.left >= 1 && st.release_all_calls >= 1
@@ -345,6 +345,53 @@ async fn held_key_released_on_leave_and_on_peer_drop() {
 }
 
 #[tokio::test]
+async fn return_to_source_lands_inside_its_left_edge() {
+    let (a, b) = spawn_pair().await;
+    wait_until("both machines arm their shared edge", || {
+        !a.mock.state.lock().edges.is_empty() && !b.mock.state.lock().edges.is_empty()
+    })
+    .await;
+    let (source, target, source_id) = if a.mock.state.lock().edges[0].side == EdgeSide::Left {
+        (&a, &b, mid("aaa"))
+    } else {
+        (&b, &a, mid("bbb"))
+    };
+    source.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    wait_until("left machine owns the source claim", || {
+        a.handle.state().borrow().source == Some(source_id.clone())
+            && b.handle.state().borrow().source == Some(source_id.clone())
+    })
+    .await;
+    let edge = source.mock.state.lock().edges[0].clone();
+    assert_eq!(edge.side, EdgeSide::Left);
+    let along = f64::from(edge.from + edge.to) / 2.0;
+    source
+        .mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }))
+        .unwrap();
+    wait_until("left source captures", || source.mock.state.lock().capturing).await;
+    wait_until("right target accepts source", || {
+        !target.mock.state.lock().entered.is_empty()
+    })
+    .await;
+    push_motion(source, 25.0 * into_sign(&edge), 0.0);
+    push_motion(source, -4000.0 * into_sign(&edge), 0.0);
+    wait_until("left source returns locally", || !source.mock.state.lock().capturing).await;
+    let warp = source
+        .mock
+        .state
+        .lock()
+        .capture_ends
+        .last()
+        .copied()
+        .flatten()
+        .expect("return warp");
+    assert!((0.0..1920.0).contains(&warp.x));
+    assert!((0.0..1080.0).contains(&warp.y));
+}
+
+#[tokio::test]
 async fn source_claim_ends_remote_capture() {
     let (a, b) = spawn_pair().await;
     drive_a_to_b(&a, &b).await;
@@ -354,7 +401,9 @@ async fn source_claim_ends_remote_capture() {
     b.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
     wait_until("A ended capture", || !a.mock.state.lock().capturing).await;
     let ends = a.mock.state.lock().capture_ends.clone();
-    assert_eq!(ends.last(), Some(&None), "sourceness loss ends capture without warp");
+    let warp = ends.last().copied().flatten().expect("sourceness loss return warp");
+    assert!((0.0..1920.0).contains(&warp.x));
+    assert!((0.0..1080.0).contains(&warp.y));
     wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
     wait_until("both sides agree bbb is source", || {
         a.handle.state().borrow().source == Some(mid("bbb"))
@@ -479,6 +528,17 @@ async fn disabled_barrier_activation_is_immediately_released() {
         !state.capturing && state.capture_ends.len() > ends_before
     })
     .await;
+    let warp = a
+        .mock
+        .state
+        .lock()
+        .capture_ends
+        .last()
+        .copied()
+        .flatten()
+        .expect("rejected activation warp");
+    assert!((0.0..1920.0).contains(&warp.x));
+    assert!((0.0..1080.0).contains(&warp.y));
     assert!(matches!(focus_of(&a), UiFocus::Local));
 }
 

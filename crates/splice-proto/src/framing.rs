@@ -7,31 +7,56 @@
 use crate::{Frame, ProtoError, MAX_FRAME_LEN};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+struct ReuseBuffer<'a>(&'a mut Vec<u8>);
+
+impl Extend<u8> for ReuseBuffer<'_> {
+    fn extend<T: IntoIterator<Item = u8>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
 /// Read one frame. Cancel-safe ONLY at the length-prefix boundary; callers should own the
 /// read half exclusively in a dedicated task.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame, ProtoError> {
+    let mut buf = Vec::new();
+    read_frame_buffered(r, &mut buf).await
+}
+
+pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<Frame, ProtoError> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_LEN {
         return Err(ProtoError::FrameTooLarge(len));
     }
-    let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).await?;
-    Ok(postcard::from_bytes(&buf)?)
+    buf.resize(len as usize, 0);
+    r.read_exact(buf).await?;
+    Ok(postcard::from_bytes(buf)?)
 }
 
 /// Write one frame and flush.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Result<(), ProtoError> {
-    let payload = postcard::to_allocvec(frame)?;
-    let len = payload.len() as u32;
-    if len > MAX_FRAME_LEN {
-        return Err(ProtoError::FrameTooLarge(len));
+    let mut buf = Vec::new();
+    write_frame_buffered(w, frame, &mut buf).await
+}
+
+pub async fn write_frame_buffered<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    frame: &Frame,
+    buf: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    buf.clear();
+    buf.resize(4, 0);
+    postcard::to_extend(frame, ReuseBuffer(buf))?;
+    let len = buf.len() - 4;
+    if len > MAX_FRAME_LEN as usize {
+        return Err(ProtoError::FrameTooLarge(len.min(u32::MAX as usize) as u32));
     }
-    let mut buf = Vec::with_capacity(4 + payload.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&payload);
-    w.write_all(&buf).await?;
+    buf[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    w.write_all(buf).await?;
     w.flush().await?;
     Ok(())
 }

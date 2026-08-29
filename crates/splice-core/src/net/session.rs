@@ -6,7 +6,7 @@
 //! cancel-safe at the length-prefix boundary).
 
 use crate::net::{NetControlInner, PeerCmd, PeerEvent};
-use splice_proto::framing::{read_frame, write_frame};
+use splice_proto::framing::{read_frame, read_frame_buffered, write_frame, write_frame_buffered};
 use splice_proto::{caps, Frame, Hello, MachineId, ProtoError, Welcome};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -269,8 +269,9 @@ async fn session_loop(
     let (mut rd, mut wr) = sock.into_split();
     let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Frame, ProtoError>>(64);
     let reader = tokio::spawn(async move {
+        let mut read_buf = Vec::with_capacity(256);
         loop {
-            match read_frame(&mut rd).await {
+            match read_frame_buffered(&mut rd, &mut read_buf).await {
                 Ok(f) => {
                     if frame_tx.send(Ok(f)).await.is_err() {
                         return;
@@ -292,17 +293,23 @@ async fn session_loop(
     let mut degraded = false;
     let mut last_rtt_emit: Option<Instant> = None;
     let mut next_ping = Instant::now() + cadence(&inner, &active);
+    let mut write_buf = Vec::with_capacity(256);
 
     let reason: String = loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {
                 Some(PeerCmd::Send(f)) => {
-                    if let Err(e) = write_frame(&mut wr, &f).await {
+                    if let Err(e) = write_frame_buffered(&mut wr, &f, &mut write_buf).await {
                         break format!("write: {e}");
                     }
                 }
                 Some(PeerCmd::Shutdown(r)) => {
-                    let _ = write_frame(&mut wr, &Frame::Bye { reason: r.clone() }).await;
+                    let _ = write_frame_buffered(
+                        &mut wr,
+                        &Frame::Bye { reason: r.clone() },
+                        &mut write_buf,
+                    )
+                    .await;
                     break r;
                 }
                 None => break "control channel closed".to_string(),
@@ -311,7 +318,9 @@ async fn session_loop(
                 Some(Ok(Frame::Ping { nonce: n, t_us })) => {
                     if inner.opts.answer_pings.load(Ordering::Relaxed) {
                         let pong = Frame::Pong { nonce: n, t_us };
-                        if let Err(e) = write_frame(&mut wr, &pong).await {
+                        if let Err(e) =
+                            write_frame_buffered(&mut wr, &pong, &mut write_buf).await
+                        {
                             break format!("write: {e}");
                         }
                     }
@@ -369,7 +378,9 @@ async fn session_loop(
                     nonce += 1;
                     let t_us = epoch.elapsed().as_micros() as u64;
                     let ping = Frame::Ping { nonce, t_us };
-                    if let Err(e) = write_frame(&mut wr, &ping).await {
+                    if let Err(e) =
+                        write_frame_buffered(&mut wr, &ping, &mut write_buf).await
+                    {
                         break format!("write: {e}");
                     }
                     outstanding = Some((nonce, t_us, Instant::now()));

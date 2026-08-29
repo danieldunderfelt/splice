@@ -86,7 +86,7 @@ impl Tray {
         }
         #[cfg(target_os = "linux")]
         if let Some(linux) = &self.linux {
-            linux.sync();
+            linux.sync(state);
         }
     }
 }
@@ -274,11 +274,14 @@ mod linux {
     use crate::runtime::Controller;
     use parking_lot::{Mutex, RwLock};
     use splice_core::UiState;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::sync::{Arc, mpsc};
 
     pub struct LinuxTray {
         slot: Arc<Mutex<Option<ksni::Handle<SpliceTray>>>>,
         tokio: tokio::runtime::Handle,
+        menu_sig: Mutex<u64>,
     }
 
     /// Spawn the StatusNotifierItem on the background runtime. A missing
@@ -309,18 +312,32 @@ mod linux {
                 }
             }
         });
-        Some(LinuxTray { slot, tokio })
+        Some(LinuxTray { slot, tokio, menu_sig: Mutex::new(0) })
     }
 
     impl LinuxTray {
         /// Menus are generated from state on demand; nudge ksni to re-read them.
-        pub fn sync(&self) {
-            let handle = self.slot.lock().clone();
-            if let Some(handle) = handle {
-                self.tokio.spawn(async move {
-                    handle.update(|_| ()).await;
-                });
+        pub fn sync(&self, state: &UiState) {
+            let Some(handle) = self.slot.lock().clone() else {
+                return;
+            };
+            let mut hasher = DefaultHasher::new();
+            state.master_enabled.hash(&mut hasher);
+            for machine in &state.machines {
+                machine.id.0.hash(&mut hasher);
+                machine.enabled.hash(&mut hasher);
+                machine_menu_label(machine).hash(&mut hasher);
             }
+            let sig = hasher.finish();
+            let mut stored = self.menu_sig.lock();
+            if *stored == sig {
+                return;
+            }
+            *stored = sig;
+            drop(stored);
+            self.tokio.spawn(async move {
+                handle.update(|_| ()).await;
+            });
         }
     }
 

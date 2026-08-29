@@ -43,7 +43,7 @@ enum PhysicalEvent {
 }
 
 async fn run(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u32>) {
-    let (activity_tx, mut activity_rx) = mpsc::unbounded_channel::<PhysicalEvent>();
+    let (activity_tx, mut activity_rx) = mpsc::channel::<PhysicalEvent>(64);
     let eacces_reported = Arc::new(AtomicBool::new(false));
     let mut known: HashSet<PathBuf> = HashSet::new();
 
@@ -158,7 +158,7 @@ fn enumerate() -> Vec<PathBuf> {
 /// permission race on hotplugged nodes.
 fn spawn_reader(
     path: PathBuf,
-    activity: mpsc::UnboundedSender<PhysicalEvent>,
+    activity: mpsc::Sender<PhysicalEvent>,
     shared: &Arc<WaylandShared>,
     eacces_reported: &Arc<AtomicBool>,
     retries: u32,
@@ -224,20 +224,23 @@ fn spawn_reader(
                                 }),
                                 _ => Some(PhysicalEvent::Activity),
                             };
-                            if event.is_some_and(|event| activity.send(event).is_err()) {
-                                return;
+                            if let Some(event) = event {
+                                if activity.send(event).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         EventType::RELATIVE => {
-                            if activity.send(PhysicalEvent::Activity).is_err() {
-                                return;
+                            match activity.try_send(PhysicalEvent::Activity) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
                             }
                         }
                         _ => {}
                     }
                 }
                 Err(_) => {
-                    let _ = activity.send(PhysicalEvent::DeviceGone(path.clone()));
+                    let _ = activity.send(PhysicalEvent::DeviceGone(path.clone())).await;
                     return;
                 }
             }

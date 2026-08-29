@@ -224,13 +224,8 @@ fn nearest_edge(edges: &[EdgeSpec], x: f64, y: f64) -> Option<EdgeSpec> {
     edges.iter().min_by(|a, b| dist(a).total_cmp(&dist(b))).cloned()
 }
 
-/// An ongoing capture activation. `forwarding` is cleared the moment we Release; the
-/// entry stays so the matching Deactivated signal can be told apart from a compositor-
-/// initiated deactivation (which is a session-level failure).
 struct ActiveCapture {
     activation_id: u32,
-    forwarding: bool,
-    released: bool,
 }
 
 struct Session {
@@ -409,15 +404,8 @@ async fn apply_barriers(
     Ok(())
 }
 
-/// Portal Release hands the cursor back locally; the capture entry is kept (with
-/// forwarding off and `released` set) until the matching Deactivated arrives.
 async fn release(session: &Session, capture: &mut Option<ActiveCapture>, warp_to: Option<Vec2>) {
-    let Some(active) = capture.as_mut() else { return };
-    if active.released {
-        return;
-    }
-    active.forwarding = false;
-    active.released = true;
+    let Some(active) = capture.take() else { return };
     let mut opts = Options::new();
     opts.insert("activation_id", Value::new(active.activation_id));
     if let Some(pos) = warp_to {
@@ -574,8 +562,6 @@ async fn run_session(
                     tracing::warn!("activated with no matching barrier");
                     capture = Some(ActiveCapture {
                         activation_id,
-                        forwarding: true,
-                        released: false,
                     });
                     active_flag.store(true, Ordering::Release);
                     release(&session, &mut capture, None).await;
@@ -589,8 +575,6 @@ async fn run_session(
                 .clamp(edge.from as f64, (edge.to - 1).max(edge.from) as f64);
                 capture = Some(ActiveCapture {
                     activation_id,
-                    forwarding: true,
-                    released: false,
                 });
                 active_flag.store(true, Ordering::Release);
                 pressed.clear();
@@ -603,13 +587,12 @@ async fn run_session(
                     continue;
                 }
                 let activation_id = portal::get::<u32>(&opts, "activation_id");
-                let was_released = capture
+                let was_active = capture
                     .as_ref()
-                    .is_some_and(|c| c.released && Some(c.activation_id) == activation_id);
-                capture = None;
-                active_flag.store(false, Ordering::Release);
-                pressed.clear();
-                if !was_released {
+                    .is_some_and(|c| activation_id.is_none_or(|id| c.activation_id == id));
+                if was_active {
+                    active_flag.store(false, Ordering::Release);
+                    pressed.clear();
                     shared.emit(PlatformEvent::Capture(CaptureEvent::Broken {
                         reason: "capture deactivated by compositor".into(),
                     }));
@@ -663,7 +646,7 @@ async fn run_session(
                         pressed.clear();
                     }
                     Command::Panic => {
-                        if capture.as_ref().is_some_and(|c| c.forwarding) {
+                        if capture.is_some() {
                             tracing::warn!("panic chord pressed");
                             release(&session, &mut capture, None).await;
                             active_flag.store(false, Ordering::Release);
@@ -703,7 +686,7 @@ async fn handle_ei_event(
     pressed: &mut std::collections::HashSet<u32>,
     panic_chord: &[u32],
 ) -> bool {
-    let forwarding = capture.as_ref().is_some_and(|c| c.forwarding);
+    let forwarding = capture.is_some();
     match event {
         EiEvent::SeatAdded(added) => {
             added.seat.bind_capabilities(
@@ -746,7 +729,7 @@ async fn handle_ei_event(
             }
             if !panic_chord.is_empty()
                 && panic_chord.iter().all(|code| pressed.contains(code))
-                && capture.as_ref().is_some_and(|c| c.forwarding)
+                && capture.is_some()
             {
                 tracing::warn!("panic chord pressed");
                 release(session, capture, None).await;

@@ -241,8 +241,9 @@ impl Inner {
                     }
                 } => match ev {
                     Some(first) => {
-                        self.on_platform_batch(first).await;
-                        self.recompute().await;
+                        if self.on_platform_batch(first).await {
+                            self.recompute().await;
+                        }
                     }
                     None => platform_open = false,
                 },
@@ -253,8 +254,21 @@ impl Inner {
                     }
                 } => match ev {
                     Some(ev) => {
+                        let recompute = matches!(
+                            &ev,
+                            PeerEvent::Connected { .. }
+                                | PeerEvent::Degraded(_)
+                                | PeerEvent::Healthy(_, _)
+                                | PeerEvent::Disconnected(_, _)
+                                | PeerEvent::Frame(
+                                    _,
+                                    Frame::LayoutSync(_) | Frame::MachineUpdate(_)
+                                )
+                        );
                         self.on_peer_event(ev).await;
-                        self.recompute().await;
+                        if recompute {
+                            self.recompute().await;
+                        }
                     }
                     None => net_events = None,
                 },
@@ -397,7 +411,7 @@ impl Inner {
 
     /// Drain the platform channel and merge runs of consecutive Motion events into
     /// one (sum deltas) before handling, so slow frames coalesce on the wire.
-    async fn on_platform_batch(&mut self, first: PlatformEvent) {
+    async fn on_platform_batch(&mut self, first: PlatformEvent) -> bool {
         let mut events = Vec::with_capacity(8);
         events.push(first);
         while let Ok(ev) = self.platform_events.try_recv() {
@@ -447,9 +461,12 @@ impl Inner {
             }
             merged.push(ev);
         }
+        let mut recompute = false;
         for ev in merged {
+            recompute |= matches!(&ev, PlatformEvent::DisplaysChanged { .. });
             self.on_platform_event(ev).await;
         }
+        recompute
     }
 
     async fn on_platform_event(&mut self, ev: PlatformEvent) {
@@ -467,7 +484,12 @@ impl Inner {
                 }
             }
             PlatformEvent::Capture(CaptureEvent::Panic) => self.panic().await,
-            PlatformEvent::PhysicalActivity => self.claim_source(),
+            PlatformEvent::PhysicalActivity => {
+                self.claim_source();
+                if let Focus::Driven(source) = self.focus.clone() {
+                    self.end_driven(&source).await;
+                }
+            }
             PlatformEvent::ClipboardChanged { mimes, inline_text } => {
                 self.on_clipboard_changed(mimes, inline_text);
             }
@@ -495,7 +517,7 @@ impl Inner {
 
     async fn on_edge_hit(&mut self, edge_id: u32, along: f64) {
         let Some(link) = self.armed.get(edge_id as usize).cloned() else {
-            self.reject_edge_hit("unknown barrier id").await;
+            self.reject_edge_hit("unknown barrier id", None).await;
             return;
         };
         let target = link.to.clone();
@@ -507,7 +529,16 @@ impl Inner {
             || !self.peer_usable(&target)
             || !link_is_active
         {
-            self.reject_edge_hit("edge is not currently crossable").await;
+            let local = match link.side {
+                EdgeSide::Left | EdgeSide::Right => {
+                    Vec2 { x: f64::from(link.at), y: along }
+                }
+                EdgeSide::Top | EdgeSide::Bottom => {
+                    Vec2 { x: along, y: f64::from(link.at) }
+                }
+            };
+            let warp = position_inside_from_edge(&link, local);
+            self.reject_edge_hit("edge is not currently crossable", Some(warp)).await;
             return;
         }
         self.claim_source();
@@ -515,8 +546,11 @@ impl Inner {
             EdgeSide::Left | EdgeSide::Right => Vec2 { x: f64::from(link.at), y: along },
             EdgeSide::Top | EdgeSide::Bottom => Vec2 { x: along, y: f64::from(link.at) },
         };
-        self.last_local_pos = local;
-        let pos = layout::clamp_into_displays(&self.displays_of(&target), landing_pos(&link, local));
+        self.last_local_pos = position_inside_from_edge(&link, local);
+        let pos = layout::clamp_into_displays(
+            &self.displays_of(&target),
+            position_inside_to_edge(&link, local),
+        );
         self.session += 1;
         self.active_session = self.session;
         let entered = self
@@ -527,7 +561,8 @@ impl Inner {
                 pos,
             }));
         if !entered {
-            self.reject_edge_hit("peer session disappeared before Enter").await;
+            let warp = position_inside_from_edge(&link, local);
+            self.reject_edge_hit("peer session disappeared before Enter", Some(warp)).await;
             return;
         }
         let _ = self.capture.begin_capture().await;
@@ -542,9 +577,9 @@ impl Inner {
 
     /// InputCapture activates before the engine can validate replicated state.
     /// Every rejected activation must therefore explicitly hand the pointer back.
-    async fn reject_edge_hit(&self, reason: &'static str) {
+    async fn reject_edge_hit(&self, reason: &'static str, warp: Option<Vec2>) {
         tracing::debug!(reason, "releasing rejected edge activation");
-        let _ = self.capture.end_capture(None).await;
+        let _ = self.capture.end_capture(warp).await;
     }
 
     async fn on_capture_input(&mut self, ev: InputEvent) {
@@ -616,7 +651,7 @@ impl Inner {
     /// The cursor left `target` through `link`: back to us, or onward to a third
     /// machine. The triggering motion is consumed by the transition, not forwarded.
     async fn cross_link(&mut self, target: &MachineId, link: &EdgeLink, pos: Vec2) {
-        let landing = landing_pos(link, pos);
+        let landing = position_inside_to_edge(link, pos);
         if link.to == self.self_info.id {
             let warp = layout::clamp_into_displays(&self.self_info.displays, landing);
             self.send_leave(target, LeaveReason::Crossed, false);
@@ -747,7 +782,13 @@ impl Inner {
         // Lost sourceness while driving: hand the cursor back locally. If we are the
         // Driven side of the previous holder, keep state — its Leave will arrive.
         if let Focus::Remote(target) = self.focus.clone() {
-            self.end_remote(&target, LeaveReason::SourceChanged, None, false).await;
+            self.end_remote(
+                &target,
+                LeaveReason::SourceChanged,
+                Some(self.last_local_pos),
+                false,
+            )
+            .await;
         }
         self.touch_ui();
     }
@@ -1444,6 +1485,26 @@ fn landing_pos(link: &EdgeLink, pos: Vec2) -> Vec2 {
         EdgeSide::Left | EdgeSide::Right => Vec2 { x: f64::from(link.to_at), y: to_along },
         EdgeSide::Top | EdgeSide::Bottom => Vec2 { x: to_along, y: f64::from(link.to_at) },
     }
+}
+
+fn position_inside_from_edge(link: &EdgeLink, pos: Vec2) -> Vec2 {
+    match link.side {
+        EdgeSide::Left => Vec2 { x: f64::from(link.at) + 1.0, y: pos.y },
+        EdgeSide::Right => Vec2 { x: f64::from(link.at) - 1.0, y: pos.y },
+        EdgeSide::Top => Vec2 { x: pos.x, y: f64::from(link.at) + 1.0 },
+        EdgeSide::Bottom => Vec2 { x: pos.x, y: f64::from(link.at) - 1.0 },
+    }
+}
+
+fn position_inside_to_edge(link: &EdgeLink, pos: Vec2) -> Vec2 {
+    let mut landing = landing_pos(link, pos);
+    match link.side {
+        EdgeSide::Left => landing.x -= 1.0,
+        EdgeSide::Right => landing.x += 1.0,
+        EdgeSide::Top => landing.y -= 1.0,
+        EdgeSide::Bottom => landing.y += 1.0,
+    }
+    landing
 }
 
 fn parse_os(os: &str) -> Os {

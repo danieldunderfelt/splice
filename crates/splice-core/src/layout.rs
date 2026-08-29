@@ -340,8 +340,8 @@ pub fn clamp_into_displays(displays: &[DisplayRect], p: Vec2) -> Vec2 {
         let top = f64::from(display.y);
         let bottom = top + f64::from(display.h);
         let candidate = Vec2 {
-            x: p.x.clamp(left, right),
-            y: p.y.clamp(top, bottom),
+            x: p.x.clamp(left, right - 1.0),
+            y: p.y.clamp(top, bottom - 1.0),
         };
         let distance_squared = (candidate.x - p.x).powi(2) + (candidate.y - p.y).powi(2);
 
@@ -786,8 +786,8 @@ mod tests {
         ];
 
         assert_eq!(
-            clamp_into_displays(&displays, Vec2 { x: 150.0, y: 120.0 }),
-            Vec2 { x: 100.0, y: 100.0 }
+            clamp_into_displays(&displays, Vec2 { x: 149.5, y: 120.0 }),
+            Vec2 { x: 99.0, y: 99.0 }
         );
         assert_eq!(
             clamp_into_displays(&displays, Vec2 { x: 240.5, y: 30.25 }),
