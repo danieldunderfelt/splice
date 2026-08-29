@@ -294,7 +294,10 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         return CallbackResult::Keep;
     }
 
-    st.note_physical_activity();
+    let capturing = st.is_capturing();
+    if !capturing {
+        st.note_physical_activity();
+    }
 
     let key_edge = key_edge_of(st, etype, event);
     if let Some((code, pressed)) = key_edge {
@@ -306,7 +309,7 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         }
     }
 
-    if !st.is_capturing() {
+    if !capturing {
         if let CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
         | CGEventType::RightMouseDragged

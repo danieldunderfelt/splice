@@ -28,6 +28,7 @@ const CFG_DEBOUNCE: Duration = Duration::from_secs(1);
 const CLIP_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Snap tolerance for SetPlacement (DESIGN/UI: 8 px magnetism).
 const SNAP_TOLERANCE: i32 = 8;
+const MOTION_BATCH_INTERVAL: Duration = Duration::from_millis(2);
 
 #[derive(Clone, PartialEq)]
 enum Focus {
@@ -131,6 +132,7 @@ pub struct Inner {
     tailscale_error: Option<String>,
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
+    last_motion_batch: Option<Instant>,
 
     clip_lamport: u64,
     clip_seen: Option<Stamp>,
@@ -196,6 +198,7 @@ impl Inner {
             tailscale_error: None,
             ui_deadline: None,
             cfg_deadline: None,
+            last_motion_batch: None,
             clip_lamport: 0,
             clip_seen: None,
             last_applied_inline: None,
@@ -399,6 +402,26 @@ impl Inner {
         events.push(first);
         while let Ok(ev) = self.platform_events.try_recv() {
             events.push(ev);
+        }
+        let has_motion = events.iter().any(|ev| {
+            matches!(
+                ev,
+                PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Motion { .. }))
+            )
+        });
+        if has_motion {
+            if let Some(deadline) = self
+                .last_motion_batch
+                .and_then(|last| last.checked_add(MOTION_BATCH_INTERVAL))
+                .filter(|deadline| *deadline > Instant::now())
+            {
+                while let Ok(Some(ev)) =
+                    tokio::time::timeout_at(deadline.into(), self.platform_events.recv()).await
+                {
+                    events.push(ev);
+                }
+            }
+            self.last_motion_batch = Some(Instant::now());
         }
         let mut merged: Vec<PlatformEvent> = Vec::with_capacity(events.len());
         for ev in events {

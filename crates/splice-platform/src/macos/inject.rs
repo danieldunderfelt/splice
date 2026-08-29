@@ -407,7 +407,6 @@ impl Emulate for Injector {
             let displays = self.core.shared.displays.read().clone();
             let mut st = self.core.state.lock();
             st.pos = clamp_to_displays(CGPoint::new(pos.x, pos.y), &displays);
-            let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(st.pos);
             self.core.post_motion(&mut st, 0.0, 0.0);
 
             let mut id: ffi::IOPMAssertionID = 0;
