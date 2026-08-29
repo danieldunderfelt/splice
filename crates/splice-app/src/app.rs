@@ -15,10 +15,17 @@ use splice_proto::{DisplayRect, LayoutDoc, MachineId, Os, Vec2I};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const CARD_PAD_X: f32 = 14.0;
-const CARD_PAD_TOP: f32 = 46.0;
-const CARD_PAD_BOTTOM: f32 = 34.0;
 const SNAP_PX: f32 = 8.0;
+/// Uniform gap between the fitted cluster and the canvas edges.
+const CANVAS_MARGIN: f32 = 24.0;
+/// Fit clamps: the max also caps a single machine at a sane on-screen size.
+const SCALE_MIN: f32 = 0.004;
+const SCALE_MAX: f32 = 0.5;
+/// Height of the header band overlaid at the top of each card.
+const HEADER_H: f32 = 50.0;
+/// Below these on-screen sizes a card renders hostname-only, without chrome.
+const COMPACT_W: f32 = 150.0;
+const COMPACT_H: f32 = 72.0;
 
 pub struct SpliceApp {
     ctrl: Controller,
@@ -252,18 +259,11 @@ impl SpliceApp {
             return;
         };
 
-        let avail = area.shrink(36.0);
-        let content_w = (max.x - min.x).max(1.0);
-        let content_h = (max.y - min.y).max(1.0);
-        let scale = (avail.width() / content_w)
-            .min(avail.height() / content_h)
-            .clamp(0.004, 0.5);
-        let origin = avail.center()
-            - vec2((min.x + max.x) / 2.0 * scale, (min.y + max.y) / 2.0 * scale);
-        let to_screen = |cx: f32, cy: f32| origin + vec2(cx * scale, cy * scale);
+        let fit = CanvasFit::new((min, max), area);
+        let scale = fit.scale;
+        let to_screen = |cx: f32, cy: f32| fit.to_screen(cx, cy);
 
-        // Pass 1: interactions (drag bookkeeping needs the previous frame's rects).
-        let mut toggles: Vec<(MachineId, bool)> = Vec::new();
+        // Pass 1: drag interactions (bookkeeping needs the previous frame's rects).
         for machine in &state.machines {
             let card = card_rect(
                 machine,
@@ -300,26 +300,9 @@ impl SpliceApp {
                     }
                 }
             }
-
-            let mut enabled = machine.enabled;
-            let toggle_rect = Rect::from_min_size(
-                pos2(card.right() - 10.0 - 38.0, card.bottom() - 8.0 - 22.0),
-                vec2(38.0, 22.0),
-            );
-            ui.scope_builder(
-                UiBuilder::new().max_rect(toggle_rect).layout(Layout::left_to_right(Align::Center)),
-                |ui| {
-                    if switch(ui, &mut enabled, self.ctrl.is_live()).changed() {
-                        toggles.push((machine.id.clone(), enabled));
-                    }
-                },
-            );
-        }
-        for (id, enabled) in toggles {
-            self.ctrl.send(Command::SetMachineEnabled(id, enabled));
         }
 
-        // Pass 2: paint.
+        // Pass 2: paint cards, then edge strips on top of the shared borders.
         for machine in &state.machines {
             let live_offset = self
                 .drag
@@ -346,6 +329,41 @@ impl SpliceApp {
                 ],
                 Stroke::new(4.0, color),
             );
+        }
+
+        // Pass 3: enable toggles, painted last so they sit on top of the cards.
+        // Compact cards get no toggle — there is no room for it inside the card.
+        let mut toggles: Vec<(MachineId, bool)> = Vec::new();
+        for machine in &state.machines {
+            let card = card_rect(
+                machine,
+                self.drag
+                    .as_ref()
+                    .filter(|d| d.id == machine.id)
+                    .map(|d| d.accum)
+                    .unwrap_or(Vec2::ZERO),
+                &to_screen,
+                scale,
+            );
+            if card.width() < COMPACT_W || card.height() < COMPACT_H {
+                continue;
+            }
+            let mut enabled = machine.enabled;
+            let toggle_rect = Rect::from_min_size(
+                pos2(card.right() - 10.0 - 38.0, card.bottom() - 8.0 - 22.0),
+                vec2(38.0, 22.0),
+            );
+            ui.scope_builder(
+                UiBuilder::new().max_rect(toggle_rect).layout(Layout::left_to_right(Align::Center)),
+                |ui| {
+                    if switch(ui, &mut enabled, self.ctrl.is_live()).changed() {
+                        toggles.push((machine.id.clone(), enabled));
+                    }
+                },
+            );
+        }
+        for (id, enabled) in toggles {
+            self.ctrl.send(Command::SetMachineEnabled(id, enabled));
         }
     }
 
@@ -435,6 +453,32 @@ impl eframe::App for SpliceApp {
     }
 }
 
+/// Uniform canvas→screen fit: the largest clamped scale that fits the content
+/// bounds into `area` minus `CANVAS_MARGIN`, centred in both axes. Pure math so
+/// unit tests can exercise it without an egui context.
+struct CanvasFit {
+    scale: f32,
+    origin: Pos2,
+}
+
+impl CanvasFit {
+    fn new((min, max): (Pos2, Pos2), area: Rect) -> Self {
+        let avail = area.shrink(CANVAS_MARGIN);
+        let content_w = (max.x - min.x).max(1.0);
+        let content_h = (max.y - min.y).max(1.0);
+        let scale = (avail.width() / content_w)
+            .min(avail.height() / content_h)
+            .clamp(SCALE_MIN, SCALE_MAX);
+        let origin = avail.center()
+            - vec2((min.x + max.x) / 2.0 * scale, (min.y + max.y) / 2.0 * scale);
+        CanvasFit { scale, origin }
+    }
+
+    fn to_screen(&self, cx: f32, cy: f32) -> Pos2 {
+        self.origin + vec2(cx * self.scale, cy * self.scale)
+    }
+}
+
 /// Union of all machines' display rects in canvas coordinates.
 fn content_bounds(state: &UiState) -> Option<(Pos2, Pos2)> {
     let mut min = pos2(f32::MAX, f32::MAX);
@@ -457,7 +501,10 @@ fn content_bounds(state: &UiState) -> Option<(Pos2, Pos2)> {
     any.then_some((min, max))
 }
 
-/// Card rect (screen px): the machine's display union plus header/toggle margins.
+/// Card rect (screen px): EXACTLY the machine's scaled display union. Machines
+/// are adjacent in canvas space and must stay adjacent on screen — touching
+/// edges are crossable edges — so all chrome lives inside this rect and two
+/// cards never overlap unless the machine geometries themselves overlap.
 fn card_rect(
     machine: &UiMachine,
     live_offset: Vec2,
@@ -478,10 +525,7 @@ fn card_rect(
     if union == Rect::NOTHING {
         union = Rect::from_min_size(to_screen(machine.offset.x as f32, machine.offset.y as f32), vec2(40.0, 30.0));
     }
-    Rect::from_min_max(
-        union.min - vec2(CARD_PAD_X, CARD_PAD_TOP),
-        union.max + vec2(CARD_PAD_X, CARD_PAD_BOTTOM),
-    )
+    union
 }
 
 fn draw_card(
@@ -505,22 +549,14 @@ fn draw_card(
     };
 
     let card = card_rect(machine, live_offset, to_screen, scale);
+    // All card content paints into a painter clipped to the card rect, so no
+    // chrome can bleed into a neighbouring (touching) card.
+    let painter = &painter.with_clip_rect(card);
+
     let fill = shade(theme::card_fill(dark));
     painter.rect_filled(card, CornerRadius::same(12), fill);
 
-    let border = if is_self {
-        theme::ACCENT
-    } else {
-        theme::card_border(dark)
-    };
-    painter.rect_stroke(
-        card,
-        CornerRadius::same(12),
-        Stroke::new(if is_self { 2.0 } else { 1.0 }, shade(border)),
-        StrokeKind::Inside,
-    );
-
-    // Displays, drawn to scale inside the card.
+    // Displays at their true scaled positions: they tile the card exactly.
     for display in &machine.displays {
         let top_left = to_screen(
             (machine.offset.x + display.x) as f32,
@@ -539,25 +575,88 @@ fn draw_card(
         );
     }
 
+    // Border on top of the display fills: cards touch exactly, so the stroke is
+    // what visually separates neighbours (accent for this machine).
+    let border = if is_self {
+        theme::ACCENT
+    } else {
+        theme::card_border(dark)
+    };
+    painter.rect_stroke(
+        card,
+        CornerRadius::same(12),
+        Stroke::new(if is_self { 2.0 } else { 1.0 }, shade(border)),
+        StrokeKind::Inside,
+    );
+
     let style = painter.ctx().style_of(painter.ctx().theme());
     let ink = style.visuals.strong_text_color();
     let weak = style.visuals.weak_text_color();
 
-    // OS glyph + hostname.
-    let glyph_rect = Rect::from_min_size(card.min + vec2(12.0, 10.0), vec2(18.0, 18.0));
-    draw_os_glyph(painter, glyph_rect, machine.os, shade(ink), fill);
-    painter.text(
-        pos2(glyph_rect.right() + 8.0, card.top() + 11.0),
-        Align2::LEFT_TOP,
-        &machine.hostname,
-        FontId::proportional(14.5),
-        shade(ink),
+    if card.width() < COMPACT_W || card.height() < COMPACT_H {
+        // Too small for the header band: hostname only, elided to the card.
+        let galley = elide(
+            painter,
+            &machine.hostname,
+            FontId::proportional(12.5),
+            (card.width() - 12.0).max(8.0),
+        );
+        painter.galley(pos2(card.left() + 6.0, card.top() + 6.0), galley, shade(ink));
+        return;
+    }
+
+    // Header band: semi-transparent scrim across the top so the chrome stays
+    // readable against the display fills underneath.
+    let band = Rect::from_min_size(card.min, vec2(card.width(), HEADER_H));
+    let scrim = if dark {
+        Color32::from_black_alpha(110)
+    } else {
+        Color32::from_white_alpha(180)
+    };
+    painter.rect_filled(
+        band,
+        CornerRadius {
+            nw: 12,
+            ne: 12,
+            sw: 0,
+            se: 0,
+        },
+        shade(scrim),
     );
 
+    // SOURCE chip (top-right of the band).
+    let mut name_right = card.right() - 10.0;
+    if machine.is_source {
+        let galley = painter.layout_no_wrap(
+            "SOURCE".into(),
+            FontId::proportional(10.0),
+            Color32::WHITE,
+        );
+        let chip = Rect::from_min_size(
+            pos2(card.right() - 12.0 - galley.size().x - 14.0, card.top() + 11.0),
+            galley.size() + vec2(14.0, 6.0),
+        );
+        painter.rect_filled(chip, CornerRadius::same(8), shade(theme::ACCENT));
+        painter.galley(chip.min + vec2(7.0, 3.0), galley, Color32::WHITE);
+        name_right = chip.left() - 8.0;
+    }
+
+    // OS glyph + hostname, elided ahead of the chip.
+    let glyph_rect = Rect::from_min_size(card.min + vec2(10.0, 8.0), vec2(18.0, 18.0));
+    draw_os_glyph(painter, glyph_rect, machine.os, shade(ink), fill);
+    let name_x = glyph_rect.right() + 8.0;
+    let galley = elide(
+        painter,
+        &machine.hostname,
+        FontId::proportional(14.5),
+        (name_right - name_x).max(8.0),
+    );
+    painter.galley(pos2(name_x, card.top() + 9.0), galley, shade(ink));
+
     // Connection badge.
-    let badge_y = card.top() + 33.0;
-    let dot_center = pos2(card.left() + 16.0, badge_y + 5.0);
-    let text_pos = pos2(card.left() + 26.0, badge_y);
+    let badge_y = card.top() + 31.0;
+    let dot_center = pos2(card.left() + 14.0, badge_y + 5.0);
+    let text_pos = pos2(card.left() + 24.0, badge_y);
     match &machine.connection {
         UiConnection::SelfMachine => {
             painter.text(
@@ -606,21 +705,27 @@ fn draw_card(
             );
         }
     }
+}
 
-    // SOURCE chip.
-    if machine.is_source {
-        let galley = painter.layout_no_wrap(
-            "SOURCE".into(),
-            FontId::proportional(10.0),
-            Color32::WHITE,
-        );
-        let chip = Rect::from_min_size(
-            pos2(card.right() - 12.0 - galley.size().x - 14.0, card.top() + 11.0),
-            galley.size() + vec2(14.0, 6.0),
-        );
-        painter.rect_filled(chip, CornerRadius::same(8), shade(theme::ACCENT));
-        painter.galley(chip.min + vec2(7.0, 3.0), galley, Color32::WHITE);
+/// Hostname that fits `max_width`, truncated with an ellipsis if needed.
+fn elide(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let galley = painter.layout_no_wrap(text.into(), font.clone(), Color32::WHITE);
+    if galley.size().x <= max_width {
+        return galley;
     }
+    let mut truncated = text.to_owned();
+    while truncated.pop().is_some() && !truncated.is_empty() {
+        let galley = painter.layout_no_wrap(format!("{truncated}…"), font.clone(), Color32::WHITE);
+        if galley.size().x <= max_width {
+            return galley;
+        }
+    }
+    painter.layout_no_wrap("…".into(), font, Color32::WHITE)
 }
 
 /// Simple vector OS glyphs (no icon assets).
@@ -828,4 +933,67 @@ fn health_rows(state: &UiState) -> Vec<(String, String, String)> {
         rows.push(("Clipboard sync".into(), detail.clone(), hint.into()));
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A card is exactly the machine's scaled display union, so canvas-space
+    /// adjacency must render as screen-space adjacency: no pair of cards may
+    /// overlap (touching borders are fine — their intersection is degenerate).
+    #[test]
+    fn preview_cards_do_not_overlap() {
+        let state = crate::runtime::preview::initial_state();
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
+        let bounds = content_bounds(&state).expect("preview state has machines");
+        let fit = CanvasFit::new(bounds, area);
+        let to_screen = |cx: f32, cy: f32| fit.to_screen(cx, cy);
+
+        let cards: Vec<(&str, Rect)> = state
+            .machines
+            .iter()
+            .map(|m| {
+                (
+                    m.hostname.as_str(),
+                    card_rect(m, Vec2::ZERO, &to_screen, fit.scale),
+                )
+            })
+            .collect();
+        assert!(cards.len() >= 2, "preview should have several machines");
+
+        for (i, (name_a, a)) in cards.iter().enumerate() {
+            assert!(a.is_positive(), "card for {name_a} has no area: {a:?}");
+            assert!(
+                area.contains_rect(*a),
+                "card for {name_a} escapes the canvas: {a:?} not in {area:?}",
+            );
+            for (name_b, b) in &cards[i + 1..] {
+                let overlap = a.intersect(*b);
+                assert!(
+                    !overlap.is_positive(),
+                    "cards for {name_a} and {name_b} overlap by {overlap:?}",
+                );
+            }
+        }
+    }
+
+    /// The fit must centre the content in the available area and respect the
+    /// scale clamps, so a single machine is never blown up past SCALE_MAX.
+    #[test]
+    fn canvas_fit_centres_and_clamps() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
+
+        // Single 1920x1080 machine: the raw fit scale would exceed SCALE_MAX.
+        let fit = CanvasFit::new((pos2(0.0, 0.0), pos2(1920.0, 1080.0)), area);
+        assert!((fit.scale - SCALE_MAX).abs() < f32::EPSILON);
+        let center = fit.to_screen(960.0, 540.0);
+        let avail = area.shrink(CANVAS_MARGIN);
+        assert!((center.x - avail.center().x).abs() < 0.01);
+        assert!((center.y - avail.center().y).abs() < 0.01);
+
+        // Huge cluster: clamped at SCALE_MIN, still centred.
+        let fit = CanvasFit::new((pos2(0.0, 0.0), pos2(1.0e7, 1.0e7)), area);
+        assert!((fit.scale - SCALE_MIN).abs() < f32::EPSILON);
+    }
 }
