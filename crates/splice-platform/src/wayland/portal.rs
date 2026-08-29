@@ -26,7 +26,7 @@ pub type Results = HashMap<String, OwnedValue>;
 
 static TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn next_token() -> String {
+pub fn next_token() -> String {
     let n = TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
     format!("splice{}_{n}", std::process::id())
 }
@@ -122,6 +122,14 @@ pub fn session_signal(msg: &zbus::Message) -> Option<(String, Results)> {
 /// mistyped fields come back as None.
 pub fn get<T: TryFrom<OwnedValue>>(results: &Results, key: &str) -> Option<T> {
     T::try_from(results.get(key)?.clone()).ok()
+}
+
+/// Extract a portal session handle. Although the specification declares an object
+/// path, some portal/backend combinations return a string in the response vardict.
+pub fn session_handle(results: &Results) -> Option<String> {
+    get::<OwnedObjectPath>(results, "session_handle")
+        .map(|path| path.to_string())
+        .or_else(|| get::<String>(results, "session_handle"))
 }
 
 /// ObjectPath for a session handle string, for use as a method argument (`o`).

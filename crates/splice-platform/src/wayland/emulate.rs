@@ -22,7 +22,7 @@ use reis::ei::keyboard::KeyState;
 use reis::event::{DeviceCapability, EiEvent};
 use splice_proto::{InputEvent, PointerButton, Vec2};
 use tokio::sync::{mpsc, watch};
-use zbus::zvariant::{OwnedFd, OwnedObjectPath, Value};
+use zbus::zvariant::{OwnedFd, Value};
 
 use super::clipboard::ClipSession;
 use super::portal::{self, Options};
@@ -288,9 +288,8 @@ async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<(Sess
         (opts,)
     })
     .await?;
-    let session_path = portal::get::<OwnedObjectPath>(&created, "session_handle")
-        .ok_or_else(|| PlatformError::Unavailable("CreateSession returned no session_handle".into()))?
-        .to_string();
+    let session_path = portal::session_handle(&created)
+        .ok_or_else(|| PlatformError::Unavailable("CreateSession returned no valid session_handle".into()))?;
     let session_opath = portal::object_path(&session_path)?;
 
     // RequestClipboard must be called before Start or the grant can never happen.
@@ -304,15 +303,17 @@ async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<(Sess
 
     let restore_token = tokens.get(TokenKind::RemoteDesktop);
     let used_token = restore_token.is_some();
-    let mut select_opts = Options::new();
-    select_opts.insert("types", Value::new(DEV_KEYBOARD | DEV_POINTER));
-    select_opts.insert("persist_mode", Value::new(PERSIST));
-    if let Some(restore) = restore_token {
-        select_opts.insert("restore_token", Value::new(restore));
-    }
-    rd.call::<_, _, ()>("SelectDevices", &(session_opath.clone(), select_opts))
-        .await
-        .map_err(portal::err_ctx("SelectDevices"))?;
+    portal::request(conn, &rd, "SelectDevices", |token| {
+        let mut opts = Options::new();
+        opts.insert("handle_token", Value::new(token.to_owned()));
+        opts.insert("types", Value::new(DEV_KEYBOARD | DEV_POINTER));
+        opts.insert("persist_mode", Value::new(PERSIST));
+        if let Some(restore) = restore_token {
+            opts.insert("restore_token", Value::new(restore));
+        }
+        (session_opath.clone(), opts)
+    })
+    .await?;
 
     let started = portal::request(conn, &rd, "Start", |token| {
         let mut opts = Options::new();

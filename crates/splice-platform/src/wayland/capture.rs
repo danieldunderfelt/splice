@@ -7,7 +7,6 @@
 //! - Capture activates only when the cursor hits a barrier; there is no way to force it,
 //!   so `begin_capture` is a no-op and forwarding starts at `Activated`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +18,7 @@ use reis::ei::keyboard::KeyState;
 use reis::event::{DeviceCapability, EiEvent};
 use splice_proto::{DisplayRect, InputEvent, PointerButton, Vec2};
 use tokio::sync::{mpsc, Notify};
-use zbus::zvariant::{OwnedFd, OwnedObjectPath, Value};
+use zbus::zvariant::{OwnedFd, Value};
 
 use super::portal::{self, Options};
 use super::tokens::{TokenKind, TokenStore};
@@ -224,40 +223,52 @@ async fn establish(
 ) -> Result<Session> {
     let ic = portal::proxy(conn, IFACE).await?;
     let version = portal::version(&ic).await;
-    if version < 2 {
-        return Err(PlatformError::Unavailable(format!(
-            "InputCapture portal v2 required (CreateSession2), found v{version}"
-        )));
-    }
-
-    let created = portal::request(conn, &ic, "CreateSession2", |token| {
+    let (created, already_started) = if version >= 2 {
+        // CreateSession2 returns its results directly; it does not emit Request::Response.
         let mut opts = Options::new();
-        opts.insert("handle_token", Value::new(token.to_owned()));
-        opts.insert("session_handle_token", Value::new(token.to_owned()));
-        (opts,)
-    })
-    .await?;
-    let session_path = portal::get::<OwnedObjectPath>(&created, "session_handle")
-        .ok_or_else(|| PlatformError::Unavailable("CreateSession2 returned no session_handle".into()))?
-        .to_string();
+        opts.insert("session_handle_token", Value::new(portal::next_token()));
+        let results: portal::Results = ic
+            .call("CreateSession2", &(opts,))
+            .await
+            .map_err(portal::err_ctx("CreateSession2"))?;
+        (results, false)
+    } else {
+        // Version 1 creates and starts the session in one request. Start is v2-only.
+        let results = portal::request(conn, &ic, "CreateSession", |token| {
+            let mut opts = Options::new();
+            opts.insert("handle_token", Value::new(token.to_owned()));
+            opts.insert("session_handle_token", Value::new(token.to_owned()));
+            opts.insert("capabilities", Value::new(CAP_KEYBOARD | CAP_POINTER));
+            ("", opts)
+        })
+        .await?;
+        (results, true)
+    };
+    let session_path = portal::session_handle(&created)
+        .ok_or_else(|| PlatformError::Unavailable("CreateSession returned no valid session_handle".into()))?;
     let session_opath = portal::object_path(&session_path)?;
 
-    let restore_token = tokens.get(TokenKind::InputCapture);
-    let started = portal::request(conn, &ic, "Start", |token| {
-        let mut opts = Options::new();
-        opts.insert("handle_token", Value::new(token.to_owned()));
-        opts.insert("capabilities", Value::new(CAP_KEYBOARD | CAP_POINTER));
-        opts.insert("persist_mode", Value::new(PERSIST));
-        if let Some(restore) = restore_token {
-            opts.insert("restore_token", Value::new(restore));
+    let granted = if already_started {
+        created
+    } else {
+        let restore_token = tokens.get(TokenKind::InputCapture);
+        let started = portal::request(conn, &ic, "Start", |token| {
+            let mut opts = Options::new();
+            opts.insert("handle_token", Value::new(token.to_owned()));
+            opts.insert("capabilities", Value::new(CAP_KEYBOARD | CAP_POINTER));
+            opts.insert("persist_mode", Value::new(PERSIST));
+            if let Some(restore) = restore_token {
+                opts.insert("restore_token", Value::new(restore));
+            }
+            (session_opath.clone(), "", opts)
+        })
+        .await?;
+        if let Some(token) = portal::get::<String>(&started, "restore_token") {
+            tokens.set(TokenKind::InputCapture, token);
         }
-        (session_opath.clone(), "", opts)
-    })
-    .await?;
-    if let Some(token) = portal::get::<String>(&started, "restore_token") {
-        tokens.set(TokenKind::InputCapture, token);
-    }
-    let capabilities = portal::get::<u32>(&started, "capabilities").unwrap_or(0);
+        started
+    };
+    let capabilities = portal::get::<u32>(&granted, "capabilities").unwrap_or(0);
     if capabilities & (CAP_KEYBOARD | CAP_POINTER) != CAP_KEYBOARD | CAP_POINTER {
         return Err(PlatformError::Permission(format!(
             "InputCapture granted capabilities {capabilities:#x}, need keyboard+pointer"
@@ -309,10 +320,13 @@ async fn apply_barriers(
     session: &mut Session,
     edges: &[EdgeSpec],
 ) -> Result<()> {
-    let mut barriers: HashMap<u32, (i32, i32, i32, i32)> = HashMap::new();
+    let mut barriers = Vec::new();
     for (i, edge) in edges.iter().enumerate() {
         if let Some(pos) = edge_barrier(edge) {
-            barriers.insert(i as u32 + 1, pos);
+            let mut barrier = Options::new();
+            barrier.insert("barrier_id", Value::new(i as u32 + 1));
+            barrier.insert("position", Value::new(pos));
+            barriers.push(barrier);
         }
     }
     let session_opath = session.session_opath.clone();
