@@ -14,7 +14,25 @@ mod runtime;
 mod theme;
 mod tray;
 
+#[cfg(target_os = "linux")]
+fn restore_dumpability_after_group_activation() {
+    // `sg` is setgid, so Linux marks its descendants non-dumpable. Desktop
+    // portals inspect /proc/<pid>/root using a ptrace-style access check and
+    // reject the session while that flag is clear. Splice now has ordinary
+    // user credentials again, so restore the normal exec-time value.
+    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+    if result != 0 {
+        eprintln!(
+            "warning: could not restore process dumpability after input-group activation: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    #[cfg(target_os = "linux")]
+    restore_dumpability_after_group_activation();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

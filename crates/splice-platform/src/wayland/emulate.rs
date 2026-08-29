@@ -192,13 +192,22 @@ type Region = (u32, u32, u32, u32);
 
 #[derive(Default)]
 struct Devices {
-    /// Every event device, deduplicated for start/stop_emulating.
-    all: Vec<reis::event::Device>,
+    /// Every event device and its EIS lifecycle state. A newly advertised device is
+    /// paused; sending start_emulating, input, or frame before DeviceResumed is a
+    /// protocol violation and makes GNOME disconnect the whole EIS connection.
+    all: Vec<TrackedDevice>,
     keyboard: Option<(ei::Device, ei::Keyboard)>,
     pointer: Option<(ei::Device, ei::Pointer)>,
     pointer_abs: Option<(ei::Device, ei::PointerAbsolute, Vec<Region>)>,
     scroll: Option<(ei::Device, ei::Scroll)>,
     button: Option<(ei::Device, ei::Button)>,
+}
+
+struct TrackedDevice {
+    device: reis::event::Device,
+    resumed: bool,
+    emulating: bool,
+    resume_serial: u32,
 }
 
 impl Devices {
@@ -233,7 +242,12 @@ impl Devices {
                 self.button = Some((device.device().clone(), iface));
             }
         }
-        self.all.push(device);
+        self.all.push(TrackedDevice {
+            device,
+            resumed: false,
+            emulating: false,
+            resume_serial: 0,
+        });
     }
 
     fn remove(&mut self, device: &reis::event::Device) {
@@ -252,7 +266,53 @@ impl Devices {
                 self.pointer_abs = None;
             }
         }
-        self.all.retain(|d| d != device);
+        self.all.retain(|d| d.device != *device);
+    }
+
+    fn resume(&mut self, device: &reis::event::Device, serial: u32, sequence: Option<u32>) {
+        let Some(tracked) = self.all.iter_mut().find(|d| d.device == *device) else {
+            return;
+        };
+        tracked.resumed = true;
+        tracked.resume_serial = serial;
+        if let Some(sequence) = sequence {
+            tracked.device.device().start_emulating(serial, sequence);
+            tracked.emulating = true;
+        }
+    }
+
+    fn pause(&mut self, device: &reis::event::Device) {
+        if let Some(tracked) = self.all.iter_mut().find(|d| d.device == *device) {
+            tracked.resumed = false;
+            tracked.emulating = false;
+        }
+    }
+
+    fn start_resumed(&mut self, sequence: u32) {
+        for tracked in &mut self.all {
+            if tracked.resumed && !tracked.emulating {
+                // The most recently received EIS serial is the serial from the
+                // corresponding DeviceResumed event.
+                tracked
+                    .device
+                    .device()
+                    .start_emulating(tracked.resume_serial, sequence);
+                tracked.emulating = true;
+            }
+        }
+    }
+
+    fn stop_emulating(&mut self, serial: u32) {
+        for tracked in &mut self.all {
+            if tracked.emulating {
+                tracked.device.device().stop_emulating(serial);
+                tracked.emulating = false;
+            }
+        }
+    }
+
+    fn is_emulating(&self, device: &ei::Device) -> bool {
+        self.all.iter().any(|tracked| tracked.device.device() == device && tracked.emulating)
     }
 
     fn abs_region_containing(&self, x: f64, y: f64) -> bool {
@@ -353,6 +413,8 @@ async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<(Sess
 #[derive(Default)]
 struct Active {
     emulating: bool,
+    sequence: u32,
+    pending_position: Option<Vec2>,
     held_keys: HashSet<u32>,
     held_buttons: HashSet<u32>,
     scroll_rem_x: i32,
@@ -409,6 +471,7 @@ async fn run(
                 }));
                 let resume = entered.take();
                 run_session(
+                    &shared,
                     &conn,
                     session,
                     &mut cmd_rx,
@@ -431,6 +494,7 @@ async fn run(
 /// Runs one live session. `resume` re-enters a session that was active when the previous
 /// portal session died.
 async fn run_session(
+    shared: &Arc<WaylandShared>,
     conn: &zbus::Connection,
     mut session: Session,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
@@ -442,6 +506,9 @@ async fn run_session(
         Ok(p) => p,
         Err(err) => {
             tracing::warn!(error = %err, "cannot watch remote desktop session");
+            shared.set_health(|h| {
+                h.emulate = Some(format!("cannot watch remote desktop session: {err}"))
+            });
             return;
         }
     };
@@ -449,6 +516,9 @@ async fn run_session(
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(error = %err, "cannot subscribe to Session.Closed");
+            shared.set_health(|h| {
+                h.emulate = Some(format!("cannot watch remote desktop closure: {err}"))
+            });
             return;
         }
     };
@@ -457,20 +527,23 @@ async fn run_session(
     let mut active = Active::default();
 
     if let Some(pos) = resume {
-        do_enter(&session, &devices, &mut active, screensaver, pos);
+        do_enter(&session, &mut devices, &mut active, screensaver, pos);
     }
 
     loop {
         tokio::select! {
             _ = closed.next() => {
                 tracing::warn!("remote desktop session closed by portal");
+                shared.set_health(|h| {
+                    h.emulate = Some("remote desktop session closed by portal".into())
+                });
                 return;
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     Command::Enter(pos) => {
-                        do_enter(&session, &devices, &mut active, screensaver, pos);
+                        do_enter(&session, &mut devices, &mut active, screensaver, pos);
                         *entered = Some(pos);
                     }
                     Command::Inject(ev) => {
@@ -479,7 +552,7 @@ async fn run_session(
                         }
                     }
                     Command::Leave => {
-                        do_leave(&session, &devices, &mut active, screensaver);
+                        do_leave(&session, &mut devices, &mut active, screensaver);
                         *entered = None;
                     }
                     Command::ReleaseAll => {
@@ -492,10 +565,16 @@ async fn run_session(
                 match event {
                     None => {
                         tracing::warn!("ei stream ended");
+                        shared.set_health(|h| {
+                            h.emulate = Some("input emulation transport ended".into())
+                        });
                         return;
                     }
                     Some(Err(err)) => {
                         tracing::warn!(error = %err, "ei stream error");
+                        shared.set_health(|h| {
+                            h.emulate = Some(format!("input emulation transport error: {err}"))
+                        });
                         return;
                     }
                     Some(Ok(EiEvent::SeatAdded(added))) => {
@@ -507,26 +586,57 @@ async fn run_session(
                                 | DeviceCapability::Scroll,
                         );
                         if session.connection.flush().is_err() {
+                            shared.set_health(|h| {
+                                h.emulate = Some("input emulation transport write failed".into())
+                            });
                             return;
                         }
                     }
                     Some(Ok(EiEvent::DeviceAdded(added))) => {
-                        let new_device = added.device.clone();
                         devices.add(added.device);
-                        if active.emulating {
-                            // Devices arriving mid-session must be started explicitly.
-                            new_device.device().start_emulating(
-                                session.connection.serial(),
-                                EMULATE_SEQ.load(Ordering::Relaxed),
-                            );
-                            let _ = session.connection.flush();
-                        }
                     }
                     Some(Ok(EiEvent::DeviceRemoved(removed))) => {
                         devices.remove(&removed.device);
                     }
+                    Some(Ok(EiEvent::DeviceResumed(resumed))) => {
+                        tracing::debug!(device = ?resumed.device, "input emulation device resumed");
+                        devices.resume(
+                            &resumed.device,
+                            resumed.serial,
+                            active.emulating.then_some(active.sequence),
+                        );
+                        if active.emulating {
+                            send_pending_position(&session, &devices, &mut active);
+                        }
+                        let _ = session.connection.flush();
+                    }
+                    Some(Ok(EiEvent::DevicePaused(paused))) => {
+                        tracing::debug!(device = ?paused.device, "input emulation device paused");
+                        devices.pause(&paused.device);
+                        // EIS resets a paused device's input state. Drop our ledger
+                        // too so a later resume cannot emit stale release events.
+                        active.held_keys.clear();
+                        active.held_buttons.clear();
+                        active.scroll_rem_x = 0;
+                        active.scroll_rem_y = 0;
+                    }
                     Some(Ok(EiEvent::Disconnected(disconnected))) => {
-                        tracing::warn!(reason = ?disconnected.reason, "ei disconnected");
+                        tracing::warn!(
+                            reason = ?disconnected.reason,
+                            explanation = ?disconnected.explanation,
+                            "ei disconnected"
+                        );
+                        let explanation = disconnected
+                            .explanation
+                            .as_deref()
+                            .map(|text| format!(": {text}"))
+                            .unwrap_or_default();
+                        shared.set_health(|h| {
+                            h.emulate = Some(format!(
+                                "input emulation disconnected ({:?}){explanation}",
+                                disconnected.reason
+                            ))
+                        });
                         return;
                     }
                     Some(Ok(_)) => {}
@@ -538,7 +648,7 @@ async fn run_session(
 
 fn do_enter(
     session: &Session,
-    devices: &Devices,
+    devices: &mut Devices,
     active: &mut Active,
     screensaver: &Arc<ScreenSaver>,
     pos: Vec2,
@@ -554,18 +664,10 @@ fn do_enter(
 
     // One sequence per enter, shared by all devices; monotonic across sessions.
     let seq = EMULATE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-    for device in &devices.all {
-        device.device().start_emulating(session.connection.serial(), seq);
-    }
-
-    // Absolute positioning requires the point inside a device region; out-of-region
-    // coordinates are silently discarded, so fall back to a relative-motion no-op.
-    if devices.abs_region_containing(pos.x, pos.y) {
-        if let Some((device, iface, _)) = &devices.pointer_abs {
-            iface.motion_absolute(pos.x as f32, pos.y as f32);
-            device.frame(session.connection.serial(), now_micros());
-        }
-    }
+    active.sequence = seq;
+    active.pending_position = Some(pos);
+    devices.start_resumed(seq);
+    send_pending_position(session, devices, active);
     let _ = session.connection.flush();
 
     let screensaver = screensaver.clone();
@@ -574,7 +676,7 @@ fn do_enter(
 
 fn do_leave(
     session: &Session,
-    devices: &Devices,
+    devices: &mut Devices,
     active: &mut Active,
     screensaver: &Arc<ScreenSaver>,
 ) {
@@ -583,30 +685,50 @@ fn do_leave(
     let _ = tokio::spawn(async move { screensaver.uninhibit().await });
 }
 
-fn do_leave_inner(session: &Session, devices: &Devices, active: &mut Active) {
+fn do_leave_inner(session: &Session, devices: &mut Devices, active: &mut Active) {
     release_held(session, devices, active);
     if active.emulating {
-        for device in &devices.all {
-            device.device().stop_emulating(session.connection.serial());
-        }
+        devices.stop_emulating(session.connection.serial());
     }
     active.emulating = false;
+    active.pending_position = None;
     let _ = session.connection.flush();
 }
 
 fn release_held(session: &Session, devices: &Devices, active: &mut Active) {
+    let keys: Vec<_> = active.held_keys.drain().collect();
     if let Some((device, keyboard)) = &devices.keyboard {
-        for key in active.held_keys.drain() {
-            keyboard.key(key, KeyState::Released);
+        if devices.is_emulating(device) && !keys.is_empty() {
+            for key in keys {
+                keyboard.key(key, KeyState::Released);
+            }
+            device.frame(session.connection.serial(), now_micros());
         }
-        device.frame(session.connection.serial(), now_micros());
     }
+    let buttons: Vec<_> = active.held_buttons.drain().collect();
     if let Some((device, button)) = &devices.button {
-        for code in active.held_buttons.drain() {
-            button.button(code, ButtonState::Released);
+        if devices.is_emulating(device) && !buttons.is_empty() {
+            for code in buttons {
+                button.button(code, ButtonState::Released);
+            }
+            device.frame(session.connection.serial(), now_micros());
         }
+    }
+}
+
+fn send_pending_position(session: &Session, devices: &Devices, active: &mut Active) {
+    let Some(pos) = active.pending_position else { return };
+    let Some((device, iface, _)) = &devices.pointer_abs else { return };
+    if !devices.is_emulating(device) {
+        return;
+    }
+    // Absolute positioning requires the point inside a device region;
+    // out-of-region coordinates are silently discarded.
+    if devices.abs_region_containing(pos.x, pos.y) {
+        iface.motion_absolute(pos.x as f32, pos.y as f32);
         device.frame(session.connection.serial(), now_micros());
     }
+    active.pending_position = None;
 }
 
 fn inject(session: &Session, devices: &Devices, active: &mut Active, ev: InputEvent) {
@@ -614,12 +736,17 @@ fn inject(session: &Session, devices: &Devices, active: &mut Active, ev: InputEv
     match ev {
         InputEvent::Motion { dx, dy } => {
             if let Some((device, pointer)) = &devices.pointer {
-                pointer.motion_relative(dx as f32, dy as f32);
-                device.frame(serial, now_micros());
+                if devices.is_emulating(device) {
+                    pointer.motion_relative(dx as f32, dy as f32);
+                    device.frame(serial, now_micros());
+                }
             }
         }
         InputEvent::Button { button, pressed } => {
             if let Some((device, iface)) = &devices.button {
+                if !devices.is_emulating(device) {
+                    return;
+                }
                 let code = match button {
                     PointerButton::Left => BTN_LEFT,
                     PointerButton::Right => BTN_LEFT + 1,
@@ -641,6 +768,9 @@ fn inject(session: &Session, devices: &Devices, active: &mut Active, ev: InputEv
         }
         InputEvent::Key { code, pressed } => {
             if let Some((device, keyboard)) = &devices.keyboard {
+                if !devices.is_emulating(device) {
+                    return;
+                }
                 let state = if pressed { KeyState::Press } else { KeyState::Released };
                 keyboard.key(code, state);
                 if pressed {
@@ -653,11 +783,17 @@ fn inject(session: &Session, devices: &Devices, active: &mut Active, ev: InputEv
         }
         InputEvent::ScrollPixels { dx, dy } => {
             if let Some((device, scroll)) = &devices.scroll {
-                scroll.scroll(dx as f32, dy as f32);
-                device.frame(serial, now_micros());
+                if devices.is_emulating(device) {
+                    scroll.scroll(dx as f32, dy as f32);
+                    device.frame(serial, now_micros());
+                }
             }
         }
         InputEvent::Scroll120 { dx, dy } => {
+            let Some((device, scroll)) = &devices.scroll else { return };
+            if !devices.is_emulating(device) {
+                return;
+            }
             // GNOME silently drops sub-120 remainders; accumulate and emit whole
             // detents only (i32 division is trunc-toward-zero, as required).
             active.scroll_rem_x += dx;
@@ -665,18 +801,18 @@ fn inject(session: &Session, devices: &Devices, active: &mut Active, ev: InputEv
             let steps_x = active.scroll_rem_x / 120;
             let steps_y = active.scroll_rem_y / 120;
             if steps_x != 0 || steps_y != 0 {
-                if let Some((device, scroll)) = &devices.scroll {
-                    scroll.scroll_discrete(steps_x * 120, steps_y * 120);
-                    device.frame(serial, now_micros());
-                }
+                scroll.scroll_discrete(steps_x * 120, steps_y * 120);
+                device.frame(serial, now_micros());
                 active.scroll_rem_x -= steps_x * 120;
                 active.scroll_rem_y -= steps_y * 120;
             }
         }
         InputEvent::ScrollStop { cancel } => {
             if let Some((device, scroll)) = &devices.scroll {
-                scroll.scroll_stop(1, 1, cancel as u32);
-                device.frame(serial, now_micros());
+                if devices.is_emulating(device) {
+                    scroll.scroll_stop(1, 1, cancel as u32);
+                    device.frame(serial, now_micros());
+                }
             }
         }
     }

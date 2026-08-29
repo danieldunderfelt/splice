@@ -3,7 +3,7 @@ Description=Splice software KVM
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/splice
+ExecStart=%h/.local/bin/splice-launch
 Restart=on-failure
 RestartSec=3
 

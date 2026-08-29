@@ -1,8 +1,9 @@
 //! Capture side (this machine as source): InputCapture portal session + reis receiver.
 //!
 //! Load-bearing rules from docs/research/wayland-input.md:
-//! - NEVER call `Disable()` (mutter bug #3908); barrier changes are SetPointerBarriers +
-//!   Enable on the SAME session, and barrier updates already suspend the session.
+//! - NEVER call `Disable()` (mutter bug #3908). GNOME also rejects barrier changes on an
+//!   enabled session, so start disabled when no edges exist and recreate only when a real
+//!   barrier/topology change cannot be applied to the current disabled session.
 //! - Restore tokens are single-use; the replacement is persisted on every Start.
 //! - Capture activates only when the cursor hits a barrier; there is no way to force it,
 //!   so `begin_capture` is a no-op and forwarding starts at `Activated`.
@@ -53,7 +54,12 @@ pub struct WaylandCapture {
 #[async_trait::async_trait]
 impl Capture for WaylandCapture {
     async fn set_edges(&self, edges: Vec<EdgeSpec>) -> Result<()> {
-        *self.edges.write() = edges;
+        let mut current = self.edges.write();
+        if *current == edges {
+            return Ok(());
+        }
+        *current = edges;
+        drop(current);
         self.edges_dirty.notify_one();
         Ok(())
     }
@@ -118,7 +124,7 @@ pub fn create(
     Arc::new(WaylandCapture { edges: edges_handle, edges_dirty, cmd })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Zone {
     x: i32,
     y: i32,
@@ -214,6 +220,8 @@ struct Session {
     ei_stream: reis::tokio::EiConvertEventStream,
     zones: Vec<Zone>,
     zone_set: u32,
+    enabled: bool,
+    applied_edges: Vec<EdgeSpec>,
 }
 
 async fn establish(
@@ -308,13 +316,15 @@ async fn establish(
         ei_stream,
         zones,
         zone_set,
+        enabled: false,
+        applied_edges: Vec::new(),
     };
     apply_barriers(conn, &mut session, edges).await?;
     Ok(session)
 }
 
-/// Sets barriers and re-arms capture on the SAME session (SetPointerBarriers suspends
-/// the session; Enable re-arms). Barrier ids are 1-based indexes into `edges`.
+/// Sets barriers on a disabled session and enables capture. Barrier ids are 1-based
+/// indexes into `edges`; an empty set deliberately leaves a new session disabled.
 async fn apply_barriers(
     conn: &zbus::Connection,
     session: &mut Session,
@@ -329,6 +339,24 @@ async fn apply_barriers(
             barriers.push(barrier);
         }
     }
+    // GNOME's portal rejects SetPointerBarriers while a session is enabled,
+    // despite the portal specification saying that the call suspends it. Keep
+    // a newly created session disabled until there is something useful to arm.
+    if barriers.is_empty() {
+        session.applied_edges = edges.to_vec();
+        return Ok(());
+    }
+    if session.enabled {
+        return Err(PlatformError::Unavailable(
+            "cannot update pointer barriers on an enabled GNOME session".into(),
+        ));
+    }
+    tracing::debug!(
+        zone_set = session.zone_set,
+        zones = ?session.zones,
+        edges = ?edges,
+        "arming pointer barriers"
+    );
     let session_opath = session.session_opath.clone();
     let zone_set = session.zone_set;
     let response =
@@ -341,12 +369,17 @@ async fn apply_barriers(
     let failed = portal::get::<Vec<u32>>(&response, "failed_barriers").unwrap_or_default();
     if !failed.is_empty() {
         tracing::warn!(failed = ?failed, "pointer barriers denied by compositor");
+        return Err(PlatformError::Unavailable(format!(
+            "compositor rejected pointer barrier IDs {failed:?}"
+        )));
     }
     session
         .ic
         .call::<_, _, ()>("Enable", &(session.session_opath.clone(), Options::new()))
         .await
         .map_err(portal::err_ctx("Enable"))?;
+    session.enabled = true;
+    session.applied_edges = edges.to_vec();
     Ok(())
 }
 
@@ -398,7 +431,12 @@ async fn run(
                 let displays: Vec<DisplayRect> =
                     session.zones.iter().enumerate().map(|(i, z)| z.display(i)).collect();
                 shared.emit(PlatformEvent::DisplaysChanged { displays });
-                run_session(&shared, &conn, session, &panic_chord, &edges, &mut cmd_rx).await;
+                let end =
+                    run_session(&shared, &conn, session, &panic_chord, &edges, &mut cmd_rx)
+                        .await;
+                if matches!(end, SessionEnd::Reconfigure) {
+                    continue;
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "input capture session setup failed");
@@ -411,6 +449,18 @@ async fn run(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEnd {
+    Reconfigure,
+    Broken,
+}
+
+async fn close_session(session_proxy: &zbus::Proxy<'_>) {
+    if let Err(err) = session_proxy.call::<_, _, ()>("Close", &()).await {
+        tracing::warn!(error = %err, "cannot close capture session for reconfiguration");
+    }
+}
+
 async fn run_session(
     shared: &Arc<WaylandShared>,
     conn: &zbus::Connection,
@@ -418,19 +468,19 @@ async fn run_session(
     panic_chord: &[u32],
     edges: &Arc<RwLock<Vec<EdgeSpec>>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
-) {
+) -> SessionEnd {
     let session_proxy = match portal::session_proxy(conn, &session.session_path).await {
         Ok(p) => p,
         Err(err) => {
             tracing::warn!(error = %err, "cannot watch capture session");
-            return;
+            return SessionEnd::Broken;
         }
     };
     let mut closed = match session_proxy.receive_signal("Closed").await {
         Ok(s) => s,
         Err(err) => {
             tracing::warn!(error = %err, "cannot subscribe to Session.Closed");
-            return;
+            return SessionEnd::Broken;
         }
     };
     let (mut activated, mut deactivated, mut zones_changed) = match futures::future::try_join3(
@@ -443,17 +493,21 @@ async fn run_session(
         Ok(streams) => streams,
         Err(err) => {
             tracing::warn!(error = %err, "cannot subscribe to InputCapture signals");
-            return;
+            return SessionEnd::Broken;
         }
     };
 
+    // Desired edges may have changed while the portal setup requests were in
+    // flight, so use what establish() actually submitted rather than rereading
+    // the shared desired set here.
+    let mut applied_edges = session.applied_edges.clone();
     let mut capture: Option<ActiveCapture> = None;
     let mut pressed: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     loop {
         tokio::select! {
             msg = activated.next() => {
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else { return SessionEnd::Broken };
                 let Some((path, opts)) = portal::session_signal(&msg) else { continue };
                 if path != session.session_path {
                     continue;
@@ -484,7 +538,7 @@ async fn run_session(
                 shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }));
             }
             msg = deactivated.next() => {
-                let Some(msg) = msg else { return };
+                let Some(msg) = msg else { return SessionEnd::Broken };
                 let Some((path, opts)) = portal::session_signal(&msg) else { continue };
                 if path != session.session_path {
                     continue;
@@ -499,56 +553,48 @@ async fn run_session(
                     shared.emit(PlatformEvent::Capture(CaptureEvent::Broken {
                         reason: "capture deactivated by compositor".into(),
                     }));
-                    return;
+                    return SessionEnd::Broken;
+                }
+                if *edges.read() != applied_edges {
+                    close_session(&session_proxy).await;
+                    return SessionEnd::Reconfigure;
                 }
             }
             msg = zones_changed.next() => {
                 if msg.is_none() {
-                    return;
+                    return SessionEnd::Broken;
                 }
-                let session_opath = session.session_opath.clone();
-                let zones_result =
-                    portal::request(conn, &session.ic, "GetZones", |token| {
-                        let mut opts = Options::new();
-                        opts.insert("handle_token", Value::new(token.to_owned()));
-                        (session_opath, opts)
-                    })
-                    .await;
-                match zones_result {
-                    Ok(result) => {
-                        session.zone_set = portal::get::<u32>(&result, "zone_set").unwrap_or(0);
-                        session.zones = portal::get::<Vec<(u32, u32, i32, i32)>>(&result, "zones")
-                            .unwrap_or_default()
-                            .iter()
-                            .map(|&(w, h, x, y)| Zone { x, y, w, h })
-                            .collect();
-                        let displays: Vec<DisplayRect> =
-                            session.zones.iter().enumerate().map(|(i, z)| z.display(i)).collect();
-                        shared.emit(PlatformEvent::DisplaysChanged { displays });
-                        let current = edges.read().clone();
-                        if let Err(err) = apply_barriers(conn, &mut session, &current).await {
-                            tracing::warn!(error = %err, "re-applying barriers after zone change failed");
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "GetZones after ZonesChanged failed");
-                        return;
-                    }
-                }
+                // GNOME also requires the session to be disabled before querying
+                // and replacing barriers. Recreate it instead of using Disable,
+                // whose re-enable path is broken on affected Mutter versions.
+                close_session(&session_proxy).await;
+                return SessionEnd::Reconfigure;
             }
             _ = closed.next() => {
                 tracing::warn!("capture session closed by portal");
-                return;
+                return SessionEnd::Broken;
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { return };
+                let Some(cmd) = cmd else { return SessionEnd::Broken };
                 match cmd {
                     Command::ApplyEdges(new_edges) => {
-                        *edges.write() = new_edges.clone();
-                        if let Err(err) = apply_barriers(conn, &mut session, &new_edges).await {
-                            tracing::warn!(error = %err, "SetPointerBarriers failed");
-                            return;
+                        if new_edges == applied_edges || capture.is_some() {
+                            continue;
+                        }
+                        if session.enabled {
+                            close_session(&session_proxy).await;
+                            return SessionEnd::Reconfigure;
+                        }
+                        match apply_barriers(conn, &mut session, &new_edges).await {
+                            Ok(()) => {
+                                applied_edges = new_edges;
+                                shared.set_health(|h| h.capture = None);
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "SetPointerBarriers failed");
+                                shared.set_health(|h| h.capture = Some(format!("{err}")));
+                                return SessionEnd::Broken;
+                            }
                         }
                     }
                     Command::EndCapture { warp_to } => {
@@ -561,15 +607,15 @@ async fn run_session(
                 match event {
                     None => {
                         tracing::warn!("ei stream ended");
-                        return;
+                        return SessionEnd::Broken;
                     }
                     Some(Err(err)) => {
                         tracing::warn!(error = %err, "ei stream error");
-                        return;
+                        return SessionEnd::Broken;
                     }
                     Some(Ok(event)) => {
                         if handle_ei_event(shared, &session, event, &mut capture, &mut pressed, panic_chord).await {
-                            return;
+                            return SessionEnd::Broken;
                         }
                     }
                 }
@@ -708,4 +754,60 @@ async fn handle_ei_event(
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn left_edge() -> EdgeSpec {
+        EdgeSpec {
+            id: 0,
+            side: EdgeSide::Left,
+            at: 0,
+            from: 108,
+            to: 1080,
+        }
+    }
+
+    #[test]
+    fn edge_barrier_uses_inclusive_portal_endpoints() {
+        assert_eq!(edge_barrier(&left_edge()), Some((0, 108, 0, 1079)));
+        assert_eq!(
+            edge_barrier(&EdgeSpec {
+                id: 1,
+                side: EdgeSide::Bottom,
+                at: 1080,
+                from: 20,
+                to: 1920,
+            }),
+            Some((20, 1080, 1919, 1080))
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_edge_sets_do_not_schedule_portal_updates() {
+        let edges = Arc::new(RwLock::new(Vec::new()));
+        let edges_dirty = Arc::new(Notify::new());
+        let (cmd, _cmd_rx) = mpsc::unbounded_channel();
+        let capture = WaylandCapture {
+            edges,
+            edges_dirty: edges_dirty.clone(),
+            cmd,
+        };
+        let desired = vec![left_edge()];
+
+        capture.set_edges(desired.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(20), edges_dirty.notified())
+            .await
+            .expect("changed edges must schedule an update");
+
+        capture.set_edges(desired).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), edges_dirty.notified())
+                .await
+                .is_err(),
+            "unchanged edges must not churn an enabled portal session"
+        );
+    }
 }

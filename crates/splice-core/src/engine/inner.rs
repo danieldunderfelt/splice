@@ -659,12 +659,14 @@ impl Inner {
     // ----- source arbitration -----
 
     fn claim_source(&mut self) {
-        if self.claim.as_ref().is_some_and(|c| c.writer == self.self_info.id) {
-            return;
-        }
+        // Every physical activity refreshes the claim, even when we already
+        // believe we are source. Two machines can both retain self-claims after
+        // a network interruption; suppressing this broadcast made that split
+        // permanent and caused the target to reject the following Enter frame.
         self.claim_lamport += 1;
         let stamp = Stamp { lamport: self.claim_lamport, writer: self.self_info.id.clone() };
         self.claim = Some(stamp.clone());
+        tracing::debug!(source = %stamp.writer, lamport = stamp.lamport, "claiming source");
         if let Some(net) = &self.net {
             net.broadcast(Frame::SourceClaim { stamp });
         }
@@ -697,6 +699,9 @@ impl Inner {
                 peer.degraded = false;
                 if let (Some(net), Some(doc)) = (&self.net, &self.layout) {
                     net.send_to(&id, Frame::LayoutSync(doc.clone()));
+                }
+                if let (Some(net), Some(claim)) = (&self.net, self.claim.clone()) {
+                    net.send_to(&id, Frame::SourceClaim { stamp: claim });
                 }
                 self.auto_place(&id);
                 self.touch_ui();

@@ -29,6 +29,10 @@ Add your user to the `input` group, then re-login:
 sudo usermod -aG input $USER
 ```
 
+The installed launcher also activates configured membership when a lingering user service keeps
+an old group list across logouts. This is common on development machines with user lingering
+enabled; no reboot or `loginctl terminate-user` workaround is required.
+
 The physical-input monitor reads `/dev/input/event*` devices in read-only mode. Portal-injected
 input does not appear on those devices, so Splice uses evdev events to identify the machine that
 last received physical input. Without access to the `input` group, capture activation still works,

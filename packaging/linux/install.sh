@@ -6,6 +6,7 @@ repository_root="$(cd -- "${script_directory}/../.." && pwd)"
 binary_path="${repository_root}/target/release/splice"
 desktop_file="${script_directory}/splice.desktop"
 service_file="${script_directory}/app-splice.service"
+launcher_file="${script_directory}/splice-launch"
 binary_directory="${HOME}/.local/bin"
 applications_directory="${HOME}/.local/share/applications"
 systemd_user_directory="${HOME}/.config/systemd/user"
@@ -18,6 +19,7 @@ fi
 
 mkdir -p "$binary_directory" "$applications_directory" "$systemd_user_directory"
 install -m 0755 "$binary_path" "$binary_directory/splice"
+install -m 0755 "$launcher_file" "$binary_directory/splice-launch"
 install -m 0644 "$desktop_file" "$applications_directory/splice.desktop"
 install -m 0644 "$service_file" "$systemd_user_directory/app-splice.service"
 

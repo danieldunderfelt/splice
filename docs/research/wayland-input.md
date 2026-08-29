@@ -45,18 +45,20 @@ Signals:
   first device event — use it to correlate the D-Bus and EIS streams (independently ordered).
 - `Deactivated{activation_id}`: compositor ended capture (e.g. user switched VT). Treat as
   session end: Leave + release-all.
-- `ZonesChanged{zone_set}`: monitor hotplug/rearrange. Re-GetZones, re-SetPointerBarriers,
-  re-Enable, republish displays to core. Rate-limit; GNOME may kill sessions on device
-  add/remove — handle `EI_EVENT_DISCONNECT` by full session re-establishment (backoff 1 s,
-  max 1 recreation per 5 s — never churn like lan-mouse's 34-reconnects bug).
+- `ZonesChanged{zone_set}`: monitor hotplug/rearrange. Recreate the session, republish displays,
+  and re-arm the new zone set. Rate-limit; GNOME may also kill sessions on device add/remove —
+  handle `EI_EVENT_DISCONNECT` by full session re-establishment (backoff 1 s, max 1 recreation
+  per 5 s — never churn like lan-mouse's 34-reconnects bug).
 - To hand control back: `Release{activation_id, cursor_position}` — position is a suggestion
   for where the local cursor reappears (compositor may ignore; usually honored). ALWAYS call
   Release on Leave-back; if the EIS connection drops without Release the cursor is stranded.
 
 **NEVER call `Disable()` on a live session** — mutter bug #3908: after Disable, events stop
-flowing to the EIS socket permanently while Activated still fires. Barrier updates already
-suspend the session; the Disable/Enable pair is never needed. If a barrier set must change,
-do SetPointerBarriers → Enable on the SAME session.
+flowing to the EIS socket permanently while Activated still fires. GNOME 50 also rejects
+SetPointerBarriers while enabled even though the portal specification says that call suspends
+the session. Leave a new session disabled while the barrier set is empty; apply the first
+non-empty set and Enable once. Deduplicate unchanged sets. For a real later change, close and
+recreate the session with the usual rate limit.
 
 **Do not rely on `ei_keyboard.modifiers` events on GNOME** (mutter #3375: never sent to ei
 clients). Track modifier state from raw key up/down + the keymap. Do this on all compositors.
@@ -86,10 +88,15 @@ libei receiver specifics (reis):
    is connected the `Notify*` D-Bus methods are forbidden — use libei for everything.
 3. Create/receive devices: expect a keyboard (with an xkb keymap fd — mmap MAP_PRIVATE) and
    pointer devices. Separate device capabilities for relative pointer, absolute pointer,
-   scroll. Absolute motion targets a device REGION; coordinates outside regions are silently
-   discarded (use for Enter positioning). Relative motion for everything else.
-4. `start_emulating(sequence)` when a remote session enters; `stop_emulating` on Leave.
-   Sequence increases monotonically across sessions.
+   scroll. A newly advertised device is PAUSED: wait for `ei_device.resumed` before sending
+   `start_emulating`, input, or `frame`. After `ei_device.paused`, stop sending until the next
+   resume and begin emulating again if the logical remote session is still entered. Violating
+   this state machine makes GNOME disconnect EIS with a protocol error.
+4. `start_emulating(sequence)` when a remote session enters (or its devices later resume);
+   `stop_emulating` on Leave, only for devices that are currently emulating. Sequence increases
+   monotonically across sessions. Never emit an empty cleanup frame for a paused device.
+   Absolute motion targets a device REGION; coordinates outside regions are silently discarded
+   (use for Enter positioning). Relative motion is used for everything else.
 5. Keyboard injection: send RAW EVDEV codes. The compositor applies its own layout — exactly
    what we want (scancodes on the wire). We do NOT reverse-map keysyms in v1 (machines'
    layouts assumed compatible; documented limitation). One key event per key per frame;

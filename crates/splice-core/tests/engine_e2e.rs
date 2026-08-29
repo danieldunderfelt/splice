@@ -311,6 +311,44 @@ async fn source_claim_ends_remote_capture() {
 }
 
 #[tokio::test]
+async fn source_claims_created_before_connection_converge() {
+    let a = spawn_rig("aaa", &node("bbb")).await;
+    let b = spawn_rig("bbb", &node("aaa")).await;
+
+    // Reproduce a partition: both machines observe local input before they can
+    // reach one another, so each starts out believing it is the source.
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    b.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    wait_until("both machines hold independent self-claims", || {
+        a.handle.state().borrow().source == Some(mid("aaa"))
+            && b.handle.state().borrow().source == Some(mid("bbb"))
+    })
+    .await;
+
+    // Connecting must exchange the current claims even before either machine
+    // produces another input event. Equal Lamport values converge by writer ID.
+    a.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
+    b.dial_ports.write().unwrap().insert(mid("aaa"), a.addr.port());
+    wait_until("both sides connect", || connected_to(&a, "bbb") && connected_to(&b, "aaa"))
+        .await;
+    wait_until("both sides converge on one source", || {
+        let a_source = a.handle.state().borrow().source.clone();
+        let b_source = b.handle.state().borrow().source.clone();
+        a_source.is_some() && a_source == b_source
+    })
+    .await;
+
+    // New physical activity supersedes the converged claim and is propagated
+    // before a subsequent Enter frame would be sent.
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    wait_until("fresh activity makes aaa source everywhere", || {
+        a.handle.state().borrow().source == Some(mid("aaa"))
+            && b.handle.state().borrow().source == Some(mid("aaa"))
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn clipboard_offer_and_lazy_fetch() {
     let (a, b) = spawn_pair().await;
     let payload = b"hello clipboard".to_vec();

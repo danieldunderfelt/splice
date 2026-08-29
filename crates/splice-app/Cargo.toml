@@ -24,6 +24,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { workspace = true }
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { workspace = true }
