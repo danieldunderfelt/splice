@@ -32,7 +32,14 @@ fn main() -> eframe::Result<()> {
         None
     };
 
+    // Some GPU/VM combinations render blank under wgpu; glow is the escape hatch.
+    let renderer = match std::env::var("SPLICE_RENDERER").ok().as_deref() {
+        Some("glow") => eframe::Renderer::Glow,
+        _ => eframe::Renderer::Wgpu,
+    };
+
     let options = eframe::NativeOptions {
+        renderer,
         viewport: egui::ViewportBuilder::default()
             .with_title("Splice")
             .with_app_id("splice")

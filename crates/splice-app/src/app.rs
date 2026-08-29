@@ -27,6 +27,9 @@ pub struct SpliceApp {
     drag: Option<Drag>,
     allow_close: bool,
     exit_at: Option<Instant>,
+    /// SPLICE_UI_SCREENSHOT=<path>: capture one frame to PNG (preview smoke runs).
+    screenshot_to: Option<std::path::PathBuf>,
+    screenshot_requested: bool,
 }
 
 struct Drag {
@@ -49,6 +52,43 @@ impl SpliceApp {
             drag: None,
             allow_close: false,
             exit_at: exit_after.map(|secs| Instant::now() + Duration::from_secs_f64(secs)),
+            screenshot_to: std::env::var_os("SPLICE_UI_SCREENSHOT").map(Into::into),
+            screenshot_requested: false,
+        }
+    }
+
+    /// One-shot frame capture for design review: ask on the first pass, write the PNG
+    /// when egui delivers the image on a later pass.
+    fn pump_screenshot(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.screenshot_to.clone() else {
+            return;
+        };
+        if !self.screenshot_requested {
+            self.screenshot_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            ctx.request_repaint();
+            return;
+        }
+        let shot = ctx.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(image) = shot {
+            let [w, h] = [image.size[0] as u32, image.size[1] as u32];
+            let mut buf = Vec::with_capacity((w * h * 4) as usize);
+            for px in image.pixels.iter() {
+                buf.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
+            }
+            if let Some(rgba) = image::RgbaImage::from_raw(w, h, buf) {
+                if let Err(e) = rgba.save(&path) {
+                    tracing::warn!(error = %e, "screenshot save failed");
+                }
+            }
+            self.screenshot_to = None;
+        } else {
+            ctx.request_repaint();
         }
     }
 
@@ -332,6 +372,7 @@ impl eframe::App for SpliceApp {
     /// Non-drawing work: smoke-run deadline, close→hide, tray event pump. Also runs
     /// while the window is hidden, so the tray keeps working then too.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
         // SPLICE_UI_EXIT_AFTER (preview smoke runs): close cleanly after N seconds.
         if let Some(deadline) = self.exit_at {
             if Instant::now() >= deadline {
@@ -386,6 +427,7 @@ impl eframe::App for SpliceApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.pump_screenshot(ui.ctx());
         let state = self.ctrl.state();
         self.header(ui, &state);
         self.side_panel(ui, &state);

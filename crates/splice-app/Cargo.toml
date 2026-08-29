@@ -17,9 +17,10 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-eframe = { workspace = true }
+eframe = { workspace = true, features = ["glow"] }
 egui = { workspace = true }
 parking_lot = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { workspace = true }
