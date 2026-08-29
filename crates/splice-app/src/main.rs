@@ -1,6 +1,6 @@
 //! Splice app: engine + tray + egui arrangement window in one process.
 //!
-//! Spec: docs/DESIGN.md "UI (crates/splice-app)". Implemented by the UI agent:
+//! Spec: docs/DESIGN.md "UI (crates/splice-app)".
 //!   app.rs    — eframe App: arrangement canvas (draggable machine cards, snapping,
 //!               green/red edges), side panel, header. Pure function of UiState + Commands.
 //!   theme.rs  — custom egui Style (NOT default-looking): accent #5B8DEF, rounded cards,
@@ -9,13 +9,53 @@
 //!               opened on demand; app continues with window closed.
 //!   runtime.rs— tokio runtime thread + engine bootstrap; macOS ActivationPolicy::Accessory.
 
-fn main() -> anyhow::Result<()> {
+mod app;
+mod runtime;
+mod theme;
+mod tray;
+
+fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,splice_core=debug".into()),
         )
         .init();
-    eprintln!("splice-app: UI not yet implemented (see docs/DESIGN.md)");
-    Ok(())
+
+    let preview = std::env::var("SPLICE_UI_PREVIEW").ok().as_deref() == Some("1");
+    let exit_after = if preview {
+        std::env::var("SPLICE_UI_EXIT_AFTER")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|secs| *secs > 0.0)
+    } else {
+        None
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Splice")
+            .with_app_id("splice")
+            .with_inner_size([1060.0, 680.0])
+            .with_min_inner_size([780.0, 480.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Splice",
+        options,
+        Box::new(move |cc| {
+            theme::apply(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            tray::set_activation_policy_accessory();
+            let ctrl = runtime::start(preview, cc.egui_ctx.clone());
+            let (tray, tray_actions) = tray::Tray::new(&ctrl);
+            Ok(Box::new(app::SpliceApp::new(
+                ctrl,
+                tray,
+                tray_actions,
+                exit_after,
+            )))
+        }),
+    )
 }

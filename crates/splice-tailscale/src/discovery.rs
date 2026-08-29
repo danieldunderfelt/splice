@@ -1,6 +1,7 @@
 use super::{Endpoint, Result, TsError};
 use std::path::{Path, PathBuf};
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const SAME_USER_PROOF_PREFIX: &str = "sameuserproof-";
 
 pub async fn discover_endpoint() -> Result<Endpoint> {
@@ -124,6 +125,7 @@ async fn read_port(path: &Path) -> Option<u16> {
     parse_port_text(&contents)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_sameuserproof_path(path: &Path) -> Option<Endpoint> {
     let filename = path.file_name()?.to_str()?;
     let value = filename.strip_prefix(SAME_USER_PROOF_PREFIX)?;
@@ -139,6 +141,7 @@ fn parse_sameuserproof_path(path: &Path) -> Option<Endpoint> {
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn parse_port_text(value: &str) -> Option<u16> {
     let value = value.trim();
     let port = value.parse::<u16>().ok()?;
