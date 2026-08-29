@@ -27,6 +27,11 @@ certificate_pem="${temporary_directory}/splice-dev.pem"
 certificate_der="${temporary_directory}/splice-dev.cer"
 pkcs12_file="${temporary_directory}/splice-dev.p12"
 pkcs12_password="$(openssl rand -hex 32)"
+pkcs12_options=()
+
+if openssl pkcs12 -help 2>&1 | grep -q -- '-legacy'; then
+    pkcs12_options+=(-legacy)
+fi
 
 printf 'Generating the "%s" private key and certificate...\n' "$certificate_name"
 openssl genrsa -out "$private_key" 3072
@@ -46,6 +51,7 @@ openssl x509 -in "$certificate_pem" -outform DER -out "$certificate_der"
 printf 'Exporting the certificate and key as PKCS#12...\n'
 openssl pkcs12 \
     -export \
+    "${pkcs12_options[@]}" \
     -out "$pkcs12_file" \
     -inkey "$private_key" \
     -in "$certificate_pem" \
