@@ -866,16 +866,30 @@ impl Inner {
                 self.on_enter((*from).clone(), session, pos).await;
             }
             Frame::Input { session, ev } => {
-                if let Focus::Driven(src) = &self.focus {
-                    // Stale sessions (after Leave/re-Enter) are discarded.
-                    if src == from.as_ref() && session == self.active_session {
-                        self.target_ledger.observe(&ev);
-                        let _ = self.emulate.inject(ev).await;
+                let current = matches!(
+                    &self.focus,
+                    Focus::Driven(src) if src == from.as_ref() && session == self.active_session
+                );
+                if current {
+                    self.target_ledger.observe(&ev);
+                    if let Err(err) = self.emulate.inject(ev).await {
+                        tracing::warn!(source = %from, error = %err, "target input emulation failed");
+                        if let Some(net) = &self.net {
+                            net.send_to(
+                                from.as_ref(),
+                                Frame::Leave { session, reason: LeaveReason::CaptureLost },
+                            );
+                        }
+                        self.end_driven(from.as_ref()).await;
                     }
                 }
             }
             Frame::Leave { session, reason } => {
-                if matches!(&self.focus, Focus::Driven(source) if source == from.as_ref()) {
+                if matches!(
+                    &self.focus,
+                    Focus::Driven(source)
+                        if source == from.as_ref() && session == self.active_session
+                ) {
                     self.end_driven(from.as_ref()).await;
                 } else if matches!(&self.focus, Focus::Remote(target) if target == from.as_ref())
                     && session == self.active_session

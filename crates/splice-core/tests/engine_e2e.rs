@@ -343,6 +343,22 @@ async fn motion_burst_preserves_total_delta() {
 }
 
 #[tokio::test]
+async fn target_emulation_failure_releases_source_capture() {
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    b.mock.state.lock().inject_error = Some("test emulation failure".into());
+    push_motion(&a, 25.0 * into_sign(&edge), 0.0);
+    wait_until("source capture releases after target emulation failure", || {
+        !a.mock.state.lock().capturing
+    })
+    .await;
+    wait_until("both sides return local after target emulation failure", || {
+        matches!(focus_of(&a), UiFocus::Local) && matches!(focus_of(&b), UiFocus::Local)
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn held_key_released_on_leave_and_on_peer_drop() {
     let (a, b) = spawn_pair().await;
     let (edge, _along) = drive_a_to_b(&a, &b).await;

@@ -19,6 +19,7 @@ pub struct MockState {
     pub capture_ends: Vec<Option<Vec2>>,
     pub entered: Vec<Vec2>,
     pub injected: Vec<InputEvent>,
+    pub inject_error: Option<String>,
     pub left: usize,
     pub release_all_calls: usize,
     pub remote_offers: Vec<ClipboardOffer>,
@@ -62,7 +63,11 @@ impl Emulate for MockEmulate {
         Ok(())
     }
     async fn inject(&self, ev: InputEvent) -> Result<()> {
-        self.0.state.lock().injected.push(ev);
+        let mut state = self.0.state.lock();
+        if let Some(reason) = &state.inject_error {
+            return Err(crate::PlatformError::Unavailable(reason.clone()));
+        }
+        state.injected.push(ev);
         Ok(())
     }
     async fn leave(&self) -> Result<()> {

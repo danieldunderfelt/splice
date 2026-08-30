@@ -21,7 +21,7 @@ use reis::ei::button::ButtonState;
 use reis::ei::keyboard::KeyState;
 use reis::event::{DeviceCapability, EiEvent};
 use splice_proto::{InputEvent, PointerButton, Vec2};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 use zbus::zvariant::{OwnedFd, Value};
 
 use super::clipboard::ClipSession;
@@ -38,6 +38,9 @@ const DEV_POINTER: u32 = 2;
 const PERSIST: u32 = 2;
 const RECREATE_MIN_BACKOFF: Duration = Duration::from_secs(1);
 const RECREATE_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const EIS_FLUSH_RETRY: Duration = Duration::from_millis(1);
+const MAX_MOTION_BATCH_EVENTS: usize = 64;
+const COMMAND_SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
 const BTN_LEFT: u32 = 0x110;
 
@@ -50,6 +53,7 @@ enum Command {
 
 pub struct WaylandEmulate {
     cmd: mpsc::Sender<Command>,
+    abort: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -73,10 +77,18 @@ impl Emulate for WaylandEmulate {
 
 impl WaylandEmulate {
     async fn send(&self, command: Command) -> Result<()> {
-        self.cmd
-            .send(command)
-            .await
-            .map_err(|_| crate::PlatformError::Unavailable("input emulation stopped".into()))
+        match tokio::time::timeout(COMMAND_SEND_TIMEOUT, self.cmd.send(command)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(crate::PlatformError::Unavailable(
+                "input emulation stopped".into(),
+            )),
+            Err(_) => {
+                self.abort.notify_one();
+                Err(crate::PlatformError::Unavailable(
+                    "input emulation command queue stalled".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -86,6 +98,7 @@ pub fn create(
     conn: zbus::Connection,
 ) -> (Arc<WaylandEmulate>, watch::Receiver<Option<ClipSession>>) {
     let (cmd, cmd_rx) = mpsc::channel(64);
+    let abort = Arc::new(Notify::new());
     let (clip_tx, clip_rx) = watch::channel(None);
     let screensaver = Arc::new(ScreenSaver::new(conn.clone()));
 
@@ -94,21 +107,24 @@ pub fn create(
     // dedicated current-thread runtime where block_on needs no Send bound.
     let _ = std::thread::Builder::new()
         .name("splice-emulate".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(err) => {
-                    tracing::error!(error = %err, "cannot start emulate runtime");
-                    return;
-                }
-            };
-            rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver));
+        .spawn({
+            let abort = abort.clone();
+            move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        tracing::error!(error = %err, "cannot start emulate runtime");
+                        return;
+                    }
+                };
+                rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver, abort));
+            }
         });
 
-    (Arc::new(WaylandEmulate { cmd }), clip_rx)
+    (Arc::new(WaylandEmulate { cmd, abort }), clip_rx)
 }
 
 /// org.freedesktop.ScreenSaver keep-awake + lock detection. GNOME exposes the interface
@@ -435,6 +451,7 @@ async fn run(
     mut cmd_rx: mpsc::Receiver<Command>,
     clip_tx: watch::Sender<Option<ClipSession>>,
     screensaver: Arc<ScreenSaver>,
+    abort: Arc<Notify>,
 ) {
     {
         let shared = shared.clone();
@@ -480,9 +497,12 @@ async fn run(
                     &conn,
                     session,
                     &mut cmd_rx,
-                    &screensaver,
-                    &mut entered,
                     resume,
+                    RunState {
+                        screensaver: &screensaver,
+                        entered: &mut entered,
+                        abort: &abort,
+                    },
                 )
                 .await;
                 let _ = clip_tx.send(None);
@@ -496,6 +516,12 @@ async fn run(
     }
 }
 
+struct RunState<'a> {
+    screensaver: &'a Arc<ScreenSaver>,
+    entered: &'a mut Option<Vec2>,
+    abort: &'a Notify,
+}
+
 /// Runs one live session. `resume` re-enters a session that was active when the previous
 /// portal session died.
 async fn run_session(
@@ -503,9 +529,8 @@ async fn run_session(
     conn: &zbus::Connection,
     mut session: Session,
     cmd_rx: &mut mpsc::Receiver<Command>,
-    screensaver: &Arc<ScreenSaver>,
-    entered: &mut Option<Vec2>,
     resume: Option<Vec2>,
+    state: RunState<'_>,
 ) {
     let session_proxy = match portal::session_proxy(conn, &session.session_path).await {
         Ok(p) => p,
@@ -530,13 +555,20 @@ async fn run_session(
 
     let mut devices = Devices::default();
     let mut active = Active::default();
+    let mut flush_pending = false;
 
     if let Some(pos) = resume {
-        do_enter(&session, &mut devices, &mut active, screensaver, pos);
+        do_enter(&session, &mut devices, &mut active, state.screensaver, pos);
+        flush_pending = true;
     }
 
     loop {
         tokio::select! {
+            _ = state.abort.notified() => {
+                *state.entered = None;
+                let _ = session_proxy.call::<_, _, ()>("Close", &()).await;
+                return;
+            }
             _ = closed.next() => {
                 tracing::warn!("remote desktop session closed by portal");
                 shared.set_health(|h| {
@@ -544,18 +576,27 @@ async fn run_session(
                 });
                 return;
             }
-            cmd = cmd_rx.recv() => {
+            cmd = async {
+                if flush_pending {
+                    std::future::pending().await
+                } else {
+                    cmd_rx.recv().await
+                }
+            } => {
                 let Some(mut command) = cmd else { return };
                 loop {
                     let following = match command {
                         Command::Enter(pos) => {
-                            do_enter(&session, &mut devices, &mut active, screensaver, pos);
-                            *entered = Some(pos);
+                            do_enter(&session, &mut devices, &mut active, state.screensaver, pos);
+                            *state.entered = Some(pos);
                             None
                         }
                         Command::Inject(InputEvent::Motion { mut dx, mut dy }) => {
                             let mut following = None;
-                            while let Ok(next) = cmd_rx.try_recv() {
+                            for _ in 1..MAX_MOTION_BATCH_EVENTS {
+                                let Ok(next) = cmd_rx.try_recv() else {
+                                    break;
+                                };
                                 match next {
                                     Command::Inject(InputEvent::Motion {
                                         dx: next_dx,
@@ -570,7 +611,7 @@ async fn run_session(
                                     }
                                 }
                             }
-                            if active.emulating && !screensaver.is_locked() {
+                            if active.emulating && !state.screensaver.is_locked() {
                                 inject(
                                     &session,
                                     &devices,
@@ -581,19 +622,18 @@ async fn run_session(
                             following
                         }
                         Command::Inject(ev) => {
-                            if active.emulating && !screensaver.is_locked() {
+                            if active.emulating && !state.screensaver.is_locked() {
                                 inject(&session, &devices, &mut active, ev);
                             }
                             None
                         }
                         Command::Leave => {
-                            do_leave(&session, &mut devices, &mut active, screensaver);
-                            *entered = None;
+                            do_leave(&session, &mut devices, &mut active, state.screensaver);
+                            *state.entered = None;
                             None
                         }
                         Command::ReleaseAll => {
                             release_held(&session, &devices, &mut active);
-                            let _ = session.connection.flush();
                             None
                         }
                     };
@@ -601,6 +641,34 @@ async fn run_session(
                         break;
                     };
                     command = next;
+                }
+                match flush_eis(&session) {
+                    Ok(pending) => flush_pending = pending,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "input emulation transport write failed");
+                        shared.set_health(|h| {
+                            h.emulate = Some(format!("input emulation transport write failed: {err}"))
+                        });
+                        return;
+                    }
+                }
+            }
+            _ = async {
+                if flush_pending {
+                    tokio::time::sleep(EIS_FLUSH_RETRY).await;
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match flush_eis(&session) {
+                    Ok(pending) => flush_pending = pending,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "input emulation transport write failed");
+                        shared.set_health(|h| {
+                            h.emulate = Some(format!("input emulation transport write failed: {err}"))
+                        });
+                        return;
+                    }
                 }
             }
             event = session.ei_stream.next() => {
@@ -650,7 +718,16 @@ async fn run_session(
                         if active.emulating {
                             send_pending_position(&session, &devices, &mut active);
                         }
-                        let _ = session.connection.flush();
+                        match flush_eis(&session) {
+                            Ok(pending) => flush_pending = pending,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "input emulation transport write failed");
+                                shared.set_health(|h| {
+                                    h.emulate = Some(format!("input emulation transport write failed: {err}"))
+                                });
+                                return;
+                            }
+                        }
                     }
                     Some(Ok(EiEvent::DevicePaused(paused))) => {
                         tracing::debug!(device = ?paused.device, "input emulation device paused");
@@ -710,7 +787,6 @@ fn do_enter(
     active.pending_position = Some(pos);
     devices.start_resumed(seq);
     send_pending_position(session, devices, active);
-    let _ = session.connection.flush();
 
     let screensaver = screensaver.clone();
     let _ = tokio::spawn(async move { screensaver.inhibit().await });
@@ -734,7 +810,14 @@ fn do_leave_inner(session: &Session, devices: &mut Devices, active: &mut Active)
     }
     active.emulating = false;
     active.pending_position = None;
-    let _ = session.connection.flush();
+}
+
+fn flush_eis(session: &Session) -> std::result::Result<bool, String> {
+    match session.connection.flush() {
+        Ok(()) => Ok(false),
+        Err(err) if err.raw_os_error() == libc::EAGAIN => Ok(true),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn release_held(session: &Session, devices: &Devices, active: &mut Active) {
