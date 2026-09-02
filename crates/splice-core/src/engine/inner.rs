@@ -3,6 +3,7 @@
 //! capture/emulation and publishes UiState snapshots (debounced to <=10 Hz).
 
 use crate::engine::Command;
+use crate::arrange::{self, Body, Rules};
 use crate::layout::{self, EdgeLink, MachineGeom};
 use crate::ledger::HeldLedger;
 use crate::net::{self, NetControl, NetOpts, PeerEvent, TsApi};
@@ -1062,7 +1063,8 @@ impl Inner {
     }
 
     /// A newly seen machine absent from the doc is placed right of the current
-    /// rightmost machine, top-aligned at y=0, enabled.
+    /// rightmost machine at y=0, then rested against the cluster under the
+    /// arrangement rules so it starts out touching, enabled.
     fn auto_place(&mut self, id: &MachineId) {
         if *id == self.self_info.id {
             return;
@@ -1075,26 +1077,29 @@ impl Inner {
             return;
         }
         self.ensure_doc();
-        let rightmost = self
+        let placed: Vec<Body> = self
             .layout
             .as_ref()
             .expect("doc exists")
             .machines
             .iter()
-            .map(|(mid, p)| {
-                let right = self
-                    .displays_of(mid)
-                    .iter()
-                    .map(|d| d.x + d.w as i32)
-                    .max()
-                    .unwrap_or(0);
-                p.offset.x + right
-            })
+            .map(|(mid, p)| Body::new(&self.displays_of(mid), p.offset))
+            .collect();
+        let rightmost = placed
+            .iter()
+            .filter_map(Body::bounds)
+            .map(|bounds| bounds.right)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0) as i32;
+        let start = Vec2I { x: rightmost, y: 0 };
+        let newcomer = Body::new(&self.displays_of(id), start);
+        let offset = match arrange::resolve(&newcomer, Vec2I::default(), &placed, &Rules::default(), None) {
+            Some(placement) => Vec2I { x: start.x + placement.delta.x, y: start.y + placement.delta.y },
+            None => start,
+        };
         self.layout.as_mut().expect("doc exists").machines.insert(
             id.clone(),
-            MachinePlacement { offset: Vec2I { x: rightmost, y: 0 }, enabled: true },
+            MachinePlacement { offset, enabled: true },
         );
         self.bump_layout();
     }
@@ -1173,6 +1178,17 @@ impl Inner {
                     .entry(id)
                     .or_insert(MachinePlacement { offset: Vec2I { x: 0, y: 0 }, enabled: true })
                     .offset = snapped;
+                self.bump_layout();
+            }
+            Command::SetArrangement(placements) => {
+                self.ensure_doc();
+                let doc = self.layout.as_mut().expect("doc exists");
+                for (id, offset) in placements {
+                    doc.machines
+                        .entry(id)
+                        .or_insert(MachinePlacement { offset: Vec2I { x: 0, y: 0 }, enabled: true })
+                        .offset = offset;
+                }
                 self.bump_layout();
             }
             Command::SetSensitivity { link_key, factor } => {

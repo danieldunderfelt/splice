@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod arrange;
 pub mod layout;
 pub mod ledger;
 pub mod net;

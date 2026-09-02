@@ -10,6 +10,7 @@
 //!   runtime.rs— tokio runtime thread + engine bootstrap; macOS ActivationPolicy::Accessory.
 
 mod app;
+mod drag;
 mod runtime;
 mod theme;
 mod tray;

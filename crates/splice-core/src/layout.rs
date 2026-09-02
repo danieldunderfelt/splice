@@ -16,7 +16,7 @@ use splice_proto::{DisplayRect, MachineId, MachinePlacement, Vec2, Vec2I};
 use std::collections::BTreeMap;
 
 const EDGE_ALIGNMENT_TOLERANCE: i64 = 2;
-const MIN_EDGE_OVERLAP: i64 = 32;
+pub const MIN_EDGE_OVERLAP: i64 = 32;
 
 /// Everything layout math needs to know about one machine.
 #[derive(Clone, Debug)]

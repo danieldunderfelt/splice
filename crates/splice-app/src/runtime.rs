@@ -423,6 +423,14 @@ pub mod preview {
                 }
                 recompute_edges(state);
             }
+            Command::SetArrangement(placements) => {
+                for (id, offset) in placements {
+                    if let Some(machine) = state.machines.iter_mut().find(|m| &m.id == id) {
+                        machine.offset = *offset;
+                    }
+                }
+                recompute_edges(state);
+            }
             Command::SetSensitivity { link_key, factor } => {
                 state
                     .sensitivity

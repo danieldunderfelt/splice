@@ -248,10 +248,16 @@ a default egui demo: custom `egui::Style` (rounded corners, subtle shadows, acce
 `#5B8DEF`, neutral grays), no window decorations chrome beyond the platform default.
 
 - **Arrangement canvas** (central panel): machine cards = actual display rects to scale,
-  draggable as a unit (egui drag interactions), edge snapping with 8 px magnetism at ~1/12
-  scale; this machine highlighted with accent border; offline peers ghosted at 40% opacity;
-  disabled peers desaturated with an enable toggle on the card. Shared edges render as green
-  (crossable) / red (touching but blocked) strips per computed EdgeLinks.
+  draggable as a unit. Cards are magnetic (`splice-core::arrange`): a dragged card always
+  rests against a neighbour along a seam of at least `MIN_SEAM` (160 canvas px, so displays
+  never meet corner-to-corner), slides along that seam, flips onto the next side once the
+  pointer passes the corner, and can push straight through to the far side. Flush edges and
+  centres attract within 6 screen px. Neighbours the card was holding together close ranks
+  with the smallest legal move; every snap eases (~50 ms) instead of popping. A drop commits
+  the whole arrangement in one `SetArrangement`. Live seams render in accent colour during
+  the drag; committed edges as green (crossable) / red (touching but blocked) strips per
+  computed EdgeLinks. This machine highlighted with accent border; offline peers ghosted at
+  40% opacity; disabled peers desaturated with an enable toggle on the card.
 - Card content: hostname, OS glyph, connection badge (● direct / ◐ DERP with warning tint /
   ○ offline), RTT ms, "SOURCE" chip when that machine holds sourceness.
 - **Side panel**: per-link sensitivity slider (0.25–4.0 log, default 1.0), clipboard sync

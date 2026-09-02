@@ -1,21 +1,23 @@
-//! eframe App: arrangement canvas (draggable machine cards, snapping, green/red edges),
+//! eframe App: arrangement canvas (magnetic machine cards, live seams, green/red edges),
 //! side panel (sensitivity, clipboard, panic chord, health), header (master switch,
 //! disconnect all). Renders purely from the latest UiState; mutates only via Commands.
 
+use crate::drag::CardDrag;
 use crate::runtime::{BootStatus, Controller};
 use crate::theme;
 use crate::tray::{Tray, TrayAction};
 use egui::{
-    Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect,
-    RichText, Sense, Shape, Stroke, StrokeKind, UiBuilder, Vec2, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Layout, Margin, Pos2, Rect,
+    RichText, Sense, Shadow, Shape, Stroke, StrokeKind, UiBuilder, Vec2, pos2, vec2,
 };
+use splice_core::arrange;
+use splice_core::layout::MIN_EDGE_OVERLAP;
 use splice_core::ui_state::{UiConnection, UiMachine};
 use splice_core::{Command, UiState};
-use splice_proto::{DisplayRect, LayoutDoc, MachineId, Os, Vec2I};
+use splice_proto::{LayoutDoc, MachineId, Os};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-const SNAP_PX: f32 = 8.0;
 /// Uniform gap between the fitted cluster and the canvas edges.
 const CANVAS_MARGIN: f32 = 24.0;
 /// Fit clamps: the max also caps a single machine at a sane on-screen size.
@@ -31,18 +33,12 @@ pub struct SpliceApp {
     ctrl: Controller,
     tray: Tray,
     tray_actions: mpsc::Receiver<TrayAction>,
-    drag: Option<Drag>,
+    drag: Option<CardDrag>,
     allow_close: bool,
     exit_at: Option<Instant>,
     /// SPLICE_UI_SCREENSHOT=<path>: capture one frame to PNG (preview smoke runs).
     screenshot_to: Option<std::path::PathBuf>,
     screenshot_requested: bool,
-}
-
-struct Drag {
-    id: MachineId,
-    /// Accumulated pointer movement, screen px.
-    accum: Vec2,
 }
 
 impl SpliceApp {
@@ -263,88 +259,122 @@ impl SpliceApp {
         let scale = fit.scale;
         let to_screen = |cx: f32, cy: f32| fit.to_screen(cx, cy);
 
+        let dt = ui.input(|i| i.stable_dt);
+        let settled = self.drag.as_mut().is_none_or(|drag| !drag.tick(dt));
+        if !settled {
+            ui.ctx().request_repaint();
+        }
+
         // Pass 1: drag interactions (bookkeeping needs the previous frame's rects).
-        for machine in &state.machines {
-            let card = card_rect(
-                machine,
-                self.drag
-                    .as_ref()
-                    .filter(|d| d.id == machine.id)
-                    .map(|d| d.accum)
-                    .unwrap_or(Vec2::ZERO),
-                &to_screen,
-                scale,
-            );
+        let offsets = self.offsets(state);
+        for (machine, offset) in state.machines.iter().zip(&offsets) {
+            let card = card_rect(machine, *offset, &to_screen, scale);
             let response = ui.interact(
                 card,
                 ui.id().with(("card", &machine.id.0)),
                 Sense::drag(),
             );
+            let grabbed = self.drag.as_ref().is_some_and(|drag| drag.id() == &machine.id);
+            if grabbed {
+                ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
+            } else if response.hovered() && self.drag.is_none() && !machine.displays.is_empty() {
+                ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
+            }
             if response.drag_started() {
-                self.drag = Some(Drag {
-                    id: machine.id.clone(),
-                    accum: Vec2::ZERO,
-                });
+                self.drag = CardDrag::begin(state, &machine.id, scale);
             }
             if response.dragged() {
-                if let Some(drag) = &mut self.drag {
-                    if drag.id == machine.id {
-                        drag.accum += response.drag_delta();
-                    }
+                if let Some(drag) = self.drag.as_mut().filter(|drag| drag.id() == &machine.id) {
+                    drag.drag_by(response.drag_delta(), scale);
                 }
             }
             if response.drag_stopped() {
-                if let Some(drag) = self.drag.take() {
-                    if drag.id == machine.id {
-                        self.commit_placement(state, machine, drag.accum, scale);
+                if let Some(drag) = self.drag.take_if(|drag| drag.id() == &machine.id) {
+                    let changes = drag.changes();
+                    if !changes.is_empty() {
+                        self.ctrl.send(Command::SetArrangement(changes));
                     }
                 }
             }
         }
 
         // Pass 2: paint cards, then edge strips on top of the shared borders.
-        for machine in &state.machines {
-            let live_offset = self
-                .drag
-                .as_ref()
-                .filter(|d| d.id == machine.id)
-                .map(|d| d.accum)
-                .unwrap_or(Vec2::ZERO);
+        let offsets = self.offsets(state);
+        let grabbed = |machine: &UiMachine| {
+            self.drag.as_ref().is_some_and(|drag| drag.id() == &machine.id)
+        };
+        let paint_order = state
+            .machines
+            .iter()
+            .zip(&offsets)
+            .filter(|(machine, _)| !grabbed(machine))
+            .chain(
+                state
+                    .machines
+                    .iter()
+                    .zip(&offsets)
+                    .filter(|(machine, _)| grabbed(machine)),
+            );
+        for (machine, offset) in paint_order {
+            let lifted = grabbed(machine);
+            if lifted {
+                let card = card_rect(machine, *offset, &to_screen, scale);
+                painter.add(
+                    Shadow {
+                        offset: [0, 6],
+                        blur: 20,
+                        spread: 0,
+                        color: Color32::from_black_alpha(if dark { 120 } else { 60 }),
+                    }
+                    .as_shape(card, CornerRadius::same(12)),
+                );
+            }
             draw_card(
                 &painter,
                 machine,
-                live_offset,
+                *offset,
                 &to_screen,
                 scale,
-                machine.id == state.self_id,
-                dark,
+                CardLook {
+                    is_self: machine.id == state.self_id,
+                    lifted,
+                    dark,
+                },
             );
         }
-        for edge in &state.edges {
-            let color = if edge.crossable { theme::OK } else { theme::ERR };
-            painter.line_segment(
-                [
-                    to_screen(edge.x1 as f32, edge.y1 as f32),
-                    to_screen(edge.x2 as f32, edge.y2 as f32),
-                ],
-                Stroke::new(4.0, color),
-            );
+        match &self.drag {
+            Some(drag) => {
+                if settled {
+                    for seam in arrange::seams(&drag.bodies(), MIN_EDGE_OVERLAP) {
+                        painter.line_segment(
+                            [
+                                to_screen(seam.from.0 as f32, seam.from.1 as f32),
+                                to_screen(seam.to.0 as f32, seam.to.1 as f32),
+                            ],
+                            Stroke::new(4.0, theme::ACCENT),
+                        );
+                    }
+                }
+            }
+            None => {
+                for edge in &state.edges {
+                    let color = if edge.crossable { theme::OK } else { theme::ERR };
+                    painter.line_segment(
+                        [
+                            to_screen(edge.x1 as f32, edge.y1 as f32),
+                            to_screen(edge.x2 as f32, edge.y2 as f32),
+                        ],
+                        Stroke::new(4.0, color),
+                    );
+                }
+            }
         }
 
         // Pass 3: enable toggles, painted last so they sit on top of the cards.
         // Compact cards get no toggle — there is no room for it inside the card.
         let mut toggles: Vec<(MachineId, bool)> = Vec::new();
-        for machine in &state.machines {
-            let card = card_rect(
-                machine,
-                self.drag
-                    .as_ref()
-                    .filter(|d| d.id == machine.id)
-                    .map(|d| d.accum)
-                    .unwrap_or(Vec2::ZERO),
-                &to_screen,
-                scale,
-            );
+        for (machine, offset) in state.machines.iter().zip(&offsets) {
+            let card = card_rect(machine, *offset, &to_screen, scale);
             if card.width() < COMPACT_W || card.height() < COMPACT_H {
                 continue;
             }
@@ -367,23 +397,24 @@ impl SpliceApp {
         }
     }
 
-    fn commit_placement(&mut self, state: &UiState, machine: &UiMachine, delta_px: Vec2, scale: f32) {
-        let proposed = Vec2I {
-            x: machine.offset.x + (delta_px.x / scale).round() as i32,
-            y: machine.offset.y + (delta_px.y / scale).round() as i32,
-        };
-        let others: Vec<(&[DisplayRect], Vec2I)> = state
+    /// Canvas offset each card is drawn at: the drag's live (eased) positions while
+    /// one is in flight, the committed arrangement otherwise.
+    fn offsets(&self, state: &UiState) -> Vec<Vec2> {
+        state
             .machines
             .iter()
-            .filter(|m| m.id != machine.id)
-            .map(|m| (m.displays.as_slice(), m.offset))
-            .collect();
-        let tolerance = ((SNAP_PX / scale).ceil() as i32).max(1);
-        let snapped = splice_core::layout::snap_offset(&machine.displays, proposed, &others, tolerance);
-        if snapped != machine.offset {
-            self.ctrl.send(Command::SetPlacement(machine.id.clone(), snapped));
-        }
+            .map(|machine| {
+                self.drag
+                    .as_ref()
+                    .and_then(|drag| drag.shown_offset(&machine.id))
+                    .unwrap_or_else(|| canvas_offset(machine))
+            })
+            .collect()
     }
+}
+
+fn canvas_offset(machine: &UiMachine) -> Vec2 {
+    vec2(machine.offset.x as f32, machine.offset.y as f32)
 }
 
 impl eframe::App for SpliceApp {
@@ -507,36 +538,45 @@ fn content_bounds(state: &UiState) -> Option<(Pos2, Pos2)> {
 /// cards never overlap unless the machine geometries themselves overlap.
 fn card_rect(
     machine: &UiMachine,
-    live_offset: Vec2,
+    offset: Vec2,
     to_screen: &impl Fn(f32, f32) -> Pos2,
     scale: f32,
 ) -> Rect {
     let mut union = Rect::NOTHING;
     for display in &machine.displays {
-        let top_left = to_screen(
-            (machine.offset.x + display.x) as f32,
-            (machine.offset.y + display.y) as f32,
-        ) + live_offset;
+        let top_left = to_screen(offset.x + display.x as f32, offset.y + display.y as f32);
         union = union.union(Rect::from_min_size(
             top_left,
             vec2(display.w as f32 * scale, display.h as f32 * scale),
         ));
     }
     if union == Rect::NOTHING {
-        union = Rect::from_min_size(to_screen(machine.offset.x as f32, machine.offset.y as f32), vec2(40.0, 30.0));
+        union = Rect::from_min_size(to_screen(offset.x, offset.y), vec2(40.0, 30.0));
     }
     union
+}
+
+#[derive(Clone, Copy)]
+struct CardLook {
+    is_self: bool,
+    /// Being dragged: drawn last, on a shadow, with a strong accent border.
+    lifted: bool,
+    dark: bool,
 }
 
 fn draw_card(
     painter: &egui::Painter,
     machine: &UiMachine,
-    live_offset: Vec2,
+    offset: Vec2,
     to_screen: &impl Fn(f32, f32) -> Pos2,
     scale: f32,
-    is_self: bool,
-    dark: bool,
+    look: CardLook,
 ) {
+    let CardLook {
+        is_self,
+        lifted,
+        dark,
+    } = look;
     let offline = matches!(machine.connection, UiConnection::Offline);
     let opacity = if offline { 0.4 } else { 1.0 };
     let shade = |color: Color32| {
@@ -548,7 +588,7 @@ fn draw_card(
         theme::ghost(color, opacity)
     };
 
-    let card = card_rect(machine, live_offset, to_screen, scale);
+    let card = card_rect(machine, offset, to_screen, scale);
     // All card content paints into a painter clipped to the card rect, so no
     // chrome can bleed into a neighbouring (touching) card.
     let painter = &painter.with_clip_rect(card);
@@ -558,10 +598,7 @@ fn draw_card(
 
     // Displays at their true scaled positions: they tile the card exactly.
     for display in &machine.displays {
-        let top_left = to_screen(
-            (machine.offset.x + display.x) as f32,
-            (machine.offset.y + display.y) as f32,
-        ) + live_offset;
+        let top_left = to_screen(offset.x + display.x as f32, offset.y + display.y as f32);
         let rect = Rect::from_min_size(
             top_left,
             vec2(display.w as f32 * scale, display.h as f32 * scale),
@@ -577,7 +614,9 @@ fn draw_card(
 
     // Border on top of the display fills: cards touch exactly, so the stroke is
     // what visually separates neighbours (accent for this machine).
-    let border = if is_self {
+    let border = if lifted {
+        theme::ACCENT_STRONG
+    } else if is_self {
         theme::ACCENT
     } else {
         theme::card_border(dark)
@@ -585,7 +624,7 @@ fn draw_card(
     painter.rect_stroke(
         card,
         CornerRadius::same(12),
-        Stroke::new(if is_self { 2.0 } else { 1.0 }, shade(border)),
+        Stroke::new(if is_self || lifted { 2.0 } else { 1.0 }, shade(border)),
         StrokeKind::Inside,
     );
 
@@ -956,7 +995,7 @@ mod tests {
             .map(|m| {
                 (
                     m.hostname.as_str(),
-                    card_rect(m, Vec2::ZERO, &to_screen, fit.scale),
+                    card_rect(m, canvas_offset(m), &to_screen, fit.scale),
                 )
             })
             .collect();

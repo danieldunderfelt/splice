@@ -18,6 +18,8 @@ pub enum Command {
     SetMasterEnabled(bool),
     SetMachineEnabled(MachineId, bool),
     SetPlacement(MachineId, Vec2I),
+    /// Commit a whole arrangement at once (the UI's constrained drag moves several cards).
+    SetArrangement(Vec<(MachineId, Vec2I)>),
     SetSensitivity { link_key: String, factor: f64 },
     SetClipboardSync(bool),
     /// Local panic: end any session, release everything, broadcast Leave+ReleaseAll.
