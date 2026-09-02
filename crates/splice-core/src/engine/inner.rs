@@ -131,6 +131,7 @@ pub struct Inner {
     geo_links: Vec<EdgeLink>,
     /// Outgoing geometric links, index-aligned with the armed EdgeSpec ids.
     armed: Vec<EdgeLink>,
+    armed_specs: Vec<splice_platform::EdgeSpec>,
     health: HealthReport,
     tailscale_error: Option<String>,
     ui_deadline: Option<Instant>,
@@ -199,6 +200,7 @@ impl Inner {
             links: Vec::new(),
             geo_links: Vec::new(),
             armed: Vec::new(),
+            armed_specs: Vec::new(),
             health: HealthReport::default(),
             tailscale_error: None,
             ui_deadline: None,
@@ -482,6 +484,7 @@ impl Inner {
                 self.touch_ui();
             }
             PlatformEvent::Health(report) => {
+                tracing::info!(?report, "platform health");
                 self.health = report;
                 self.touch_ui();
             }
@@ -500,14 +503,25 @@ impl Inner {
         let recently_driven = self
             .driven_grace_until
             .is_some_and(|until| Instant::now() < until);
-        if self.focus != Focus::Local
-            || recently_driven
-            || !self.cfg.master_enabled
-            || !self.machine_enabled(&self.self_info.id)
-            || !self.machine_enabled(&target)
-            || !self.peer_usable(&target)
-            || !link_is_active
-        {
+        let block = if self.focus != Focus::Local {
+            Some("already focused elsewhere")
+        } else if recently_driven {
+            Some("in post-driven grace window")
+        } else if !self.cfg.master_enabled {
+            Some("master disabled")
+        } else if !self.machine_enabled(&self.self_info.id) {
+            Some("self disabled in layout")
+        } else if !self.machine_enabled(&target) {
+            Some("target disabled in layout")
+        } else if !self.peer_usable(&target) {
+            Some("target not connected")
+        } else if !link_is_active {
+            Some("edge link not currently active")
+        } else {
+            None
+        };
+        if let Some(reason) = block {
+            tracing::debug!(target = %target, reason, "edge hit not crossable");
             let local = match link.side {
                 EdgeSide::Left | EdgeSide::Right => {
                     Vec2 { x: f64::from(link.at), y: along }
@@ -544,6 +558,7 @@ impl Inner {
             self.reject_edge_hit("peer session disappeared before Enter", Some(warp)).await;
             return;
         }
+        tracing::debug!(target = %target, session = self.active_session, ?pos, "entering remote machine");
         let _ = self.capture.begin_capture().await;
         if let Some(net) = &self.net {
             net.set_active(&target, true);
@@ -645,6 +660,7 @@ impl Inner {
         let landing = position_inside_to_edge(&link, pos);
         if link.to == self.self_info.id {
             let warp = layout::clamp_into_displays(&self.self_info.displays, landing);
+            tracing::debug!(from = %link.from, ?warp, "cursor crossed back home");
             self.send_leave(&link.from, LeaveReason::Crossed, false);
             let _ = self.capture.end_capture(Some(warp)).await;
             self.focus = Focus::Local;
@@ -713,6 +729,7 @@ impl Inner {
         warp: Option<Vec2>,
         release_all: bool,
     ) {
+        tracing::debug!(target = %target, ?reason, ?warp, "remote session ended");
         self.send_leave(target, reason, release_all);
         let _ = self.capture.end_capture(warp).await;
         self.focus = Focus::Local;
@@ -728,6 +745,7 @@ impl Inner {
     }
 
     async fn end_driven(&mut self, src: &MachineId, notify: Option<LeaveReason>) {
+        tracing::debug!(source = %src, ?notify, "driven session ended");
         self.release_target_side().await;
         let _ = self.emulate.leave().await;
         if let Some(net) = &self.net {
@@ -982,6 +1000,7 @@ impl Inner {
             self.refuse_enter(&from, session);
             return;
         }
+        tracing::debug!(source = %from, session, ?pos, "driven session started");
         self.focus = Focus::Driven(from.clone());
         self.active_session = session;
         self.target_ledger = HeldLedger::default();
@@ -992,6 +1011,16 @@ impl Inner {
     }
 
     fn refuse_enter(&self, source: &MachineId, session: u64) {
+        tracing::debug!(
+            source = %source,
+            session,
+            master = self.cfg.master_enabled,
+            self_enabled = self.machine_enabled(&self.self_info.id),
+            source_enabled = self.machine_enabled(source),
+            source_usable = self.peer_usable(source),
+            claim = ?self.claim.as_ref().map(|c| c.writer.clone()),
+            "refusing Enter"
+        );
         if let Some(net) = &self.net {
             net.send_to(
                 source,
@@ -1296,6 +1325,14 @@ impl Inner {
         // peer liveness are enforced above/on EdgeHit and must not recreate a portal
         // session (v1 portals prompt again for every new session).
         let specs = layout::edge_specs_for(&self.geo_links, &self.self_info.id);
+        if specs != self.armed_specs {
+            tracing::info!(
+                edges = ?specs,
+                crossable = ?self.links.iter().filter(|l| l.from == self.self_info.id).map(|l| l.to.clone()).collect::<Vec<_>>(),
+                "armed edges updated"
+            );
+            self.armed_specs = specs.clone();
+        }
         let _ = self.capture.set_edges(specs).await;
         self.active_sensitivity = match &self.focus {
             Focus::Remote(target) => self.sensitivity(target),

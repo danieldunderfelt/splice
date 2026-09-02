@@ -21,7 +21,7 @@ use parking_lot::{Mutex, RwLock};
 use splice_proto::{InputEvent, PointerButton, Vec2};
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,10 @@ const HEALTH_POLL: Duration = Duration::from_secs(5);
 const SECURE_INPUT_POLL: Duration = Duration::from_secs(2);
 const PUMP_SLICE: Duration = Duration::from_millis(100);
 const ACTIVITY_DEBOUNCE_MS: u64 = 50;
+/// After handing the cursor back, the warp we post lands just inside the edge and
+/// would immediately re-trigger the barrier. Ignore edge tests for this long so a
+/// return never bounces straight back across.
+const CROSS_COOLDOWN_MS: u64 = 250;
 
 const TAPPED_EVENTS: &[CGEventType] = &[
     CGEventType::LeftMouseDown,
@@ -64,6 +68,8 @@ pub struct TapState {
     /// produces exactly one `EdgeHit`.
     contact: Mutex<Option<u32>>,
     last_activity_ms: Mutex<u64>,
+    /// Wall-clock ms of the last capture end; edge tests are muted briefly after it.
+    last_end_ms: AtomicU64,
     /// Raw `CFMachPortRef` of the live tap, so the callback can re-enable it inline.
     port: AtomicPtr<c_void>,
     need_recreate: AtomicBool,
@@ -88,6 +94,7 @@ impl TapState {
             keys: Mutex::new(KeyState::default()),
             contact: Mutex::new(None),
             last_activity_ms: Mutex::new(0),
+            last_end_ms: AtomicU64::new(0),
             port: AtomicPtr::new(std::ptr::null_mut()),
             need_recreate: AtomicBool::new(false),
         })
@@ -122,11 +129,19 @@ impl TapState {
             return;
         }
         cursor::end(warp_to);
-        *self.contact.lock() = warp_to.and_then(|p| self.edge_hit(p)).map(|(id, _)| id);
+        self.last_end_ms.store(cursor::now_ms(), Ordering::SeqCst);
+        *self.contact.lock() = None;
     }
 
     fn is_capturing(&self) -> bool {
         self.capturing.load(Ordering::SeqCst)
+    }
+
+    /// True for a short window after a capture ends, so the warp-back event that lands
+    /// just inside the edge cannot immediately re-trigger a crossing.
+    fn in_cross_cooldown(&self) -> bool {
+        cursor::now_ms().saturating_sub(self.last_end_ms.load(Ordering::SeqCst))
+            < CROSS_COOLDOWN_MS
     }
 
     fn emit(&self, ev: CaptureEvent) {
@@ -320,6 +335,10 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         | CGEventType::RightMouseDragged
         | CGEventType::OtherMouseDragged = etype
         {
+            if st.in_cross_cooldown() {
+                *st.contact.lock() = None;
+                return CallbackResult::Keep;
+            }
             let loc = event.location();
             match st.edge_hit(loc) {
                 Some((edge_id, along)) => {
@@ -548,4 +567,43 @@ fn install_wake_observers(st: Arc<TapState>) {
 /// `warp_to` in engine coords is already CG global points on macOS.
 pub fn warp_point(v: Vec2) -> CGPoint {
     CGPoint::new(v.x, v.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PlatformEvent;
+
+    fn state() -> Arc<TapState> {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PlatformEvent>();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        TapState::new(shared, Vec::new())
+    }
+
+    #[test]
+    fn cross_cooldown_mutes_edges_only_briefly() {
+        let st = state();
+        assert!(!st.in_cross_cooldown(), "a fresh tap must not mute edge tests");
+        st.last_end_ms.store(cursor::now_ms(), Ordering::SeqCst);
+        assert!(st.in_cross_cooldown(), "edges are muted right after a capture ends");
+        st.last_end_ms
+            .store(cursor::now_ms().saturating_sub(CROSS_COOLDOWN_MS + 5), Ordering::SeqCst);
+        assert!(!st.in_cross_cooldown(), "muting lifts once the cooldown elapses");
+    }
+
+    #[test]
+    fn set_edges_are_deduplicated() {
+        let st = state();
+        let edge = EdgeSpec { id: 0, side: EdgeSide::Right, at: 1920, from: 0, to: 1080 };
+        st.set_edges(vec![edge.clone()]);
+        *st.contact.lock() = Some(0);
+        st.set_edges(vec![edge]);
+        assert_eq!(*st.contact.lock(), Some(0), "an unchanged edge set keeps live contact");
+        st.set_edges(vec![EdgeSpec { id: 0, side: EdgeSide::Left, at: 0, from: 0, to: 1080 }]);
+        assert_eq!(*st.contact.lock(), None, "a real edge change resets contact");
+    }
 }

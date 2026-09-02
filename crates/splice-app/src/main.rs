@@ -29,16 +29,35 @@ fn restore_dumpability_after_group_activation() {
     }
 }
 
+/// Finder/launchd-started apps have no stderr, so the log goes to `splice.log` in the
+/// config directory unless a terminal is attached.
+fn init_tracing() {
+    use std::io::IsTerminal;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,splice_core=debug".into());
+    if std::io::stderr().is_terminal() {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return;
+    }
+    let file = splice_core::config::config_dir()
+        .ok()
+        .and_then(|dir| std::fs::File::create(dir.join("splice.log")).ok());
+    match file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+}
+
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "linux")]
     restore_dumpability_after_group_activation();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,splice_core=debug".into()),
-        )
-        .init();
+    init_tracing();
 
     let preview = std::env::var("SPLICE_UI_PREVIEW").ok().as_deref() == Some("1");
     let exit_after = if preview {

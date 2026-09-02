@@ -54,19 +54,15 @@ enum Command {
 pub struct WaylandEmulate {
     cmd: mpsc::Sender<Command>,
     abort: Arc<Notify>,
-    screensaver: Arc<ScreenSaver>,
-    live: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
 impl Emulate for WaylandEmulate {
     async fn enter(&self, pos: Vec2) -> Result<()> {
-        self.ready()?;
         self.send(Command::Enter(pos)).await
     }
 
     async fn inject(&self, ev: InputEvent) -> Result<()> {
-        self.ready()?;
         self.send(Command::Inject(ev)).await
     }
 
@@ -80,16 +76,6 @@ impl Emulate for WaylandEmulate {
 }
 
 impl WaylandEmulate {
-    fn ready(&self) -> Result<()> {
-        if !self.live.load(Ordering::Acquire) {
-            return Err(PlatformError::Unavailable("no input emulation session".into()));
-        }
-        if self.screensaver.is_locked() {
-            return Err(PlatformError::Unavailable("screen locked: remote input paused".into()));
-        }
-        Ok(())
-    }
-
     async fn send(&self, command: Command) -> Result<()> {
         match tokio::time::timeout(COMMAND_SEND_TIMEOUT, self.cmd.send(command)).await {
             Ok(Ok(())) => Ok(()),
@@ -113,7 +99,6 @@ pub fn create(
 ) -> (Arc<WaylandEmulate>, watch::Receiver<Option<ClipSession>>) {
     let (cmd, cmd_rx) = mpsc::channel(64);
     let abort = Arc::new(Notify::new());
-    let live = Arc::new(AtomicBool::new(false));
     let (clip_tx, clip_rx) = watch::channel(None);
     let screensaver = Arc::new(ScreenSaver::new(conn.clone()));
 
@@ -124,8 +109,6 @@ pub fn create(
         .name("splice-emulate".into())
         .spawn({
             let abort = abort.clone();
-            let live = live.clone();
-            let screensaver = screensaver.clone();
             move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -137,11 +120,11 @@ pub fn create(
                         return;
                     }
                 };
-                rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver, abort, live));
+                rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver, abort));
             }
         });
 
-    (Arc::new(WaylandEmulate { cmd, abort, screensaver, live }), clip_rx)
+    (Arc::new(WaylandEmulate { cmd, abort }), clip_rx)
 }
 
 /// org.freedesktop.ScreenSaver keep-awake + lock detection. GNOME exposes the interface
@@ -470,7 +453,6 @@ async fn run(
     clip_tx: watch::Sender<Option<ClipSession>>,
     screensaver: Arc<ScreenSaver>,
     abort: Arc<Notify>,
-    live: Arc<AtomicBool>,
 ) {
     {
         let shared = shared.clone();
@@ -511,7 +493,6 @@ async fn run(
                     enabled: session.clipboard_enabled,
                 }));
                 let resume = entered.take();
-                live.store(true, Ordering::Release);
                 run_session(
                     &shared,
                     &conn,
@@ -525,7 +506,6 @@ async fn run(
                     },
                 )
                 .await;
-                live.store(false, Ordering::Release);
                 let _ = clip_tx.send(None);
                 screensaver.uninhibit().await;
             }
