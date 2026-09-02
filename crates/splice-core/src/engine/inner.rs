@@ -45,6 +45,7 @@ struct Peer {
     caps: Vec<String>,
     connected: bool,
     degraded: bool,
+    master_off: bool,
     ts_online: bool,
     /// Tailscale reports a direct path (CurAddr non-empty) vs DERP relay.
     direct: bool,
@@ -270,7 +271,9 @@ impl Inner {
                                 | PeerEvent::Disconnected(_, _)
                                 | PeerEvent::Frame(
                                     _,
-                                    Frame::LayoutSync(_) | Frame::MachineUpdate(_)
+                                    Frame::LayoutSync(_)
+                                        | Frame::MachineUpdate(_)
+                                        | Frame::MasterState { .. }
                                 )
                         );
                         self.on_peer_event(ev).await;
@@ -836,6 +839,7 @@ impl Inner {
                 if let (Some(net), Some(claim)) = (&self.net, self.claim.clone()) {
                     net.send_to(&id, Frame::SourceClaim { stamp: claim });
                 }
+                self.send_master_state(&id);
                 self.auto_place(&id);
                 self.touch_ui();
             }
@@ -892,6 +896,11 @@ impl Inner {
                     self.mark_cfg_dirty();
                     self.touch_ui();
                 }
+            }
+            Frame::MasterState { enabled } => {
+                tracing::info!(peer = %from, enabled, "peer master switch");
+                self.peers.entry((*from).clone()).or_default().master_off = !enabled;
+                self.touch_ui();
             }
             Frame::MachineUpdate(info) => {
                 let id = info.id.clone();
@@ -1111,6 +1120,10 @@ impl Inner {
             Command::SetMasterEnabled(on) => {
                 self.cfg.master_enabled = on;
                 self.mark_cfg_dirty();
+                let ids: Vec<MachineId> = self.peers.keys().cloned().collect();
+                for id in &ids {
+                    self.send_master_state(id);
+                }
                 if !on {
                     if let Focus::Remote(target) = self.focus.clone() {
                         self.end_remote(
@@ -1396,7 +1409,19 @@ impl Inner {
     }
 
     fn peer_usable(&self, id: &MachineId) -> bool {
-        self.peers.get(id).is_some_and(|p| p.connected && !p.degraded)
+        self.peers
+            .get(id)
+            .is_some_and(|p| p.connected && !p.degraded && !p.master_off)
+    }
+
+    fn send_master_state(&self, id: &MachineId) {
+        let supports = self
+            .peers
+            .get(id)
+            .is_some_and(|p| p.connected && p.caps.iter().any(|c| c == caps::MASTER_V1));
+        if let (true, Some(net)) = (supports, &self.net) {
+            net.send_to(id, Frame::MasterState { enabled: self.cfg.master_enabled });
+        }
     }
 
     fn machine_enabled(&self, id: &MachineId) -> bool {

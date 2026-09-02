@@ -38,6 +38,8 @@ pub mod caps {
     pub const CLIPBOARD_V1: &str = "clipboard-v1";
     /// Layout replication.
     pub const LAYOUT_V1: &str = "layout-v1";
+    /// Master switch state replication (`Frame::MasterState`).
+    pub const MASTER_V1: &str = "master-v1";
 }
 
 /// Stable machine identity = Tailscale `Node.StableID`.
@@ -242,6 +244,9 @@ pub enum Frame {
     ClipAbort { id: u64, reason: String },
     /// Graceful shutdown notice.
     Bye { reason: String },
+    /// Sender's master switch. A machine with it off refuses every Enter, so peers must
+    /// not offer it as a crossing target. Gated on `caps::MASTER_V1`.
+    MasterState { enabled: bool },
 }
 
 /// Errors shared by framing and session-level protocol handling.

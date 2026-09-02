@@ -750,3 +750,35 @@ async fn target_master_disable_returns_the_source_home() {
     assert!(warp.is_some(), "an orderly teardown warps the cursor home");
     wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
 }
+
+#[tokio::test]
+async fn peer_master_off_makes_the_edge_uncrossable_until_reenabled() {
+    let (a, b) = spawn_pair().await;
+    wait_until("A arms an edge toward B", || !a.mock.state.lock().edges.is_empty()).await;
+    b.handle.send(Command::SetMasterEnabled(false));
+    wait_until("A sees B's master off as an uncrossable edge", || {
+        let state = a.handle.state();
+        let state = state.borrow();
+        !state.edges.is_empty() && state.edges.iter().all(|e| !e.crossable)
+    })
+    .await;
+
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    let edge = a.mock.state.lock().edges[0].clone();
+    let along = f64::from(edge.from + edge.to) / 2.0;
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!a.mock.state.lock().capturing, "A must not capture toward a master-off peer");
+    assert!(b.mock.state.lock().entered.is_empty(), "B must never be entered");
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+
+    b.handle.send(Command::SetMasterEnabled(true));
+    wait_until("edge becomes crossable again", || {
+        a.handle.state().borrow().edges.iter().all(|e| e.crossable)
+    })
+    .await;
+    drive_a_to_b(&a, &b).await;
+}

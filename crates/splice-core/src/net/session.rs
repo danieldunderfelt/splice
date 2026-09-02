@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 
 /// Capabilities every Splice peer advertises; the negotiated set is the intersection.
 fn our_caps() -> Vec<String> {
-    [caps::INPUT_V1, caps::CLIPBOARD_V1, caps::LAYOUT_V1]
+    [caps::INPUT_V1, caps::CLIPBOARD_V1, caps::LAYOUT_V1, caps::MASTER_V1]
         .iter()
         .map(|s| s.to_string())
         .collect()
