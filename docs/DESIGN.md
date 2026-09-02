@@ -55,7 +55,8 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
    applies its own keyboard layout. (Kills: Deskflow's 11-year AltGr bug class; lan-mouse's
    layout-group leak.)
 4. **Forgiving liveness.** Heartbeat 1 s when a session is active, 5 s idle; 3 missed → peer
-   *degraded* (release all input, keep trying) — never tear down sockets on a missed heartbeat.
+   *degraded* (release all input, keep trying) — never tear down sockets on a missed heartbeat;
+   only 10 s of continuous silence drops the socket so the dialer can redial.
    (Kills: lan-mouse's 2 s hard-window disconnects.)
 5. **Held-input safety, both sides independently.** Both source and target track held keys/buttons.
    Release everything on: Leave, disconnect, degrade, capture loss, Secure Input start/end, panic
@@ -177,6 +178,34 @@ TargetActive(source, session_seq)
 - Enter carries absolute position in the *target's* local coords (source converts via layout).
 - Motion accumulates into virtual_pos clamped to the target's display union (dead-zone aware:
   clamp to nearest point inside any display rect).
+
+### Never-stuck invariants
+
+Every rule below closes a verified way for the cursor to end up captured with no way home.
+
+- **A target never turns an injected barrier hit into a crossing.** Wayland InputCapture
+  barriers fire for portal-injected motion too, so the driven machine's own edge activates
+  whenever the source pushes the cursor against it. While `TargetActive` such an `EdgeHit`
+  is released immediately; for a grace period after any driven session ends it is still
+  released, because the activation can arrive after the source's `Leave` (the two travel
+  different paths). Only physical local input lifts the grace early. Without this the target
+  claims sourceness and `Enter`s the source, which throws the cursor straight back.
+- **A return path must exist while `SourceRemote`.** `reconcile_focus` requires a chain of
+  crossable links from the current target back to this machine; if layout or display
+  geometry changes remove it, the session ends and the cursor is warped home. Corner dead
+  zones are capped at a quarter of the shared span so a short edge stays crossable.
+- **A target that ends a session on its own tells the source.** Every target-side teardown
+  (physical input, disable, panic, degrade, emulation failure) sends `Leave` for the active
+  session; the source treats any `Leave` for its active session as an orderly teardown.
+- **A target refuses what it cannot inject.** Wayland `Emulate::enter`/`inject` fail while
+  the screen is locked or no RemoteDesktop session is live, so the source never captures
+  into a black hole. A failed portal `Release` closes and recreates the capture session,
+  because a stranded activation would otherwise swallow all local input.
+- **Silence is not forever.** A peer that stays Degraded for `degraded_timeout` (10 s) has
+  its socket dropped and redialed; TCP alone would take minutes to notice a dead path.
+- **Returning home re-arms the edge only after the cursor leaves it.** macOS warps the
+  cursor 1 px inside the edge; the tap records that edge as already in contact so the next
+  event cannot re-cross. Edge sets that did not change do not reset contact either.
 
 ## Wire protocol (splice-proto)
 

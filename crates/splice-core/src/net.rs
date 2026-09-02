@@ -106,6 +106,8 @@ pub struct NetOpts {
     pub idle_hb: Duration,
     /// Consecutive missed Pongs before PeerEvent::Degraded.
     pub max_misses: u32,
+    /// Continuous Degraded time after which the socket is dropped and redialed.
+    pub degraded_timeout: Duration,
     pub backoff_min: Duration,
     pub backoff_max: Duration,
     pub dial_timeout: Duration,
@@ -127,6 +129,7 @@ impl Default for NetOpts {
             active_hb: Duration::from_secs(1),
             idle_hb: Duration::from_secs(5),
             max_misses: 3,
+            degraded_timeout: Duration::from_secs(10),
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             dial_timeout: Duration::from_secs(2),

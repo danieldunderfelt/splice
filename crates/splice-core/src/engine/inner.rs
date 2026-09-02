@@ -29,6 +29,8 @@ const CLIP_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Snap tolerance for SetPlacement (DESIGN/UI: 8 px magnetism).
 const SNAP_TOLERANCE: i32 = 8;
 const MAX_PLATFORM_BATCH_EVENTS: usize = 64;
+const DRIVEN_GRACE: Duration = Duration::from_secs(1);
+const TS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, PartialEq)]
 enum Focus {
@@ -134,6 +136,7 @@ pub struct Inner {
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
     platform_batch: Vec<PlatformEvent>,
+    driven_grace_until: Option<Instant>,
 
     clip_lamport: u64,
     clip_seen: Option<Stamp>,
@@ -201,6 +204,7 @@ impl Inner {
             ui_deadline: None,
             cfg_deadline: None,
             platform_batch: Vec::with_capacity(16),
+            driven_grace_until: None,
             clip_lamport: 0,
             clip_seen: None,
             last_applied_inline: None,
@@ -312,7 +316,7 @@ impl Inner {
     async fn bootstrap(&mut self) {
         let retry = self.poll_interval.min(Duration::from_secs(5));
         loop {
-            let status = match self.ts.status().await {
+            let status = match self.ts_status().await {
                 Ok(status) => status,
                 Err(e) => {
                     self.tailscale_error = Some(format!("tailscale unreachable: {e}"));
@@ -367,8 +371,16 @@ impl Inner {
 
     // ----- discovery -----
 
+    async fn ts_status(&self) -> Result<splice_tailscale::Status, String> {
+        match tokio::time::timeout(TS_STATUS_TIMEOUT, self.ts.status()).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("LocalAPI status timed out".into()),
+        }
+    }
+
     async fn discover(&mut self) {
-        match self.ts.status().await {
+        match self.ts_status().await {
             Ok(status) => {
                 self.tailscale_error = None;
                 let self_user = status.self_node.user_id;
@@ -449,8 +461,9 @@ impl Inner {
             PlatformEvent::PhysicalActivity => {
                 self.claim_source();
                 if let Focus::Driven(source) = self.focus.clone() {
-                    self.end_driven(&source).await;
+                    self.end_driven(&source, Some(LeaveReason::SourceChanged)).await;
                 }
+                self.driven_grace_until = None;
             }
             PlatformEvent::ClipboardChanged { mimes, inline_text } => {
                 self.on_clipboard_changed(mimes, inline_text);
@@ -484,7 +497,11 @@ impl Inner {
         };
         let target = link.to.clone();
         let link_is_active = self.links.iter().any(|candidate| candidate == &link);
+        let recently_driven = self
+            .driven_grace_until
+            .is_some_and(|until| Instant::now() < until);
         if self.focus != Focus::Local
+            || recently_driven
             || !self.cfg.master_enabled
             || !self.machine_enabled(&self.self_info.id)
             || !self.machine_enabled(&target)
@@ -607,6 +624,8 @@ impl Inner {
                 if link.from != *target {
                     return false;
                 }
+                let span = f64::from(link.from_range.1 - link.from_range.0);
+                let dz = dz.min(span / 4.0);
                 let (along, crosses) = match link.side {
                     EdgeSide::Left => (pos.y, pos.x <= f64::from(link.at)),
                     EdgeSide::Right => (pos.y, pos.x >= f64::from(link.at)),
@@ -708,12 +727,18 @@ impl Inner {
         let _ = self.emulate.release_all().await;
     }
 
-    async fn end_driven(&mut self, src: &MachineId) {
+    async fn end_driven(&mut self, src: &MachineId, notify: Option<LeaveReason>) {
         self.release_target_side().await;
         let _ = self.emulate.leave().await;
         if let Some(net) = &self.net {
+            if let Some(reason) = notify {
+                if self.peers.get(src).is_some_and(|p| p.connected) {
+                    net.send_to(src, Frame::Leave { session: self.active_session, reason });
+                }
+            }
             net.set_active(src, false);
         }
+        self.driven_grace_until = Some(Instant::now() + DRIVEN_GRACE);
         self.focus = Focus::Local;
         self.touch_ui();
     }
@@ -723,7 +748,7 @@ impl Inner {
             self.end_remote(&target, LeaveReason::Panic, None, true).await;
         }
         if let Focus::Driven(src) = self.focus.clone() {
-            self.end_driven(&src).await;
+            self.end_driven(&src, Some(LeaveReason::Panic)).await;
         }
         if let Some(net) = &self.net {
             net.broadcast(Frame::ReleaseAll);
@@ -803,7 +828,7 @@ impl Inner {
                     self.end_remote(&id, LeaveReason::Reconfigured, Some(self.last_local_pos), true)
                         .await;
                 } else if self.focus == Focus::Driven(id.clone()) {
-                    self.end_driven(&id).await;
+                    self.end_driven(&id, Some(LeaveReason::Reconfigured)).await;
                 }
                 self.touch_ui();
             }
@@ -822,7 +847,7 @@ impl Inner {
                     self.end_remote(&id, LeaveReason::Reconfigured, Some(self.last_local_pos), true)
                         .await;
                 } else if self.focus == Focus::Driven(id.clone()) {
-                    self.end_driven(&id).await;
+                    self.end_driven(&id, None).await;
                 }
                 self.touch_ui();
             }
@@ -874,13 +899,7 @@ impl Inner {
                     self.target_ledger.observe(&ev);
                     if let Err(err) = self.emulate.inject(ev).await {
                         tracing::warn!(source = %from, error = %err, "target input emulation failed");
-                        if let Some(net) = &self.net {
-                            net.send_to(
-                                from.as_ref(),
-                                Frame::Leave { session, reason: LeaveReason::CaptureLost },
-                            );
-                        }
-                        self.end_driven(from.as_ref()).await;
+                        self.end_driven(from.as_ref(), Some(LeaveReason::CaptureLost)).await;
                     }
                 }
             }
@@ -890,7 +909,7 @@ impl Inner {
                     Focus::Driven(source)
                         if source == from.as_ref() && session == self.active_session
                 ) {
-                    self.end_driven(from.as_ref()).await;
+                    self.end_driven(from.as_ref(), None).await;
                 } else if matches!(&self.focus, Focus::Remote(target) if target == from.as_ref())
                     && session == self.active_session
                 {
@@ -955,7 +974,7 @@ impl Inner {
             if old == from {
                 self.release_target_side().await;
             } else {
-                self.end_driven(&old).await;
+                self.end_driven(&old, Some(LeaveReason::SourceChanged)).await;
             }
         }
         if let Err(err) = self.emulate.enter(pos).await {
@@ -1074,7 +1093,7 @@ impl Inner {
                         .await;
                     }
                     if let Focus::Driven(src) = self.focus.clone() {
-                        self.end_driven(&src).await;
+                        self.end_driven(&src, Some(LeaveReason::Reconfigured)).await;
                     }
                 }
                 self.touch_ui();
@@ -1231,7 +1250,6 @@ impl Inner {
     /// Recompute the derived state from layout + reachability. Focus validity,
     /// crossable links and OS barriers are all projections of authoritative state.
     async fn recompute(&mut self) {
-        self.reconcile_focus().await;
         let mut geo: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         let mut active: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         if let Some(doc) = &self.layout {
@@ -1267,6 +1285,7 @@ impl Inner {
         }
         self.geo_links = layout::compute_links(&geo);
         self.links = layout::compute_links(&active);
+        self.reconcile_focus().await;
         self.armed = self
             .geo_links
             .iter()
@@ -1294,7 +1313,8 @@ impl Inner {
                     && self.machine_enabled(&self.self_info.id)
                     && self.machine_enabled(&target)
                     && self.peer_usable(&target)
-                    && self.claim.as_ref().is_some_and(|c| c.writer == self.self_info.id);
+                    && self.claim.as_ref().is_some_and(|c| c.writer == self.self_info.id)
+                    && self.return_path_exists(&target);
                 if !valid {
                     self.end_remote(
                         &target,
@@ -1312,10 +1332,30 @@ impl Inner {
                     && self.peer_usable(&source)
                     && self.claim.as_ref().is_some_and(|c| c.writer == source);
                 if !valid {
-                    self.end_driven(&source).await;
+                    self.end_driven(&source, Some(LeaveReason::Reconfigured)).await;
                 }
             }
         }
+    }
+
+    fn return_path_exists(&self, from: &MachineId) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = vec![from.clone()];
+        while let Some(node) = stack.pop() {
+            if node == self.self_info.id {
+                return true;
+            }
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            stack.extend(
+                self.links
+                    .iter()
+                    .filter(|link| link.from == node)
+                    .map(|link| link.to.clone()),
+            );
+        }
+        false
     }
 
     fn peer_usable(&self, id: &MachineId) -> bool {

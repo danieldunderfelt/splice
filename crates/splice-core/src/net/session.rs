@@ -293,6 +293,7 @@ async fn session_loop(
     let mut outstanding: Option<(u64, u64, Instant)> = None;
     let mut misses: u32 = 0;
     let mut degraded = false;
+    let mut degraded_since: Option<Instant> = None;
     let mut last_rtt_emit: Option<Instant> = None;
     let mut next_ping = Instant::now() + cadence(&inner, &active);
     let mut write_buf = Vec::with_capacity(256);
@@ -339,6 +340,7 @@ async fn session_loop(
                     };
                     // Any Pong is liveness, even one for a stale nonce.
                     misses = 0;
+                    degraded_since = None;
                     if degraded {
                         degraded = false;
                         let _ = inner
@@ -373,9 +375,15 @@ async fn session_loop(
                         outstanding = None;
                         if misses >= inner.opts.max_misses && !degraded {
                             degraded = true;
+                            degraded_since = Some(Instant::now());
                             let _ = inner.events.send(PeerEvent::Degraded(peer.clone()));
                         }
                     }
+                }
+                if degraded_since
+                    .is_some_and(|since| since.elapsed() >= inner.opts.degraded_timeout)
+                {
+                    break "heartbeat timeout".to_string();
                 }
                 if outstanding.is_none() {
                     nonce += 1;

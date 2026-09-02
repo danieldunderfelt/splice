@@ -404,20 +404,28 @@ async fn apply_barriers(
     Ok(())
 }
 
-async fn release(session: &Session, capture: &mut Option<ActiveCapture>, warp_to: Option<Vec2>) {
-    let Some(active) = capture.take() else { return };
+async fn release(
+    session: &Session,
+    capture: &mut Option<ActiveCapture>,
+    warp_to: Option<Vec2>,
+) -> bool {
+    let Some(active) = capture.take() else { return true };
     let mut opts = Options::new();
     opts.insert("activation_id", Value::new(active.activation_id));
     if let Some(pos) = warp_to {
         let (x, y) = clamp_to_zones(&session.zones, pos.x, pos.y);
         opts.insert("cursor_position", Value::new((x, y)));
     }
-    if let Err(err) = session
+    match session
         .ic
         .call::<_, _, ()>("Release", &(session.session_opath.clone(), opts))
         .await
     {
-        tracing::warn!(error = %err, "portal Release failed");
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(error = %err, "portal Release failed; recreating the capture session");
+            false
+        }
     }
 }
 
@@ -564,8 +572,12 @@ async fn run_session(
                         activation_id,
                     });
                     active_flag.store(true, Ordering::Release);
-                    release(&session, &mut capture, None).await;
+                    let released = release(&session, &mut capture, None).await;
                     active_flag.store(false, Ordering::Release);
+                    if !released {
+                        close_session(&session_proxy).await;
+                        return SessionEnd::Reconfigure;
+                    }
                     continue;
                 };
                 let along = match edge.side {
@@ -641,17 +653,25 @@ async fn run_session(
                         }
                     }
                     Command::EndCapture { warp_to } => {
-                        release(&session, &mut capture, warp_to).await;
+                        let released = release(&session, &mut capture, warp_to).await;
                         active_flag.store(false, Ordering::Release);
                         pressed.clear();
+                        if !released {
+                            close_session(&session_proxy).await;
+                            return SessionEnd::Reconfigure;
+                        }
                     }
                     Command::Panic => {
                         if capture.is_some() {
                             tracing::warn!("panic chord pressed");
-                            release(&session, &mut capture, None).await;
+                            let released = release(&session, &mut capture, None).await;
                             active_flag.store(false, Ordering::Release);
                             pressed.clear();
                             shared.emit(PlatformEvent::Capture(CaptureEvent::Panic));
+                            if !released {
+                                close_session(&session_proxy).await;
+                                return SessionEnd::Reconfigure;
+                            }
                         }
                     }
                 }
@@ -732,10 +752,10 @@ async fn handle_ei_event(
                 && capture.is_some()
             {
                 tracing::warn!("panic chord pressed");
-                release(session, capture, None).await;
+                let released = release(session, capture, None).await;
                 pressed.clear();
                 shared.emit(PlatformEvent::Capture(CaptureEvent::Panic));
-                return false;
+                return !released;
             }
             if forwarding {
                 shared.emit(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Key {

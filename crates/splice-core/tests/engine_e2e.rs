@@ -8,7 +8,7 @@ use splice_core::net::{NetOpts, TsApi};
 use splice_core::ui_state::{UiConnection, UiFocus};
 use splice_platform::mock::{self, MockHandle};
 use splice_platform::{CaptureEvent, EdgeSide, EdgeSpec, PlatformEvent};
-use splice_proto::{InputEvent, LayoutDoc, MachineId, Vec2I};
+use splice_proto::{DisplayRect, InputEvent, LayoutDoc, MachineId, Vec2I};
 use splice_tailscale::{Node, Status, TsError, WhoIs, WhoIsUser};
 use std::collections::HashMap;
 use std::future::Future;
@@ -654,4 +654,99 @@ async fn clipboard_offer_and_lazy_fetch() {
     let fetch = b.mock.last_fetch.lock().clone().expect("fetch callback installed");
     let data = fetch.fetch(TEXT_MIME).await.expect("origin serves the representation");
     assert_eq!(data, payload);
+}
+
+#[tokio::test]
+async fn target_barrier_activation_after_leave_does_not_steal_sourceness() {
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    wait_until("B arms its edge toward A", || !b.mock.state.lock().edges.is_empty()).await;
+
+    push_motion(&a, -4000.0 * into_sign(&edge), 0.0);
+    wait_until("A returned home", || {
+        !a.mock.state.lock().capturing && matches!(focus_of(&a), UiFocus::Local)
+    })
+    .await;
+    wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
+
+    // The compositor reports the barrier hit caused by the last injected motion
+    // only after the Leave has already been processed.
+    let b_edge = b.mock.state.lock().edges[0].clone();
+    let along = f64::from(b_edge.from + b_edge.to) / 2.0;
+    let ends_before = b.mock.state.lock().capture_ends.len();
+    b.mock.state.lock().capturing = true;
+    b.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: b_edge.id, along }))
+        .unwrap();
+    wait_until("B released the activation", || {
+        let st = b.mock.state.lock();
+        !st.capturing && st.capture_ends.len() > ends_before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(a.mock.state.lock().entered.is_empty(), "A must never be driven by B");
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+    assert!(matches!(focus_of(&b), UiFocus::Local));
+    assert_eq!(a.handle.state().borrow().source, Some(mid("aaa")));
+    assert_eq!(b.handle.state().borrow().source, Some(mid("aaa")));
+
+    // Real physical input on B lifts the guard immediately.
+    b.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    b.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: b_edge.id, along }))
+        .unwrap();
+    wait_until("B captures after physical input", || b.mock.state.lock().capturing).await;
+    wait_until("A is driven by B", || !a.mock.state.lock().entered.is_empty()).await;
+}
+
+#[tokio::test]
+async fn losing_the_return_link_ends_the_remote_session() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+
+    b.mock
+        .events
+        .send(PlatformEvent::DisplaysChanged {
+            displays: vec![DisplayRect {
+                id: "d0".into(),
+                x: 0,
+                y: 5000,
+                w: 1920,
+                h: 1080,
+                scale: 1.0,
+            }],
+        })
+        .unwrap();
+    wait_until("A returns home once B no longer touches it", || {
+        !a.mock.state.lock().capturing && matches!(focus_of(&a), UiFocus::Local)
+    })
+    .await;
+    let warp = a
+        .mock
+        .state
+        .lock()
+        .capture_ends
+        .last()
+        .copied()
+        .flatten()
+        .expect("return warp");
+    assert!((0.0..1920.0).contains(&warp.x) && (0.0..1080.0).contains(&warp.y));
+    wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
+}
+
+#[tokio::test]
+async fn target_master_disable_returns_the_source_home() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+
+    b.handle.send(Command::SetMasterEnabled(false));
+    wait_until("A returns home when the target disables itself", || {
+        !a.mock.state.lock().capturing && matches!(focus_of(&a), UiFocus::Local)
+    })
+    .await;
+    let warp = a.mock.state.lock().capture_ends.last().copied().flatten();
+    assert!(warp.is_some(), "an orderly teardown warps the cursor home");
+    wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
 }

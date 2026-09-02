@@ -94,7 +94,12 @@ impl TapState {
     }
 
     pub fn set_edges(&self, edges: Vec<EdgeSpec>) {
-        *self.edges.write() = edges;
+        let mut current = self.edges.write();
+        if *current == edges {
+            return;
+        }
+        *current = edges;
+        drop(current);
         *self.contact.lock() = None;
     }
 
@@ -117,7 +122,7 @@ impl TapState {
             return;
         }
         cursor::end(warp_to);
-        *self.contact.lock() = None;
+        *self.contact.lock() = warp_to.and_then(|p| self.edge_hit(p)).map(|(id, _)| id);
     }
 
     fn is_capturing(&self) -> bool {

@@ -304,3 +304,29 @@ async fn removing_dial_target_disconnects() {
     }
     assert!(!ca.send_to(&MachineId("bbb".into()), Frame::ReleaseAll));
 }
+
+#[tokio::test]
+async fn prolonged_silence_drops_the_socket_and_redials() {
+    let fast = NetOpts {
+        idle_hb: Duration::from_millis(20),
+        active_hb: Duration::from_millis(20),
+        degraded_timeout: Duration::from_millis(150),
+        ..test_opts()
+    };
+    let b_opts = fast.clone();
+    let b_gate = b_opts.answer_pings.clone();
+    let ((mut a, _ca), (mut b, _cb)) = pair(fast, b_opts).await;
+    wait_for(&mut a, Duration::from_secs(3), connected("bbb")).await;
+    wait_for(&mut b, Duration::from_secs(3), connected("aaa")).await;
+
+    b_gate.store(false, Ordering::SeqCst);
+    wait_for(&mut a, Duration::from_secs(3), |ev| {
+        matches!(ev, PeerEvent::Degraded(id) if id.0 == "bbb")
+    })
+    .await;
+    wait_for(&mut a, Duration::from_secs(3), disconnected("bbb")).await;
+
+    b_gate.store(true, Ordering::SeqCst);
+    wait_for(&mut a, Duration::from_secs(3), connected("bbb")).await;
+    wait_for(&mut b, Duration::from_secs(3), connected("aaa")).await;
+}
