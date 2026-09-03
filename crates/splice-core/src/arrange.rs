@@ -7,6 +7,8 @@
 //! along a seam, flipping around a corner and pushing through a neighbour all fall out of
 //! "nearest valid position". [`drag_step`] builds a whole pointer step on top of it: the
 //! dragged body is placed, then every cluster it stopped holding in place is settled.
+//! [`normalize`] repairs any arrangement (a saved one, or one whose display geometry
+//! changed) into a single connected, overlap-free cluster with the smallest moves.
 
 use splice_platform::EdgeSide;
 use splice_proto::{DisplayRect, Vec2I};
@@ -17,6 +19,9 @@ pub const MIN_SEAM: i64 = 160;
 /// Fraction of `min_seam` by which the side a body already rests on wins ties, so a
 /// card never chatters between two seams when the pointer sits on their bisector.
 const STICKINESS: i64 = 8;
+/// Fraction of `min_seam` by which staying put wins, so pointer tremor cannot flip a
+/// body between two near-equal placements.
+const INERTIA: i64 = 4;
 
 const SIDES: [EdgeSide; 4] = [
     EdgeSide::Left,
@@ -229,8 +234,10 @@ pub struct SeamSegment {
 
 /// Nearest translation to `desired` that rests `moving` against one of `fixed` along a
 /// seam of at least `rules.min_seam` without overlapping any fixed body. `current` is
-/// the side the body rests on now; it wins near-ties so corner flips are decisive.
-/// None when there is nothing to attach to.
+/// the side the body rests on now: it wins near-ties, staying put wins by more, and the
+/// perpendicular sides only come into play once the seam the body rests on has run out,
+/// so a straight push goes through to the far side rather than over the top. None when
+/// there is nothing to attach to.
 pub fn resolve(
     moving: &Body,
     desired: Vec2I,
@@ -261,42 +268,83 @@ fn attach(
         desired: (i64::from(desired.x), i64::from(desired.y)),
     };
     let stickiness = (rules.min_seam / STICKINESS) as f64;
-    let mut best: Option<(f64, Placement)> = None;
+    let mut candidates = Vec::new();
     for body in targets.iter().copied() {
-        let Some(neighbour_bounds) = body.bounds() else {
+        if body.is_empty() {
             continue;
-        };
+        }
         for anchor in &body.rects {
             for rect in &moving.rects {
                 for side in SIDES {
-                    let Some(delta) = probe.rest(*rect, *anchor, neighbour_bounds, side) else {
-                        continue;
-                    };
-                    let mut score = ((delta.0 - probe.desired.0) as f64)
-                        .hypot((delta.1 - probe.desired.1) as f64);
-                    if current == Some(side) {
-                        score -= stickiness;
-                    }
-                    if best
-                        .as_ref()
-                        .is_none_or(|(best_score, _)| score < *best_score)
-                    {
-                        best = Some((
-                            score,
-                            Placement {
-                                delta: Vec2I {
-                                    x: to_i32(delta.0),
-                                    y: to_i32(delta.1),
-                                },
-                                side,
-                            },
-                        ));
+                    if let Some(rest) = probe.rest(*rect, *anchor, body, side) {
+                        candidates.push((side, rest));
                     }
                 }
             }
         }
     }
+
+    let in_axis = |side: EdgeSide| current.is_none_or(|now| now == side || now == opposite(side));
+    let distance = |rest: &Rest| {
+        ((rest.delta.0 - probe.desired.0) as f64).hypot((rest.delta.1 - probe.desired.1) as f64)
+    };
+    let nearest = |sides: &dyn Fn(EdgeSide) -> bool| {
+        candidates
+            .iter()
+            .filter(|(side, _)| sides(*side))
+            .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
+    };
+    let nearest_in_axis = nearest(&|side| Some(side) == current).or_else(|| nearest(&in_axis));
+    if nearest_in_axis.is_some_and(|(_, rest)| !rest.exhausted) {
+        candidates.retain(|(side, _)| in_axis(*side));
+    }
+
+    let mut best: Option<(f64, Placement)> = None;
+    for (side, rest) in candidates {
+        let (dx, dy) = (
+            (rest.delta.0 - probe.desired.0) as f64,
+            (rest.delta.1 - probe.desired.1) as f64,
+        );
+        let mut score = dx.hypot(dy);
+        if current == Some(side) {
+            score -= stickiness;
+        }
+        if rest.delta == (0, 0) {
+            score -= (rules.min_seam / INERTIA) as f64;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score < *best_score)
+        {
+            best = Some((
+                score,
+                Placement {
+                    delta: Vec2I {
+                        x: to_i32(rest.delta.0),
+                        y: to_i32(rest.delta.1),
+                    },
+                    side,
+                },
+            ));
+        }
+    }
     best.map(|(_, placement)| placement)
+}
+
+fn opposite(side: EdgeSide) -> EdgeSide {
+    match side {
+        EdgeSide::Left => EdgeSide::Right,
+        EdgeSide::Right => EdgeSide::Left,
+        EdgeSide::Top => EdgeSide::Bottom,
+        EdgeSide::Bottom => EdgeSide::Top,
+    }
+}
+
+/// Where a seam candidate puts the body, and whether the seam ran out (or was blocked)
+/// before reaching the desired position along it.
+struct Rest {
+    delta: (i64, i64),
+    exhausted: bool,
 }
 
 struct Probe<'a> {
@@ -310,13 +358,8 @@ struct Probe<'a> {
 impl Probe<'_> {
     /// Translation resting `rect`'s `side` against `anchor`, slid along the seam to the
     /// point nearest the desired position that keeps the whole body overlap-free.
-    fn rest(
-        &self,
-        rect: Bounds,
-        anchor: Bounds,
-        neighbour_bounds: Bounds,
-        side: EdgeSide,
-    ) -> Option<(i64, i64)> {
+    fn rest(&self, rect: Bounds, anchor: Bounds, neighbour: &Body, side: EdgeSide) -> Option<Rest> {
+        let neighbour_bounds = neighbour.bounds()?;
         let cross_delta = match side {
             EdgeSide::Left => anchor.right - rect.left,
             EdgeSide::Right => anchor.left - rect.right,
@@ -341,7 +384,12 @@ impl Probe<'_> {
         for moving_rect in &self.moving.rects {
             let (moving_cross, moving_along) = moving_rect.spans(side);
             let moving_cross = moving_cross.shifted(cross_delta);
-            for fixed_rect in self.blocking.iter().flat_map(|body| &body.rects) {
+            for fixed_rect in self
+                .blocking
+                .iter()
+                .flat_map(|body| &body.rects)
+                .chain(&neighbour.rects)
+            {
                 let (fixed_cross, fixed_along) = fixed_rect.spans(side);
                 if moving_cross.overlaps(fixed_cross) {
                     forbidden.push((
@@ -360,6 +408,7 @@ impl Probe<'_> {
             self.desired.0
         };
         let mut along = nearest_free(low, high, &forbidden, target)?;
+        let exhausted = along != target;
 
         let (_, moving_along) = self.moving_bounds.spans(side);
         let (_, neighbour_along) = neighbour_bounds.spans(side);
@@ -375,20 +424,26 @@ impl Probe<'_> {
                     .iter()
                     .any(|&(start, end)| position > start && position < end)
         };
-        if let Some(aligned) = flush
+        let attracts = |position: i64| {
+            (position - along).abs() <= self.rules.align_tolerance && free(position)
+        };
+        if flush.contains(&0) && attracts(0) {
+            along = 0;
+        } else if let Some(aligned) = flush
             .into_iter()
-            .filter(|&position| {
-                (position - along).abs() <= self.rules.align_tolerance && free(position)
-            })
+            .filter(|&position| attracts(position))
             .min_by_key(|&position| (position - along).abs())
         {
             along = aligned;
         }
 
-        Some(if vertical {
-            (cross_delta, along)
-        } else {
-            (along, cross_delta)
+        Some(Rest {
+            delta: if vertical {
+                (cross_delta, along)
+            } else {
+                (along, cross_delta)
+            },
+            exhausted,
         })
     }
 }
@@ -444,21 +499,31 @@ fn shared_edge(rect: Bounds, other: Bounds) -> Option<(EdgeSide, i64, Span)> {
     rect_along.overlap(other_along).map(|span| (side, at, span))
 }
 
+/// The side of `rect` sharing a legal seam with `other`, if any.
+fn seam_side(rect: Bounds, other: Bounds, rules: &Rules) -> Option<EdgeSide> {
+    let (side, _, span) = shared_edge(rect, other)?;
+    let (_, rect_along) = rect.spans(side);
+    let (_, other_along) = other.spans(side);
+    let least = rules
+        .min_seam
+        .min(rect_along.len())
+        .min(other_along.len())
+        .max(1);
+    (span.len() >= least).then_some(side)
+}
+
 /// Do two bodies share a seam long enough under `rules`?
 pub fn touching(a: &Body, b: &Body, rules: &Rules) -> bool {
-    a.rects.iter().any(|rect| {
-        b.rects.iter().any(|other| {
-            shared_edge(*rect, *other).is_some_and(|(side, _, span)| {
-                let (_, rect_along) = rect.spans(side);
-                let (_, other_along) = other.spans(side);
-                span.len()
-                    >= rules
-                        .min_seam
-                        .min(rect_along.len())
-                        .min(other_along.len())
-                        .max(1)
-            })
-        })
+    resting_side(a, std::slice::from_ref(b), rules).is_some()
+}
+
+/// The side of `body` resting against any of `others` along a legal seam, if any.
+pub fn resting_side(body: &Body, others: &[Body], rules: &Rules) -> Option<EdgeSide> {
+    body.rects.iter().find_map(|rect| {
+        others
+            .iter()
+            .flat_map(|other| &other.rects)
+            .find_map(|other| seam_side(*rect, *other, rules))
     })
 }
 
@@ -497,6 +562,32 @@ fn clusters(bodies: &[Body], members: &[usize], rules: &Rules) -> Vec<Vec<usize>
     clusters
 }
 
+/// Clusters for settling: a body overlapping any other is illegal where it stands, so
+/// it forms its own cluster (and must move) even if it also shares a seam with something.
+/// The `anchor` (a body being dragged) is exempt: whatever it overlaps moves instead.
+fn settle_clusters(bodies: &[Body], anchor: Option<usize>, rules: &Rules) -> Vec<Vec<usize>> {
+    let overlapping: Vec<usize> = (0..bodies.len())
+        .filter(|&index| {
+            Some(index) != anchor
+                && bodies
+                    .iter()
+                    .enumerate()
+                    .any(|(other, body)| other != index && bodies[index].overlaps(body))
+        })
+        .collect();
+    let clear: Vec<usize> = (0..bodies.len())
+        .filter(|index| !overlapping.contains(index))
+        .collect();
+    let mut clusters = clusters(bodies, &clear, rules);
+    clusters.extend(
+        overlapping
+            .into_iter()
+            .filter(|&index| !bodies[index].is_empty())
+            .map(|index| vec![index]),
+    );
+    clusters
+}
+
 /// The cluster with the most display area among `members`; earliest wins ties, so the
 /// caller's first body (this machine) anchors the arrangement.
 fn largest_cluster(bodies: &[Body], members: &[usize], rules: &Rules) -> Vec<usize> {
@@ -517,18 +608,21 @@ pub struct Step {
     pub side: EdgeSide,
 }
 
-/// Re-placing the dragged body can strand its riders again; re-place at most this often,
-/// always settling after the last move.
-const SETTLE_ROUNDS: usize = 3;
+/// Placing the dragged body and re-settling the rest repeat until neither moves
+/// anything; this bounds the repetitions.
+const SETTLE_ROUNDS: usize = 4;
 
 /// One pointer step of a drag. Rests body `dragged` at the nearest legal position to
-/// `desired` (a translation from where it stands now), then settles everyone else. A
-/// cluster the dragged body stopped holding in place slides into the gap it left
+/// `desired` (a translation from where it stands now), then settles every cluster no
+/// longer connected to it: a cluster slides into the gap the dragged body left
 /// (`vacated`: its footprint when the drag began) when that reconnects it; otherwise it
 /// rides along, keeping its place beside the dragged body; and when that is blocked it
-/// reattaches to the stationary cluster with the smallest move. Only the stationary
-/// cluster blocks the dragged body, so it can push riders ahead of it. None when there
-/// is nothing to rest against.
+/// reattaches with the smallest move. The largest cluster of other bodies is the frame:
+/// it alone blocks the dragged body (so riders can be pushed ahead of it) and it never
+/// moves. Later rounds only restore contact with the frame's cluster after neighbours
+/// moved; they never chase the pointer again. A step whose net effect would move the
+/// dragged body against the pointer is discarded, since it could only be undone by the
+/// next step. None when there is nothing to rest against.
 pub fn drag_step(
     bodies: &[Body],
     dragged: usize,
@@ -542,68 +636,72 @@ pub fn drag_step(
     let others: Vec<usize> = (0..bodies.len())
         .filter(|&index| index != dragged)
         .collect();
+    let frame = largest_cluster(&placed, &others, rules);
+    let mut side = current;
 
-    let placement = {
-        let stationary = largest_cluster(&placed, &others, rules);
-        let targets: Vec<&Body> = others.iter().map(|&index| &placed[index]).collect();
-        let blocking: Vec<&Body> = stationary.iter().map(|&index| &placed[index]).collect();
-        attach(
-            &placed[dragged],
-            desired,
-            &targets,
-            &blocking,
+    for round in 0..SETTLE_ROUNDS {
+        let placement = {
+            let anchored = components(&placed, rules)
+                .into_iter()
+                .find(|cluster| cluster.iter().any(|member| frame.contains(member)))
+                .unwrap_or_default();
+            let reachable: Vec<usize> = if round == 0 || anchored.contains(&dragged) {
+                others.clone()
+            } else {
+                anchored
+                    .into_iter()
+                    .filter(|&member| member != dragged)
+                    .collect()
+            };
+            let targets: Vec<&Body> = reachable.iter().map(|&index| &placed[index]).collect();
+            let blocking: Vec<&Body> = frame.iter().map(|&index| &placed[index]).collect();
+            let goal = if round == 0 {
+                desired
+            } else {
+                Vec2I::default()
+            };
+            attach(&placed[dragged], goal, &targets, &blocking, rules, side)?
+        };
+        side = Some(placement.side);
+        let step = placement.delta;
+        shift(&mut placed, &mut deltas, dragged, step);
+        let moved = settle(
+            &mut placed,
+            &mut deltas,
+            dragged,
+            &frame,
+            vacated,
+            step,
             rules,
-            current,
-        )?
-    };
-    let mut side = placement.side;
-    let mut step = placement.delta;
-    shift(&mut placed, &mut deltas, dragged, step);
-
-    for round in 0..=SETTLE_ROUNDS {
-        settle(&mut placed, &mut deltas, dragged, vacated, step, rules);
-        if round == SETTLE_ROUNDS || components(&placed, rules).len() <= 1 {
+        );
+        if step == Vec2I::default() && !moved {
             break;
         }
-        let placement = {
-            let stationary = largest_cluster(&placed, &others, rules);
-            let anchors: Vec<&Body> = stationary.iter().map(|&index| &placed[index]).collect();
-            let remaining = Vec2I {
-                x: desired.x - deltas[dragged].x,
-                y: desired.y - deltas[dragged].y,
-            };
-            attach(
-                &placed[dragged],
-                remaining,
-                &anchors,
-                &anchors,
-                rules,
-                Some(side),
-            )
-        };
-        let Some(placement) = placement else {
-            break;
-        };
-        side = placement.side;
-        step = placement.delta;
-        shift(&mut placed, &mut deltas, dragged, step);
     }
-    Some(Step { deltas, side })
+    let net = deltas[dragged];
+    if i64::from(net.x) * i64::from(desired.x) + i64::from(net.y) * i64::from(desired.y) < 0 {
+        return Some(Step {
+            deltas: vec![Vec2I::default(); bodies.len()],
+            side: current.or(side)?,
+        });
+    }
+    Some(Step {
+        deltas,
+        side: side?,
+    })
 }
 
-/// A cluster closes the gap when, after sliding by `delta`, it fills the vacated
-/// footprint along the axis it slid on (three quarters of whichever is shorter), rather
-/// than merely grazing it.
-fn closes_gap(landed: Bounds, vacated: Bounds, delta: Vec2I) -> bool {
-    let Some(overlap) = landed.intersection(vacated) else {
-        return false;
-    };
-    let (covered, own, gap) = if delta.x.abs() >= delta.y.abs() {
-        (overlap.width(), landed.width(), vacated.width())
-    } else {
-        (overlap.height(), landed.height(), vacated.height())
-    };
-    covered * 4 >= own.min(gap) * 3
+/// A cluster closes the gap when its displays, after the move, fill most of the vacated
+/// footprint (three quarters of whichever is smaller) rather than grazing or merely
+/// surrounding it.
+fn closes_gap(landed: &Body, vacated: Bounds) -> bool {
+    let covered: i64 = landed
+        .rects
+        .iter()
+        .filter_map(|rect| rect.intersection(vacated))
+        .map(Bounds::area)
+        .sum();
+    covered * 4 >= landed.area().min(vacated.area()) * 3
 }
 
 fn shift(placed: &mut [Body], deltas: &mut [Vec2I], index: usize, delta: Vec2I) {
@@ -612,44 +710,53 @@ fn shift(placed: &mut [Body], deltas: &mut [Vec2I], index: usize, delta: Vec2I) 
     deltas[index].y += delta.y;
 }
 
-/// Settle every cluster of non-dragged bodies that is not the stationary one: gap
-/// closers first (nearest first), then riders.
+/// Reattach every cluster not connected to the frame, the dragged body aside (a later
+/// round re-rests it): gap closers first (nearest first), then riders. Riders only ride
+/// while the dragged body is anchored to the frame; while it merely rests on riders they
+/// wait for it to be re-rested, so a card stuck at a corner cannot ratchet its riders
+/// away. True when anything moved.
 fn settle(
     placed: &mut [Body],
     deltas: &mut [Vec2I],
     dragged: usize,
+    frame: &[usize],
     vacated: Bounds,
     step: Vec2I,
     rules: &Rules,
-) {
-    let others: Vec<usize> = (0..placed.len())
-        .filter(|&index| index != dragged)
-        .collect();
-    let mut pending = clusters(placed, &others, rules);
-    let stationary = largest_cluster(placed, &others, rules);
-    let Some(main) = pending.iter().position(|cluster| *cluster == stationary) else {
-        return;
-    };
-    let mut settled = pending.swap_remove(main);
+) -> bool {
+    let mut settled: Vec<usize> = Vec::new();
+    let mut pending: Vec<Vec<usize>> = Vec::new();
+    for cluster in settle_clusters(placed, Some(dragged), rules) {
+        if cluster.iter().any(|member| frame.contains(member)) {
+            settled.extend(cluster);
+        } else {
+            let cluster: Vec<usize> = cluster
+                .into_iter()
+                .filter(|&member| member != dragged)
+                .collect();
+            if !cluster.is_empty() {
+                pending.push(cluster);
+            }
+        }
+    }
+    if settled.is_empty() {
+        settled.push(dragged);
+    }
+    let mut moved = false;
 
+    let stationary: Vec<usize> = settled
+        .iter()
+        .copied()
+        .filter(|&member| member != dragged)
+        .collect();
     loop {
         let mut nearest: Option<(usize, f64, Vec2I)> = None;
         for (index, cluster) in pending.iter().enumerate() {
             let merged = Body::merged(cluster.iter().map(|&member| &placed[member]));
-            let targets: Vec<&Body> = settled.iter().map(|&member| &placed[member]).collect();
-            let blocking: Vec<&Body> = (0..placed.len())
-                .filter(|member| !cluster.contains(member))
-                .map(|member| &placed[member])
-                .collect();
-            let Some(placement) =
-                attach(&merged, Vec2I::default(), &targets, &blocking, rules, None)
-            else {
+            let Some(placement) = reattach(&merged, cluster, &stationary, placed, rules) else {
                 continue;
             };
-            let closes = merged
-                .shifted(placement.delta)
-                .bounds()
-                .is_some_and(|bounds| closes_gap(bounds, vacated, placement.delta));
+            let closes = closes_gap(&merged.shifted(placement.delta), vacated);
             let cost = f64::from(placement.delta.x).hypot(f64::from(placement.delta.y));
             if closes && nearest.is_none_or(|(_, best, _)| cost < best) {
                 nearest = Some((index, cost, placement.delta));
@@ -662,23 +769,24 @@ fn settle(
             shift(placed, deltas, member, delta);
             settled.push(member);
         }
+        moved = true;
     }
 
+    let anchored = settled.contains(&dragged);
     for cluster in pending {
         let merged = Body::merged(cluster.iter().map(|&member| &placed[member]));
-        let rigid = merged.shifted(step);
-        let clear = (0..placed.len())
-            .filter(|member| !cluster.contains(member))
-            .all(|member| !rigid.overlaps(&placed[member]));
-        let delta = if clear && touching(&rigid, &placed[dragged], rules) {
-            step
-        } else {
-            let targets: Vec<&Body> = settled.iter().map(|&member| &placed[member]).collect();
-            let blocking: Vec<&Body> = (0..placed.len())
+        let clear = |body: &Body| {
+            (0..placed.len())
                 .filter(|member| !cluster.contains(member))
-                .map(|member| &placed[member])
-                .collect();
-            match attach(&merged, Vec2I::default(), &targets, &blocking, rules, None) {
+                .all(|member| !body.overlaps(&placed[member]))
+        };
+        let rigid = merged.shifted(step);
+        let delta = if anchored && clear(&rigid) && touching(&rigid, &placed[dragged], rules) {
+            step
+        } else if !anchored && clear(&merged) {
+            Vec2I::default()
+        } else {
+            match reattach(&merged, &cluster, &settled, placed, rules) {
                 Some(placement) => placement.delta,
                 None => continue,
             }
@@ -687,7 +795,64 @@ fn settle(
             shift(placed, deltas, member, delta);
             settled.push(member);
         }
+        moved |= delta != Vec2I::default();
     }
+    moved
+}
+
+/// Smallest move resting `merged` (the bodies in `cluster`) against `settled`, blocked
+/// by every body outside the cluster.
+fn reattach(
+    merged: &Body,
+    cluster: &[usize],
+    settled: &[usize],
+    placed: &[Body],
+    rules: &Rules,
+) -> Option<Placement> {
+    let targets: Vec<&Body> = settled.iter().map(|&member| &placed[member]).collect();
+    let blocking: Vec<&Body> = (0..placed.len())
+        .filter(|member| !cluster.contains(member))
+        .map(|member| &placed[member])
+        .collect();
+    attach(merged, Vec2I::default(), &targets, &blocking, rules, None)
+}
+
+/// Translation per body that turns any arrangement into one connected, overlap-free
+/// cluster: the largest cluster stays put and every other cluster joins it, nearest
+/// first, each with its smallest legal move.
+pub fn normalize(bodies: &[Body], rules: &Rules) -> Vec<Vec2I> {
+    let mut placed = bodies.to_vec();
+    let mut deltas = vec![Vec2I::default(); bodies.len()];
+    let mut pending = settle_clusters(&placed, None, rules);
+    let Some(largest) = pending.iter().enumerate().max_by_key(|(_, cluster)| {
+        let area: i64 = cluster.iter().map(|&index| bodies[index].area()).sum();
+        (area, std::cmp::Reverse(cluster[0]))
+    }) else {
+        return deltas;
+    };
+    let mut settled = pending.swap_remove(largest.0);
+
+    while !pending.is_empty() {
+        let mut nearest: Option<(usize, f64, Vec2I)> = None;
+        for (index, cluster) in pending.iter().enumerate() {
+            let merged = Body::merged(cluster.iter().map(|&member| &placed[member]));
+            let Some(placement) = reattach(&merged, cluster, &settled, &placed, rules) else {
+                continue;
+            };
+            let cost = f64::from(placement.delta.x).hypot(f64::from(placement.delta.y));
+            if nearest.is_none_or(|(_, best, _)| cost < best) {
+                nearest = Some((index, cost, placement.delta));
+            }
+        }
+        let Some((index, _, delta)) = nearest else {
+            break;
+        };
+        for member in pending.swap_remove(index) {
+            shift(&mut placed, &mut deltas, member, delta);
+            settled.push(member);
+        }
+    }
+    deltas
 }
 
 /// Every shared boundary segment of at least `min_len` between two bodies.
@@ -839,6 +1004,74 @@ mod tests {
     }
 
     #[test]
+    fn alignment_is_sticky_once_flush() {
+        let rules = Rules {
+            min_seam: 20,
+            align_tolerance: 30,
+        };
+        let fixed = [Body::new(&[display(0, 0, 100, 200)], at(0, 0))];
+        let top = square(100, 0);
+        let centred = square(100, 50);
+
+        assert_eq!(
+            resolve(&top, at(0, 28), &fixed, &rules, None)
+                .unwrap()
+                .delta,
+            at(0, 0)
+        );
+        assert_eq!(
+            resolve(&top, at(0, 32), &fixed, &rules, None)
+                .unwrap()
+                .delta,
+            at(0, 50)
+        );
+        assert_eq!(
+            resolve(&centred, at(0, -22), &fixed, &rules, None)
+                .unwrap()
+                .delta,
+            at(0, 0)
+        );
+        assert_eq!(
+            resolve(&centred, at(0, -32), &fixed, &rules, None)
+                .unwrap()
+                .delta,
+            at(0, -50)
+        );
+    }
+
+    #[test]
+    fn a_step_never_moves_the_dragged_card_against_the_pointer() {
+        let rules = Rules {
+            min_seam: MIN_SEAM,
+            align_tolerance: 60,
+        };
+        let bodies = [
+            Body::new(&[display(0, 0, 1920, 1080)], at(0, -64)),
+            Body::new(&[display(0, 0, 3440, 1440)], at(1920, 856)),
+            Body::new(&[display(0, 0, 1080, 1920)], at(5360, 67)),
+        ];
+        let vacated = Bounds {
+            left: 1920,
+            top: 10,
+            right: 5360,
+            bottom: 1450,
+        };
+        let mut placed = bodies.to_vec();
+        let mut side = Some(EdgeSide::Left);
+        let mut goal = at(1759, 361);
+        for _ in 0..12 {
+            let step = drag_step(&placed, 1, goal, vacated, side, &rules).unwrap();
+            let net = step.deltas[1];
+            let along = i64::from(net.x) * i64::from(goal.x) + i64::from(net.y) * i64::from(goal.y);
+            assert!(along >= 0, "{net:?} against {goal:?}");
+            placed = applied(&placed, &step.deltas);
+            assert!(legal(&placed, &rules));
+            side = Some(step.side);
+            goal = at(goal.x + 160 - net.x, goal.y + 110 - net.y);
+        }
+    }
+
+    #[test]
     fn multi_display_bodies_keep_every_display_clear() {
         let moving = square(0, 0);
         let fixed = [Body::new(
@@ -860,17 +1093,20 @@ mod tests {
         drag_step(bodies, dragged, desired, vacated, current, &RULES).expect("attachable")
     }
 
-    fn connected(bodies: &[Body], step: &Step) -> bool {
-        let placed: Vec<Body> = bodies
+    fn applied(bodies: &[Body], deltas: &[Vec2I]) -> Vec<Body> {
+        bodies
             .iter()
-            .zip(&step.deltas)
+            .zip(deltas)
             .map(|(body, delta)| body.shifted(*delta))
-            .collect();
-        components(&placed, &RULES).len() == 1
-            && placed
+            .collect()
+    }
+
+    fn legal(bodies: &[Body], rules: &Rules) -> bool {
+        components(bodies, rules).len() == 1
+            && bodies
                 .iter()
                 .enumerate()
-                .all(|(i, a)| placed.iter().skip(i + 1).all(|b| !a.overlaps(b)))
+                .all(|(i, a)| bodies.iter().skip(i + 1).all(|b| !a.overlaps(b)))
     }
 
     #[test]
@@ -881,7 +1117,31 @@ mod tests {
 
         assert_eq!(step.deltas, vec![at(0, 0), at(-20, -100), at(-100, 0)]);
         assert_eq!(step.side, EdgeSide::Bottom);
-        assert!(connected(&bodies, &step));
+        assert!(legal(&applied(&bodies, &step.deltas), &RULES));
+    }
+
+    #[test]
+    fn sliding_the_middle_card_moves_nothing_else() {
+        let bodies = [square(0, 0), square(100, 0), square(200, 0)];
+
+        let step = step(&bodies, 1, at(0, -30), Some(EdgeSide::Left));
+
+        assert_eq!(step.deltas, vec![at(0, 0), at(0, -30), at(0, 0)]);
+
+        let real = Rules {
+            min_seam: MIN_SEAM,
+            align_tolerance: 60,
+        };
+        let row = [
+            Body::new(&[display(0, 0, 1512, 982)], at(0, 0)),
+            Body::new(&[display(0, 0, 1920, 1080)], at(1512, 0)),
+            Body::new(&[display(0, 0, 2560, 1440)], at(3432, 0)),
+        ];
+        let vacated = row[1].bounds().unwrap();
+        for dy in [-200, -400, -700] {
+            let step = drag_step(&row, 1, at(0, dy), vacated, Some(EdgeSide::Left), &real).unwrap();
+            assert_eq!(step.deltas, vec![at(0, 0), at(0, dy), at(0, 0)], "dy {dy}");
+        }
     }
 
     #[test]
@@ -891,7 +1151,35 @@ mod tests {
         let step = step(&bodies, 1, at(160, 0), Some(EdgeSide::Left));
 
         assert_eq!(step.deltas, vec![at(0, 0), at(100, 0), at(-100, 0)]);
-        assert!(connected(&bodies, &step));
+        assert!(legal(&applied(&bodies, &step.deltas), &RULES));
+    }
+
+    #[test]
+    fn a_straight_push_goes_through_a_larger_neighbour_not_over_it() {
+        let rules = Rules {
+            min_seam: MIN_SEAM,
+            align_tolerance: 60,
+        };
+        let big = Body::new(&[display(0, 0, 2560, 1440)], at(0, 0));
+        let small = Body::new(&[display(0, 0, 1920, 1080)], at(2560, 0));
+        let mut sides = Vec::new();
+        for dx in (1..=40).map(|i| -80 * i) {
+            let placement = resolve(
+                &small,
+                at(dx, 0),
+                std::slice::from_ref(&big),
+                &rules,
+                Some(EdgeSide::Left),
+            )
+            .unwrap();
+            sides.push(placement.side);
+            assert_eq!(
+                placement.delta.y, 0,
+                "dx {dx} detoured to {:?}",
+                placement.delta
+            );
+        }
+        assert_eq!(sides.last(), Some(&EdgeSide::Right));
     }
 
     #[test]
@@ -900,11 +1188,11 @@ mod tests {
 
         let up = step(&bodies, 1, at(0, -30), Some(EdgeSide::Left));
         assert_eq!(up.deltas, vec![at(0, 0), at(0, -30), at(0, -30)]);
-        assert!(connected(&bodies, &up));
+        assert!(legal(&applied(&bodies, &up.deltas), &RULES));
 
         let down = step(&bodies, 1, at(0, 30), Some(EdgeSide::Left));
         assert_eq!(down.deltas, vec![at(0, 0), at(0, 30), at(0, 30)]);
-        assert!(connected(&bodies, &down));
+        assert!(legal(&applied(&bodies, &down.deltas), &RULES));
     }
 
     #[test]
@@ -913,22 +1201,121 @@ mod tests {
 
         let step = step(&bodies, 1, at(-5, -110), Some(EdgeSide::Left));
 
-        assert_eq!(step.deltas, vec![at(0, 0), at(-20, -100), at(0, -20)]);
-        assert!(connected(&bodies, &step));
+        assert_eq!(step.deltas[1], at(-20, -100));
+        assert!(
+            step.deltas[2] == at(0, -20) || step.deltas[2] == at(-20, 0),
+            "{:?}",
+            step.deltas
+        );
+        assert!(legal(&applied(&bodies, &step.deltas), &RULES));
     }
 
     #[test]
-    fn the_dragged_card_is_re_rested_when_its_partner_closes_a_gap() {
+    fn a_step_is_a_fixed_point() {
         let bodies = [
             Body::new(&[display(0, 0, 100, 300)], at(0, 0)),
             square(100, 0),
             square(200, 0),
+            square(200, 100),
         ];
 
-        let step = step(&bodies, 1, at(160, 0), Some(EdgeSide::Left));
+        let first = step(&bodies, 1, at(160, 0), Some(EdgeSide::Left));
+        let moved = applied(&bodies, &first.deltas);
+        assert!(legal(&moved, &RULES));
+        let again = drag_step(
+            &moved,
+            1,
+            at(0, 0),
+            bodies[1].bounds().unwrap(),
+            Some(first.side),
+            &RULES,
+        )
+        .unwrap();
+        assert!(
+            again.deltas.iter().all(|delta| *delta == at(0, 0)),
+            "{:?}",
+            again.deltas
+        );
+    }
 
-        assert_eq!(step.deltas, vec![at(0, 0), at(100, 0), at(-100, 0)]);
-        assert!(connected(&bodies, &step));
+    #[test]
+    fn the_frame_never_moves_when_a_card_is_pushed_through_riders() {
+        let rules = Rules {
+            min_seam: MIN_SEAM,
+            align_tolerance: 60,
+        };
+        let bodies = [
+            Body::new(&[display(0, 0, 3840, 2160)], at(0, 0)),
+            Body::new(&[display(0, 0, 1512, 982)], at(3840, 98)),
+            Body::new(
+                &[display(0, 0, 1920, 1080), display(1920, 0, 1920, 1080)],
+                at(5352, 0),
+            ),
+            Body::new(&[display(0, 0, 1512, 982)], at(9192, 0)),
+        ];
+        let vacated = bodies[1].bounds().unwrap();
+
+        let step = drag_step(
+            &bodies,
+            1,
+            at(1160, 34),
+            vacated,
+            Some(EdgeSide::Right),
+            &rules,
+        )
+        .unwrap();
+
+        assert_eq!(step.deltas[0], at(0, 0));
+        assert!(
+            legal(&applied(&bodies, &step.deltas), &rules),
+            "{:?}",
+            step.deltas
+        );
+        let moved = applied(&bodies, &step.deltas);
+        let again = drag_step(&moved, 1, at(0, 0), vacated, Some(step.side), &rules).unwrap();
+        assert!(
+            again.deltas.iter().all(|delta| *delta == at(0, 0)),
+            "{:?}",
+            again.deltas
+        );
+    }
+
+    #[test]
+    fn a_push_through_a_row_never_spends_the_residual_on_another_seam() {
+        let rules = Rules {
+            min_seam: MIN_SEAM,
+            align_tolerance: 60,
+        };
+        let row = [
+            Body::new(&[display(0, 0, 1512, 982)], at(0, 0)),
+            Body::new(&[display(0, 0, 1920, 1080)], at(1512, 0)),
+            Body::new(&[display(0, 0, 2560, 1440)], at(3432, 0)),
+        ];
+        let vacated = row[1].bounds().unwrap();
+
+        let step = drag_step(&row, 1, at(-1750, 0), vacated, Some(EdgeSide::Left), &rules).unwrap();
+
+        assert_eq!(step.deltas[1].y, 0, "{:?}", step.deltas);
+        assert!(
+            legal(&applied(&row, &step.deltas), &rules),
+            "{:?}",
+            step.deltas
+        );
+    }
+
+    #[test]
+    fn resting_side_reports_the_seam_a_body_sits_on() {
+        let others = [square(0, 0)];
+        assert_eq!(
+            resting_side(&square(100, 30), &others, &RULES),
+            Some(EdgeSide::Left)
+        );
+        assert_eq!(
+            resting_side(&square(-20, -100), &others, &RULES),
+            Some(EdgeSide::Bottom)
+        );
+        assert_eq!(resting_side(&square(100, 90), &others, &RULES), None);
+        assert_eq!(resting_side(&square(300, 0), &others, &RULES), None);
     }
 
     #[test]
@@ -947,6 +1334,49 @@ mod tests {
             &RULES
         )
         .is_none());
+    }
+
+    #[test]
+    fn normalize_repairs_gaps_overlaps_and_leaves_legal_arrangements_alone() {
+        let row = [square(0, 0), square(100, 0), square(200, 0)];
+        assert!(normalize(&row, &RULES)
+            .iter()
+            .all(|delta| *delta == at(0, 0)));
+
+        let scattered = [
+            square(0, 0),
+            square(400, 300),
+            square(50, 50),
+            Body::default(),
+        ];
+        let deltas = normalize(&scattered, &RULES);
+        assert_eq!(deltas[0], at(0, 0));
+        assert_eq!(deltas[3], at(0, 0));
+        assert!(legal(&applied(&scattered[..3], &deltas[..3]), &RULES));
+
+        let tangled = [square(0, 0), square(100, 0), square(100, 50)];
+        let deltas = normalize(&tangled, &RULES);
+        assert_eq!(deltas[0], at(0, 0));
+        assert!(legal(&applied(&tangled, &deltas), &RULES));
+    }
+
+    #[test]
+    fn a_pushed_rider_still_attached_elsewhere_is_moved_out_of_the_way() {
+        let bodies = [
+            Body::new(&[display(0, 0, 100, 200)], at(0, -100)),
+            square(100, 0),
+            square(100, 100),
+            square(200, 50),
+        ];
+
+        let step = step(&bodies, 1, at(0, 40), Some(EdgeSide::Left));
+
+        assert_eq!(&step.deltas[..3], &[at(0, 0), at(0, 40), at(0, 40)]);
+        assert!(
+            legal(&applied(&bodies, &step.deltas), &RULES),
+            "{:?}",
+            step.deltas
+        );
     }
 
     #[test]
@@ -989,99 +1419,5 @@ mod tests {
             ]
         );
         assert_eq!(seams(&bodies, 80).len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod throwaway {
-    use super::*;
-
-    const RULES: Rules = Rules { min_seam: 20, align_tolerance: 0 };
-
-    fn display(x: i32, y: i32, w: u32, h: u32) -> DisplayRect {
-        DisplayRect { id: format!("{x},{y}"), x, y, w, h, scale: 1.0 }
-    }
-    fn square(x: i32, y: i32) -> Body {
-        Body::new(&[display(0, 0, 100, 100)], Vec2I { x, y })
-    }
-    fn at(x: i32, y: i32) -> Vec2I { Vec2I { x, y } }
-
-    #[test]
-    fn tw_small_center_drag() {
-        let bodies = [square(0, 0), square(100, 0), square(200, 0)];
-        let vacated = bodies[1].bounds().unwrap();
-        for dy in [-5, -10, -20, -30, -50, -70, -79] {
-            let s = drag_step(&bodies, 1, at(0, dy), vacated, Some(EdgeSide::Left), &RULES).unwrap();
-            println!("dy={dy} deltas={:?} side={:?}", s.deltas, s.side);
-        }
-    }
-
-    #[test]
-    fn tw_real_dims() {
-        let a = Body::new(&[display(0, 0, 1512, 982)], at(0, 0));
-        let b = Body::new(&[display(0, 0, 1920, 1080)], at(1512, 0));
-        let c = Body::new(&[display(0, 0, 2560, 1440)], at(3432, 0));
-        let rules = Rules { min_seam: MIN_SEAM, align_tolerance: 60 };
-        let bodies = [a, b, c];
-        let vacated = bodies[1].bounds().unwrap();
-        for dy in [-10, -50, -100, -200, -400] {
-            let s = drag_step(&bodies, 1, at(0, dy), vacated, Some(EdgeSide::Left), &rules).unwrap();
-            println!("dy={dy} deltas={:?} side={:?}", s.deltas, s.side);
-        }
-    }
-}
-
-#[cfg(test)]
-mod throwaway_overflow {
-    use super::*;
-    use splice_proto::{DisplayRect, Vec2I};
-
-    fn d(x: i32, y: i32, w: u32, h: u32) -> DisplayRect {
-        DisplayRect { id: "t".into(), x, y, w, h, scale: 1.0 }
-    }
-
-    #[test]
-    fn huge_display_area() {
-        let big = Body::new(&[d(0, 0, u32::MAX, u32::MAX)], Vec2I { x: 0, y: 0 });
-        let small = Body::new(&[d(0, 0, 100, 100)], Vec2I { x: -100, y: 0 });
-        let bodies = vec![small, big];
-        let vacated = bodies[0].bounds().unwrap();
-        let step = drag_step(&bodies, 0, Vec2I { x: 5, y: 5 }, vacated, None, &Rules::default());
-        println!("step = {step:?}");
-    }
-
-    #[test]
-    fn realistic_big_wall() {
-        let mut rects = Vec::new();
-        for i in 0..16 {
-            rects.push(d(i * 7680, 0, 7680, 4320));
-        }
-        let big = Body::new(&rects, Vec2I { x: 0, y: 0 });
-        println!("area = {}", big.area());
-    }
-
-    #[test]
-    fn tmp_probe_small_center_drag() {
-        let bodies = [square(0, 0), square(100, 0), square(200, 0)];
-        let s = step(&bodies, 1, at(0, -30), Some(EdgeSide::Left));
-        println!("SCENARIO1 deltas={:?} side={:?}", s.deltas, s.side);
-        println!("SCENARIO1 connected={}", connected(&bodies, &s));
-
-        for dy in [-5, -10, -20, -30, -50, -79, -80, -100] {
-            let s = step(&bodies, 1, at(0, dy), Some(EdgeSide::Left));
-            println!("dy={dy} deltas={:?} side={:?}", s.deltas, s.side);
-        }
-
-        let rules = Rules { min_seam: 160, align_tolerance: 60 };
-        let big = [
-            Body::new(&[display(0, 0, 1512, 982)], at(0, 0)),
-            Body::new(&[display(0, 0, 1920, 1080)], at(1512, 0)),
-            Body::new(&[display(0, 0, 2560, 1440)], at(3432, 0)),
-        ];
-        for dy in [-10, -50, -100, -200, -400] {
-            let vac = big[1].bounds().unwrap();
-            let s = drag_step(&big, 1, at(0, dy), vac, Some(EdgeSide::Left), &rules).unwrap();
-            println!("BIG dy={dy} deltas={:?} side={:?}", s.deltas, s.side);
-        }
     }
 }

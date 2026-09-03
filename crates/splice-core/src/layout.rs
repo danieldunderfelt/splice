@@ -68,16 +68,6 @@ impl RectBounds {
         })
     }
 
-    fn translated(self, offset: Vec2I) -> Self {
-        let x = i64::from(offset.x);
-        let y = i64::from(offset.y);
-        Self {
-            left: self.left + x,
-            right: self.right + x,
-            top: self.top + y,
-            bottom: self.bottom + y,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -367,142 +357,6 @@ pub fn to_local(placement: &MachinePlacement, p: Vec2) -> Vec2 {
         x: p.x - placement.offset.x as f64,
         y: p.y - placement.offset.y as f64,
     }
-}
-
-/// Snap a proposed placement offset so near-touching edges (within `tolerance`) become
-/// exactly touching. Used by the UI on drag release AND by the engine when adopting a
-/// LayoutSync (defensive re-snap).
-pub fn snap_offset(
-    moving: &[DisplayRect],
-    proposed: Vec2I,
-    others: &[(&[DisplayRect], Vec2I)],
-    tolerance: i32,
-) -> Vec2I {
-    let Some(moving) = union_bounds(moving).map(|bounds| bounds.translated(proposed)) else {
-        return proposed;
-    };
-    let tolerance = i64::from(tolerance);
-    if tolerance < 0 {
-        return proposed;
-    }
-
-    let mut x_correction = None;
-    let mut y_correction = None;
-
-    for &(other_displays, other_offset) in others {
-        let Some(other) =
-            union_bounds(other_displays).map(|bounds| bounds.translated(other_offset))
-        else {
-            continue;
-        };
-
-        if range_gap(moving.top, moving.bottom, other.top, other.bottom) <= tolerance {
-            let mut snapped_x = false;
-            for correction in [other.left - moving.right, other.right - moving.left] {
-                if correction.abs() <= tolerance {
-                    keep_smallest_correction(&mut x_correction, correction);
-                    snapped_x = true;
-                }
-            }
-            if snapped_x {
-                if let Some(correction) = perpendicular_correction(
-                    moving.top,
-                    moving.bottom,
-                    other.top,
-                    other.bottom,
-                    tolerance,
-                ) {
-                    keep_smallest_correction(&mut y_correction, correction);
-                }
-            }
-        }
-
-        if range_gap(moving.left, moving.right, other.left, other.right) <= tolerance {
-            let mut snapped_y = false;
-            for correction in [other.top - moving.bottom, other.bottom - moving.top] {
-                if correction.abs() <= tolerance {
-                    keep_smallest_correction(&mut y_correction, correction);
-                    snapped_y = true;
-                }
-            }
-            if snapped_y {
-                if let Some(correction) = perpendicular_correction(
-                    moving.left,
-                    moving.right,
-                    other.left,
-                    other.right,
-                    tolerance,
-                ) {
-                    keep_smallest_correction(&mut x_correction, correction);
-                }
-            }
-        }
-    }
-
-    Vec2I {
-        x: apply_correction(proposed.x, x_correction),
-        y: apply_correction(proposed.y, y_correction),
-    }
-}
-
-fn union_bounds(displays: &[DisplayRect]) -> Option<RectBounds> {
-    displays
-        .iter()
-        .filter_map(RectBounds::from_display)
-        .reduce(|union, rect| RectBounds {
-            left: union.left.min(rect.left),
-            right: union.right.max(rect.right),
-            top: union.top.min(rect.top),
-            bottom: union.bottom.max(rect.bottom),
-        })
-}
-
-fn range_gap(first_start: i64, first_end: i64, second_start: i64, second_end: i64) -> i64 {
-    if first_end < second_start {
-        second_start - first_end
-    } else if second_end < first_start {
-        first_start - second_end
-    } else {
-        0
-    }
-}
-
-fn perpendicular_correction(
-    moving_start: i64,
-    moving_end: i64,
-    other_start: i64,
-    other_end: i64,
-    tolerance: i64,
-) -> Option<i64> {
-    let candidates = if moving_end <= other_start {
-        [Some(other_start - moving_end), None]
-    } else if other_end <= moving_start {
-        [Some(other_end - moving_start), None]
-    } else {
-        [
-            Some(other_start - moving_start),
-            Some(other_end - moving_end),
-        ]
-    };
-    let mut best = None;
-    for correction in candidates.into_iter().flatten() {
-        if correction.abs() <= tolerance {
-            keep_smallest_correction(&mut best, correction);
-        }
-    }
-    best
-}
-
-fn keep_smallest_correction(best: &mut Option<i64>, candidate: i64) {
-    if best.is_none_or(|current| candidate.abs() < current.abs()) {
-        *best = Some(candidate);
-    }
-}
-
-fn apply_correction(value: i32, correction: Option<i64>) -> i32 {
-    correction
-        .and_then(|correction| i32::try_from(i64::from(value) + correction).ok())
-        .unwrap_or(value)
 }
 
 #[cfg(test)]
@@ -796,30 +650,6 @@ mod tests {
         assert_eq!(
             clamp_into_displays(&[], Vec2 { x: 3.0, y: 4.0 }),
             Vec2 { x: 3.0, y: 4.0 }
-        );
-    }
-
-    #[test]
-    fn snap_offset_applies_magnetism_only_within_tolerance() {
-        let moving = vec![display("moving", 0, 0, 100, 100)];
-        let other = vec![display("other", 0, 0, 100, 100)];
-        let others = [(other.as_slice(), Vec2I { x: 0, y: 0 })];
-
-        assert_eq!(
-            snap_offset(&moving, Vec2I { x: 104, y: 3 }, &others, 4),
-            Vec2I { x: 100, y: 0 }
-        );
-        assert_eq!(
-            snap_offset(&moving, Vec2I { x: 105, y: 3 }, &others, 4),
-            Vec2I { x: 105, y: 3 }
-        );
-        assert_eq!(
-            snap_offset(&moving, Vec2I { x: 104, y: 500 }, &others, 4),
-            Vec2I { x: 104, y: 500 }
-        );
-        assert_eq!(
-            snap_offset(&moving, Vec2I { x: 104, y: 104 }, &others, 4),
-            Vec2I { x: 100, y: 100 }
         );
     }
 

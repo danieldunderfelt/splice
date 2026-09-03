@@ -160,9 +160,11 @@ async fn spawn_trio() -> (Rig, Rig, Rig) {
             && connected_to(&c, "aaa")
     })
     .await;
-    a.handle.send(Command::SetPlacement(mid("aaa"), Vec2I { x: 0, y: 0 }));
-    a.handle.send(Command::SetPlacement(mid("bbb"), Vec2I { x: 1920, y: 0 }));
-    a.handle.send(Command::SetPlacement(mid("ccc"), Vec2I { x: 3840, y: 0 }));
+    a.handle.send(Command::SetArrangement(vec![
+        (mid("aaa"), Vec2I { x: 0, y: 0 }),
+        (mid("bbb"), Vec2I { x: 1920, y: 0 }),
+        (mid("ccc"), Vec2I { x: 3840, y: 0 }),
+    ]));
     wait_until("trio layout converges", || {
         let state = a.handle.state();
         let state = state.borrow();
@@ -702,7 +704,7 @@ async fn target_barrier_activation_after_leave_does_not_steal_sourceness() {
 }
 
 #[tokio::test]
-async fn losing_the_return_link_ends_the_remote_session() {
+async fn a_display_geometry_change_keeps_the_arrangement_connected() {
     let (a, b) = spawn_pair().await;
     drive_a_to_b(&a, &b).await;
 
@@ -719,21 +721,20 @@ async fn losing_the_return_link_ends_the_remote_session() {
             }],
         })
         .unwrap();
-    wait_until("A returns home once B no longer touches it", || {
-        !a.mock.state.lock().capturing && matches!(focus_of(&a), UiFocus::Local)
+    wait_until("A sees B's new displays rested against it", || {
+        let state = a.handle.state();
+        let state = state.borrow();
+        state
+            .machines
+            .iter()
+            .find(|m| m.id == mid("bbb"))
+            .is_some_and(|m| m.displays.first().is_some_and(|d| d.y == 5000))
+            && state.edges.iter().any(|e| e.crossable)
     })
     .await;
-    let warp = a
-        .mock
-        .state
-        .lock()
-        .capture_ends
-        .last()
-        .copied()
-        .flatten()
-        .expect("return warp");
-    assert!((0.0..1920.0).contains(&warp.x) && (0.0..1080.0).contains(&warp.y));
-    wait_until("B left the driven session", || b.mock.state.lock().left >= 1).await;
+    assert!(matches!(focus_of(&a), UiFocus::Remote(id) if id == mid("bbb")));
+    assert!(a.mock.state.lock().capturing);
+    assert_eq!(b.mock.state.lock().left, 0);
 }
 
 #[tokio::test]

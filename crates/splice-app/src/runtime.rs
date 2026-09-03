@@ -405,24 +405,6 @@ pub mod preview {
                 }
                 recompute_edges(state);
             }
-            Command::SetPlacement(id, offset) => {
-                let others: Vec<(Vec<DisplayRect>, Vec2I)> = state
-                    .machines
-                    .iter()
-                    .filter(|m| &m.id != id)
-                    .map(|m| (m.displays.clone(), m.offset))
-                    .collect();
-                let others: Vec<(&[DisplayRect], Vec2I)> = others
-                    .iter()
-                    .map(|(displays, offset)| (displays.as_slice(), *offset))
-                    .collect();
-                if let Some(machine) = state.machines.iter_mut().find(|m| &m.id == id) {
-                    // Defensive re-snap, same as the engine does on LayoutSync.
-                    machine.offset =
-                        layout::snap_offset(&machine.displays, *offset, &others, 2);
-                }
-                recompute_edges(state);
-            }
             Command::SetArrangement(placements) => {
                 for (id, offset) in placements {
                     if let Some(machine) = state.machines.iter_mut().find(|m| &m.id == id) {

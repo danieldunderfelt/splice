@@ -28,12 +28,16 @@ const HEADER_H: f32 = 50.0;
 /// Below these on-screen sizes a card renders hostname-only, without chrome.
 const COMPACT_W: f32 = 150.0;
 const COMPACT_H: f32 = 72.0;
+/// Time constant for the view to follow a changing arrangement, seconds.
+const VIEW_TAU: f32 = 0.12;
 
 pub struct SpliceApp {
     ctrl: Controller,
     tray: Tray,
     tray_actions: mpsc::Receiver<TrayAction>,
     drag: Option<CardDrag>,
+    /// The canvas→screen fit as currently shown; eases toward the fit of what is painted.
+    view: Option<CanvasFit>,
     allow_close: bool,
     exit_at: Option<Instant>,
     /// SPLICE_UI_SCREENSHOT=<path>: capture one frame to PNG (preview smoke runs).
@@ -53,6 +57,7 @@ impl SpliceApp {
             tray,
             tray_actions,
             drag: None,
+            view: None,
             allow_close: false,
             exit_at: exit_after.map(|secs| Instant::now() + Duration::from_secs_f64(secs)),
             screenshot_to: std::env::var_os("SPLICE_UI_SCREENSHOT").map(Into::into),
@@ -242,9 +247,20 @@ impl SpliceApp {
         let dark = ui.visuals().dark_mode;
         let (bg_response, painter) = ui.allocate_painter(ui.available_size(), Sense::hover());
         let area = bg_response.rect;
+        let dt = ui.input(|i| i.stable_dt);
 
-        let bounds = content_bounds(state);
-        let Some((min, max)) = bounds else {
+        if let Some(drag) = &mut self.drag {
+            drag.tick(dt);
+            if !drag.rebase(state) || drag.done(state) {
+                self.drag = None;
+            }
+        }
+        if self.drag.is_some() {
+            ui.ctx().request_repaint();
+        }
+
+        let offsets = self.offsets(state);
+        let Some(bounds) = painted_bounds(state, &offsets) else {
             painter.text(
                 area.center(),
                 Align2::CENTER_CENTER,
@@ -254,19 +270,23 @@ impl SpliceApp {
             );
             return;
         };
-
-        let fit = CanvasFit::new((min, max), area);
+        let target = CanvasFit::new(bounds, area);
+        let fit = self.follow_view(target, dt);
+        if fit != target {
+            ui.ctx().request_repaint();
+        }
         let scale = fit.scale;
         let to_screen = |cx: f32, cy: f32| fit.to_screen(cx, cy);
 
-        let dt = ui.input(|i| i.stable_dt);
-        let settled = self.drag.as_mut().is_none_or(|drag| !drag.tick(dt));
-        if !settled {
-            ui.ctx().request_repaint();
-        }
-
         // Pass 1: drag interactions (bookkeeping needs the previous frame's rects).
-        let offsets = self.offsets(state);
+        let live = self.ctrl.is_live();
+        let draggable = |machine: &UiMachine| {
+            live && !machine.displays.is_empty()
+                && state
+                    .machines
+                    .iter()
+                    .any(|other| other.id != machine.id && !other.displays.is_empty())
+        };
         for (machine, offset) in state.machines.iter().zip(&offsets) {
             let card = card_rect(machine, *offset, &to_screen, scale);
             let response = ui.interact(
@@ -274,22 +294,37 @@ impl SpliceApp {
                 ui.id().with(("card", &machine.id.0)),
                 Sense::drag(),
             );
-            let grabbed = self.drag.as_ref().is_some_and(|drag| drag.id() == &machine.id);
-            if grabbed {
+            let held = self
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.id() == &machine.id && !drag.released());
+            if held {
                 ui.output_mut(|o| o.cursor_icon = CursorIcon::Grabbing);
-            } else if response.hovered() && self.drag.is_none() && !machine.displays.is_empty() {
+            } else if response.hovered() && self.drag.is_none() && draggable(machine) {
                 ui.output_mut(|o| o.cursor_icon = CursorIcon::Grab);
             }
-            if response.drag_started() {
-                self.drag = CardDrag::begin(state, &machine.id, scale);
+            if response.drag_started() && draggable(machine) {
+                match self.drag.as_mut() {
+                    Some(drag) if drag.released() => {
+                        drag.regrab(&machine.id);
+                    }
+                    Some(_) => {}
+                    None => self.drag = CardDrag::begin(state, &machine.id, scale),
+                }
             }
-            if response.dragged() {
-                if let Some(drag) = self.drag.as_mut().filter(|drag| drag.id() == &machine.id) {
+            let held = held
+                || self
+                    .drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.id() == &machine.id && !drag.released());
+            if response.dragged() && held {
+                if let Some(drag) = self.drag.as_mut() {
                     drag.drag_by(response.drag_delta(), scale);
                 }
             }
-            if response.drag_stopped() {
-                if let Some(drag) = self.drag.take_if(|drag| drag.id() == &machine.id) {
+            if response.drag_stopped() && held {
+                if let Some(drag) = self.drag.as_mut() {
+                    drag.release();
                     let changes = drag.changes();
                     if !changes.is_empty() {
                         self.ctrl.send(Command::SetArrangement(changes));
@@ -297,11 +332,14 @@ impl SpliceApp {
                 }
             }
         }
+        let settled = self.drag.as_ref().is_none_or(|drag| !drag.easing());
 
         // Pass 2: paint cards, then edge strips on top of the shared borders.
         let offsets = self.offsets(state);
         let grabbed = |machine: &UiMachine| {
-            self.drag.as_ref().is_some_and(|drag| drag.id() == &machine.id)
+            self.drag
+                .as_ref()
+                .is_some_and(|drag| drag.id() == &machine.id && !drag.released())
         };
         let paint_order = state
             .machines
@@ -413,6 +451,32 @@ impl SpliceApp {
     }
 }
 
+impl SpliceApp {
+    /// Ease the shown view toward `target` so the canvas follows a card dragged
+    /// beyond the committed bounds, or a fresh arrangement, without jumping.
+    fn follow_view(&mut self, target: CanvasFit, dt: f32) -> CanvasFit {
+        let view = match self.view {
+            None => target,
+            Some(view) => {
+                let blend = 1.0 - (-dt / VIEW_TAU).exp();
+                let eased = CanvasFit {
+                    scale: view.scale + (target.scale - view.scale) * blend,
+                    origin: view.origin + (target.origin - view.origin) * blend,
+                };
+                if (eased.scale - target.scale).abs() < 1e-5
+                    && (eased.origin - target.origin).length() < 0.05
+                {
+                    target
+                } else {
+                    eased
+                }
+            }
+        };
+        self.view = Some(view);
+        view
+    }
+}
+
 fn canvas_offset(machine: &UiMachine) -> Vec2 {
     vec2(machine.offset.x as f32, machine.offset.y as f32)
 }
@@ -487,6 +551,7 @@ impl eframe::App for SpliceApp {
 /// Uniform canvas→screen fit: the largest clamped scale that fits the content
 /// bounds into `area` minus `CANVAS_MARGIN`, centred in both axes. Pure math so
 /// unit tests can exercise it without an egui context.
+#[derive(Clone, Copy, PartialEq)]
 struct CanvasFit {
     scale: f32,
     origin: Pos2,
@@ -505,24 +570,25 @@ impl CanvasFit {
         CanvasFit { scale, origin }
     }
 
-    fn to_screen(&self, cx: f32, cy: f32) -> Pos2 {
+    fn to_screen(self, cx: f32, cy: f32) -> Pos2 {
         self.origin + vec2(cx * self.scale, cy * self.scale)
     }
 }
 
-/// Union of all machines' display rects in canvas coordinates.
-fn content_bounds(state: &UiState) -> Option<(Pos2, Pos2)> {
+/// Union of all machines' display rects in canvas coordinates, at the offsets the
+/// cards are painted with.
+fn painted_bounds(state: &UiState, offsets: &[Vec2]) -> Option<(Pos2, Pos2)> {
     let mut min = pos2(f32::MAX, f32::MAX);
     let mut max = pos2(f32::MIN, f32::MIN);
     let mut any = false;
-    for machine in &state.machines {
+    for (machine, offset) in state.machines.iter().zip(offsets) {
         for display in &machine.displays {
             if display.w == 0 || display.h == 0 {
                 continue;
             }
             any = true;
-            let x0 = (machine.offset.x + display.x) as f32;
-            let y0 = (machine.offset.y + display.y) as f32;
+            let x0 = offset.x + display.x as f32;
+            let y0 = offset.y + display.y as f32;
             let x1 = x0 + display.w as f32;
             let y1 = y0 + display.h as f32;
             min = pos2(min.x.min(x0), min.y.min(y0));
@@ -985,7 +1051,8 @@ mod tests {
     fn preview_cards_do_not_overlap() {
         let state = crate::runtime::preview::initial_state();
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
-        let bounds = content_bounds(&state).expect("preview state has machines");
+        let offsets: Vec<Vec2> = state.machines.iter().map(canvas_offset).collect();
+        let bounds = painted_bounds(&state, &offsets).expect("preview state has machines");
         let fit = CanvasFit::new(bounds, area);
         let to_screen = |cx: f32, cy: f32| fit.to_screen(cx, cy);
 

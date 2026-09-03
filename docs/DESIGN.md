@@ -143,6 +143,10 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
   integer offset (`MachineLayout { offset, enabled }`). The UI drags whole machine cards.
 - `LayoutDoc` is replicated state, last-writer-wins by `(lamport, writer MachineId)`. Any machine
   may edit; every edit bumps the lamport and broadcasts `LayoutSync`. On receive: adopt iff newer.
+- The arrangement invariant (one connected, overlap-free cluster; seams of at least
+  `arrange::MIN_SEAM`) is enforced by the UI while dragging and repaired by the engine with
+  `arrange::normalize` (smallest moves, largest cluster stays) whenever it could break: on
+  start-up, on adopting a peer's doc, on a commit, and when any machine's displays change.
 - Crossable edges are computed, not stored: for each pair of machines (both enabled), for each
   pair of display rects, find shared boundary segments where rect A's edge touches rect B's edge
   in canvas coords (within snap tolerance 2 px after UI snapping). Only *outer* edges of a
@@ -252,12 +256,16 @@ a default egui demo: custom `egui::Style` (rounded corners, subtle shadows, acce
   rests against a neighbour along a seam of at least `MIN_SEAM` (160 canvas px, so displays
   never meet corner-to-corner), slides along that seam, flips onto the next side once the
   pointer passes the corner, and can push straight through to the far side. Flush edges and
-  centres attract within 6 screen px. Neighbours the card was holding together close ranks
+  centres attract within 6 screen px and stay flush until the pointer leaves that band;
+  staying put wins near-ties, and a step can never move the card against the pointer, so
+  corner geometries do not flicker. Neighbours the card was holding together close ranks
   with the smallest legal move; every snap eases (~50 ms) instead of popping. A drop commits
   the whole arrangement in one `SetArrangement`. Live seams render in accent colour during
   the drag; committed edges as green (crossable) / red (touching but blocked) strips per
-  computed EdgeLinks. This machine highlighted with accent border; offline peers ghosted at
-  40% opacity; disabled peers desaturated with an enable toggle on the card.
+  computed EdgeLinks. The view follows the painted arrangement (eased), so a card dragged
+  around the cluster is never clipped, and the dropped arrangement stays on screen until
+  the engine publishes it. This machine highlighted with accent border; offline peers
+  ghosted at 40% opacity; disabled peers desaturated with an enable toggle on the card.
 - Card content: hostname, OS glyph, connection badge (● direct / ◐ DERP with warning tint /
   ○ offline), RTT ms, "SOURCE" chip when that machine holds sourceness.
 - **Side panel**: per-link sensitivity slider (0.25–4.0 log, default 1.0), clipboard sync

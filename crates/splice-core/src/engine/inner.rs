@@ -27,8 +27,6 @@ const UI_DEBOUNCE: Duration = Duration::from_millis(100);
 const CFG_DEBOUNCE: Duration = Duration::from_secs(1);
 /// A lazy clipboard pull gives up after this much silence from the origin.
 const CLIP_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// Snap tolerance for SetPlacement (DESIGN/UI: 8 px magnetism).
-const SNAP_TOLERANCE: i32 = 8;
 const MAX_PLATFORM_BATCH_EVENTS: usize = 64;
 const DRIVEN_GRACE: Duration = Duration::from_secs(1);
 const TS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,6 +219,9 @@ impl Inner {
     pub async fn run(mut self) {
         self.bootstrap().await;
         self.ensure_doc();
+        if self.settle_layout() {
+            self.bump_layout();
+        }
         self.discover().await;
         self.recompute().await;
         self.publish_ui();
@@ -484,6 +485,9 @@ impl Inner {
                 self.self_info.displays = displays;
                 if let Some(net) = &self.net {
                     net.update_self(self.self_info.clone());
+                }
+                if self.settle_layout() {
+                    self.bump_layout();
                 }
                 self.touch_ui();
             }
@@ -842,6 +846,9 @@ impl Inner {
                 }
                 self.send_master_state(&id);
                 self.auto_place(&id);
+                if self.settle_layout() {
+                    self.bump_layout();
+                }
                 self.touch_ui();
             }
             PeerEvent::Frame(from, frame) => self.on_frame(from, frame).await,
@@ -895,6 +902,9 @@ impl Inner {
                     );
                     self.layout = Some(doc);
                     self.mark_cfg_dirty();
+                    if self.settle_layout() {
+                        self.bump_layout();
+                    }
                     self.touch_ui();
                 }
             }
@@ -913,6 +923,9 @@ impl Inner {
                 );
                 self.peers.entry(id.clone()).or_default().info = Some(info);
                 self.auto_place(&id);
+                if self.settle_layout() {
+                    self.bump_layout();
+                }
                 self.touch_ui();
             }
             Frame::Enter { session, pos } => {
@@ -1101,7 +1114,38 @@ impl Inner {
             id.clone(),
             MachinePlacement { offset, enabled: true },
         );
+        self.settle_layout();
         self.bump_layout();
+    }
+
+    /// Repair the doc into one connected, overlap-free cluster with the smallest moves:
+    /// arrangements saved before the rules existed, display geometry that changed, or a
+    /// commit computed against a stale topology. Only a machine that knows every placed
+    /// machine's displays may do this, and bodies are ordered by id, so every peer that
+    /// repairs the doc computes the same repair. True when anything moved.
+    fn settle_layout(&mut self) -> bool {
+        let Some(doc) = self.layout.as_ref() else {
+            return false;
+        };
+        let ids: Vec<MachineId> = doc.machines.keys().cloned().collect();
+        if ids.iter().any(|id| self.display_slice_of(id).is_empty()) {
+            return false;
+        }
+        let bodies: Vec<Body> = ids
+            .iter()
+            .map(|id| Body::new(&self.displays_of(id), doc.machines[id].offset))
+            .collect();
+        let deltas = arrange::normalize(&bodies, &Rules::default());
+        if deltas.iter().all(|delta| *delta == Vec2I::default()) {
+            return false;
+        }
+        let doc = self.layout.as_mut().expect("doc exists");
+        for (id, delta) in ids.iter().zip(deltas) {
+            let placement = doc.machines.get_mut(id).expect("listed above");
+            placement.offset.x += delta.x;
+            placement.offset.y += delta.y;
+        }
+        true
     }
 
     fn bump_layout(&mut self) {
@@ -1156,30 +1200,6 @@ impl Inner {
                     .enabled = enabled;
                 self.bump_layout();
             }
-            Command::SetPlacement(id, offset) => {
-                self.ensure_doc();
-                let moving = self.displays_of(&id);
-                let others: Vec<(Vec<DisplayRect>, Vec2I)> = self
-                    .layout
-                    .as_ref()
-                    .expect("doc exists")
-                    .machines
-                    .iter()
-                    .filter(|(mid, _)| **mid != id)
-                    .map(|(mid, p)| (self.displays_of(mid), p.offset))
-                    .collect();
-                let others_ref: Vec<(&[DisplayRect], Vec2I)> =
-                    others.iter().map(|(d, o)| (d.as_slice(), *o)).collect();
-                let snapped = layout::snap_offset(&moving, offset, &others_ref, SNAP_TOLERANCE);
-                self.layout
-                    .as_mut()
-                    .expect("doc exists")
-                    .machines
-                    .entry(id)
-                    .or_insert(MachinePlacement { offset: Vec2I { x: 0, y: 0 }, enabled: true })
-                    .offset = snapped;
-                self.bump_layout();
-            }
             Command::SetArrangement(placements) => {
                 self.ensure_doc();
                 let doc = self.layout.as_mut().expect("doc exists");
@@ -1189,6 +1209,7 @@ impl Inner {
                         .or_insert(MachinePlacement { offset: Vec2I { x: 0, y: 0 }, enabled: true })
                         .offset = offset;
                 }
+                self.settle_layout();
                 self.bump_layout();
             }
             Command::SetSensitivity { link_key, factor } => {
