@@ -126,7 +126,8 @@ Hyprland machine can only be driven by other machines, not drive them.
 other machines is indistinguishable from a local device: no portal prompt, no libei state
 machine, and it works at the lock screen so a remote machine can unlock this one. Your global
 mouse settings apply to it: natural scrolling inverts the wheel and left-handed mode swaps the
-buttons, as they would for any mouse. The Remote Desktop portal is the alternative on GNOME and
+buttons, as they would for any mouse. Keyboard remappers such as keyd also pick the virtual
+keyboard up and apply their layers to it, exactly as they would to a plugged-in keyboard. The Remote Desktop portal is the alternative on GNOME and
 KDE. On GNOME the Remote Desktop session is kept for the clipboard even when uinput injects.
 
 ## Approve portal access

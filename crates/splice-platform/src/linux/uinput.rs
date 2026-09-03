@@ -34,6 +34,8 @@ const BTN_TASK: u16 = 0x117;
 /// Keyboard key codes: everything below the BTN_ block plus the KEY_ range above it
 /// (KEY_OK..KEY_MAX), so media/remote keys such as KEY_MICMUTE are accepted.
 const KEY_BTN_BLOCK: std::ops::RangeInclusive<u16> = 0x100..=0x15f;
+/// BTN_TRIGGER_HAPPY: udev would tag the keyboard as a joystick and libinput ignores it.
+const KEY_TRIGGER_HAPPY_BLOCK: std::ops::RangeInclusive<u16> = 0x2c0..=0x2ff;
 const KEY_MAX: u16 = 0x2ff;
 /// libinput's wheel click angle: 15 logical px of smooth scroll per detent.
 const PIXELS_PER_DETENT: f64 = 15.0;
@@ -47,6 +49,19 @@ const PRODUCT_KEYBOARD: u16 = 0x0002;
 struct Devices {
     pointer: VirtualDevice,
     keyboard: VirtualDevice,
+    shared: Arc<Shared>,
+}
+
+impl Devices {
+    fn emit_pointer(&mut self, events: &[InputEvent]) -> Result<()> {
+        self.shared.note_injection();
+        emit(&mut self.pointer, events)
+    }
+
+    fn emit_keyboard(&mut self, events: &[InputEvent]) -> Result<()> {
+        self.shared.note_injection();
+        emit(&mut self.keyboard, events)
+    }
 }
 
 struct Ledger {
@@ -77,7 +92,10 @@ impl Default for Ledger {
 }
 
 fn is_keyboard_code(code: u16) -> bool {
-    code != 0 && code <= KEY_MAX && !KEY_BTN_BLOCK.contains(&code)
+    code != 0
+        && code <= KEY_MAX
+        && !KEY_BTN_BLOCK.contains(&code)
+        && !KEY_TRIGGER_HAPPY_BLOCK.contains(&code)
 }
 
 pub struct UinputEmulate {
@@ -91,9 +109,12 @@ pub async fn create(
     shared: Arc<Shared>,
     conn: Option<zbus::Connection>,
 ) -> Result<(Arc<dyn Emulate>, Stop)> {
-    let devices = tokio::task::spawn_blocking(open_devices)
-        .await
-        .map_err(|e| PlatformError::Other(anyhow::anyhow!("uinput setup task: {e}")))??;
+    let devices = tokio::task::spawn_blocking({
+        let shared = shared.clone();
+        move || open_devices(shared)
+    })
+    .await
+    .map_err(|e| PlatformError::Other(anyhow::anyhow!("uinput setup task: {e}")))??;
     let screensaver = Arc::new(ScreenSaver::new(conn));
     let monitor = tokio::spawn({
         let screensaver = screensaver.clone();
@@ -124,7 +145,7 @@ pub async fn create(
     Ok((emulate, stop))
 }
 
-fn open_devices() -> Result<Devices> {
+fn open_devices(shared: Arc<Shared>) -> Result<Devices> {
     let map_err = |what: &'static str| {
         move |e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -175,7 +196,7 @@ fn open_devices() -> Result<Devices> {
         .build()
         .map_err(map_err("create virtual keyboard"))?;
 
-    let mut devices = Devices { pointer, keyboard };
+    let mut devices = Devices { pointer, keyboard, shared };
     wait_for_udev(&mut devices.pointer)?;
     wait_for_udev(&mut devices.keyboard)?;
     Ok(devices)
@@ -303,7 +324,7 @@ fn move_to(devices: &mut Devices, ledger: &mut Ledger, displays: &[DisplayRect],
         return Ok(());
     }
     ledger.last_abs = Some((x, y));
-    emit(&mut devices.pointer, &abs_frame(x, y))
+    devices.emit_pointer(&abs_frame(x, y))
 }
 
 /// Placement must reach the compositor even when the requested cell equals the last
@@ -313,10 +334,10 @@ fn place(devices: &mut Devices, ledger: &mut Ledger, displays: &[DisplayRect], p
     let Some((x, y)) = abs_coords(displays, ledger.pos) else { return Ok(()) };
     if ledger.last_abs == Some((x, y)) {
         let detour = if x < ABS_MAX { x + 1 } else { x - 1 };
-        emit(&mut devices.pointer, &abs_frame(detour, y))?;
+        devices.emit_pointer(&abs_frame(detour, y))?;
     }
     ledger.last_abs = Some((x, y));
-    emit(&mut devices.pointer, &abs_frame(x, y))
+    devices.emit_pointer(&abs_frame(x, y))
 }
 
 /// Emits whole wheel detents from the hi-res accumulators (REL_WHEEL ±1 and
@@ -346,17 +367,17 @@ fn flush_wheel(devices: &mut Devices, ledger: &mut Ledger) -> Result<()> {
             steps_x * DETENT,
         ));
     }
-    emit(&mut devices.pointer, &events)
+    devices.emit_pointer(&events)
 }
 
 fn release_all_held(devices: &mut Devices, ledger: &mut Ledger) {
     let keys: Vec<InputEvent> = ledger.held_keys.drain().map(|k| key_event(k, false)).collect();
     if !keys.is_empty() {
-        let _ = emit(&mut devices.keyboard, &keys);
+        let _ = devices.emit_keyboard(&keys);
     }
     let buttons: Vec<InputEvent> = ledger.held_buttons.drain().map(|b| key_event(b, false)).collect();
     if !buttons.is_empty() {
-        let _ = emit(&mut devices.pointer, &buttons);
+        let _ = devices.emit_pointer(&buttons);
     }
     ledger.wheel_x = 0.0;
     ledger.wheel_y = 0.0;
@@ -397,7 +418,7 @@ impl Emulate for UinputEmulate {
                 } else {
                     ledger.held_buttons.remove(&code);
                 }
-                emit(&mut devices.pointer, &[key_event(code, pressed)])
+                devices.emit_pointer(&[key_event(code, pressed)])
             }
             WireEvent::Key { code, pressed } => {
                 let Ok(code) = u16::try_from(code) else { return Ok(()) };
@@ -409,7 +430,7 @@ impl Emulate for UinputEmulate {
                 } else {
                     ledger.held_keys.remove(&code);
                 }
-                emit(&mut devices.keyboard, &[key_event(code, pressed)])
+                devices.emit_keyboard(&[key_event(code, pressed)])
             }
             WireEvent::ScrollPixels { dx, dy } => {
                 ledger.wheel_x += dx * f64::from(DETENT) / PIXELS_PER_DETENT;

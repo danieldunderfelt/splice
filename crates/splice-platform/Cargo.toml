@@ -18,6 +18,10 @@ keycode = { workspace = true }
 parking_lot = { workspace = true }
 libc = "0.2"
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { workspace = true }
 reis = { workspace = true }

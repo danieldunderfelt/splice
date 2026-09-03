@@ -53,6 +53,15 @@ keyboard with `KEY_ESC..KEY_UNKNOWN` (1..240) and nothing else.
   reporting ready.
 - Injected events appear on `/dev/input`, so the physical-activity monitor skips devices
   named `Splice Virtual *`; otherwise every injected event would claim sourceness.
+- Keyboard remappers (keyd, kanata, input-remapper) grab every keyboard with EVIOCGRAB,
+  ours included, and re-emit the keystrokes on their own uinput device (`keyd virtual
+  keyboard`). Verified on Fedora with keyd: one injected keystroke reappeared on that
+  device, was counted as physical, and ended the driven session. The monitor therefore
+  ignores key/relative events from any software device (sysfs `/devices/virtual/input`)
+  that arrive within 150 ms of one of our own uinput writes. Physical keyboards on such
+  machines are only visible through the remapper's device anyway (the grab hides them),
+  so a real keystroke that coincides with injected input merely delays the source claim.
+  `cargo run -p splice-platform --example uinput_echo` reproduces the check.
 - The kernel filters an ABS value equal to the previous one (and the SYN with it), so
   placing the pointer at the last written cell would be a no-op: `enter` takes a one-unit
   detour when needed. Only whole detents are emitted for the wheel, from an f64

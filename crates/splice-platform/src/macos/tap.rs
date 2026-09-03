@@ -355,6 +355,13 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         return CallbackResult::Keep;
     }
 
+    if let CGEventType::MouseMoved
+    | CGEventType::LeftMouseDragged
+    | CGEventType::RightMouseDragged
+    | CGEventType::OtherMouseDragged = etype
+    {
+        cursor::reassert(event.location());
+    }
     translate(etype, event, key_edge).emit(st);
     CallbackResult::Drop
 }

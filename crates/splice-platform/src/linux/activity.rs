@@ -30,6 +30,9 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 /// a few times before an EACCES is believed.
 const HOTPLUG_RETRIES: u32 = 3;
 const HOTPLUG_RETRY_DELAY: Duration = Duration::from_millis(200);
+/// Remapper re-emission latency is single-digit milliseconds; the window is generous
+/// because a missed physical event only delays a source claim to the next one.
+const ECHO_WINDOW: Duration = Duration::from_millis(150);
 
 pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
     let _ = tokio::spawn(run(shared, panic, panic_chord));
@@ -37,7 +40,7 @@ pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
 
 #[derive(Debug)]
 enum PhysicalEvent {
-    Activity,
+    Activity(PathBuf),
     Key { device: PathBuf, code: u32, pressed: bool },
     DeviceGone(PathBuf),
     /// The node could not be opened; a later ATTRIB (ACL change) event retries it.
@@ -72,8 +75,14 @@ async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
         tokio::select! {
             event = activity_rx.recv() => {
                 let Some(event) = event else { return };
+                let last_device = match &event {
+                    PhysicalEvent::Activity(device) | PhysicalEvent::Key { device, .. } => {
+                        Some(device.clone())
+                    }
+                    _ => None,
+                };
                 match event {
-                    PhysicalEvent::Activity => {}
+                    PhysicalEvent::Activity(_) => {}
                     PhysicalEvent::Key { device, code, pressed } => {
                         let keys = held.entry(device).or_default();
                         if pressed {
@@ -112,6 +121,7 @@ async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
                 let now = Instant::now();
                 if now.duration_since(last_emit) >= DEBOUNCE {
                     last_emit = now;
+                    tracing::debug!(device = ?last_device, "physical activity");
                     shared.emit(PlatformEvent::PhysicalActivity);
                 }
             }
@@ -158,6 +168,17 @@ fn watch_input_dir() -> io::Result<EventStream<[u8; 1024]>> {
             WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::DELETE | WatchMask::MOVED_FROM | WatchMask::ATTRIB,
         )?;
     inotify.into_event_stream([0; 1024])
+}
+
+/// uinput-created devices live under /sys/devices/virtual/input; everything a remapper
+/// or another injector emits comes from there.
+fn is_software_device(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name() else { return false };
+    let sys = std::path::Path::new("/sys/class/input").join(name);
+    match std::fs::read_link(&sys) {
+        Ok(target) => target.components().any(|c| c.as_os_str() == "virtual"),
+        Err(_) => false,
+    }
 }
 
 fn enumerate() -> Vec<PathBuf> {
@@ -222,6 +243,7 @@ fn spawn_reader(
             return;
         }
         let _ = activity.send(PhysicalEvent::Opened).await;
+        let software = is_software_device(&path);
         let mut stream = match device.into_event_stream() {
             Ok(stream) => stream,
             Err(err) => {
@@ -236,6 +258,12 @@ fn spawn_reader(
         loop {
             match stream.next_event().await {
                 Ok(ev) => {
+                    if software
+                        && matches!(ev.event_type(), EventType::KEY | EventType::RELATIVE)
+                        && shared.since_injection().is_some_and(|since| since < ECHO_WINDOW)
+                    {
+                        continue;
+                    }
                     match ev.event_type() {
                         EventType::KEY => {
                             // value 2 is autorepeat: activity, but not a state transition.
@@ -250,7 +278,7 @@ fn spawn_reader(
                                     code: ev.code() as u32,
                                     pressed: true,
                                 }),
-                                _ => Some(PhysicalEvent::Activity),
+                                _ => Some(PhysicalEvent::Activity(path.clone())),
                             };
                             if let Some(event) = event {
                                 if activity.send(event).await.is_err() {
@@ -259,7 +287,7 @@ fn spawn_reader(
                             }
                         }
                         EventType::RELATIVE => {
-                            match activity.try_send(PhysicalEvent::Activity) {
+                            match activity.try_send(PhysicalEvent::Activity(path.clone())) {
                                 Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                                 Err(mpsc::error::TrySendError::Closed(_)) => return,
                             }

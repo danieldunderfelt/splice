@@ -6,7 +6,10 @@
 //! recovery paths — signal handlers, `atexit`, and a heartbeat watchdog.
 
 use core_graphics::display::CGDisplay;
+use core_graphics::event::CGEvent;
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Once;
 use std::time::{Duration, SystemTime};
@@ -16,8 +19,18 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// Milliseconds since the epoch, bumped by the tap thread on every run-loop tick.
 static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
 static GUARDS: Once = Once::new();
+/// Where the cursor was frozen; while captured every mouse event must still report it.
+static FROZEN_AT: Mutex<Option<CGPoint>> = Mutex::new(None);
 
 const WATCHDOG_STALE: Duration = Duration::from_secs(2);
+/// Movement beyond this many points from the frozen position means the system quietly
+/// re-associated the pointer behind our back.
+const DRIFT_TOLERANCE: f64 = 2.0;
+
+fn current_position() -> Option<CGPoint> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()?;
+    CGEvent::new(source).ok().map(|event| event.location())
+}
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -41,9 +54,35 @@ pub fn begin() {
         return;
     }
     beat();
+    *FROZEN_AT.lock() = current_position();
     super::ffi::set_cursor_in_background(true);
     let _ = CGDisplay::main().hide_cursor();
     let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
+}
+
+/// Called with the location of every mouse event seen while captured. macOS can
+/// re-associate the pointer on its own (display sleep/wake, another process calling
+/// associate(true), space switches); the local cursor then moves in lock-step with the
+/// remote one. Detect it by the reported location drifting from the frozen point and
+/// re-freeze in place.
+pub fn reassert(observed: CGPoint) {
+    if !CAPTURED.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut frozen = FROZEN_AT.lock();
+    let Some(at) = *frozen else {
+        *frozen = Some(observed);
+        return;
+    };
+    if (observed.x - at.x).abs() <= DRIFT_TOLERANCE && (observed.y - at.y).abs() <= DRIFT_TOLERANCE {
+        return;
+    }
+    tracing::warn!(?at, ?observed, "pointer re-associated by the system while captured; re-freezing");
+    let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(false);
+    let _ = CGDisplay::warp_mouse_cursor_position(at);
+    let _ = CGDisplay::main().hide_cursor();
+    let _ = CGDisplay::main().show_cursor();
+    let _ = CGDisplay::main().hide_cursor();
 }
 
 /// Restore the pointer at `warp_to` (CG global points), or wherever it was frozen.
@@ -55,6 +94,7 @@ pub fn end(warp_to: Option<CGPoint>) {
     if !CAPTURED.swap(false, Ordering::SeqCst) {
         return;
     }
+    *FROZEN_AT.lock() = None;
     let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
     if let Some(pt) = warp_to {
         let _ = CGDisplay::warp_mouse_cursor_position(pt);
@@ -68,6 +108,7 @@ pub fn end(warp_to: Option<CGPoint>) {
 /// beyond deciding whether the hide count needs balancing.
 fn force_restore() {
     let was = CAPTURED.swap(false, Ordering::SeqCst);
+    *FROZEN_AT.lock() = None;
     let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
     if was {
         let _ = CGDisplay::main().show_cursor();

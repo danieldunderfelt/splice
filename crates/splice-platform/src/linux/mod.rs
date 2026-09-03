@@ -30,7 +30,9 @@ mod screensaver;
 mod tokens;
 mod uinput;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use splice_proto::DisplayRect;
@@ -50,9 +52,28 @@ pub struct Shared {
     tx: UnboundedSender<PlatformEvent>,
     health: Mutex<HealthReport>,
     displays: RwLock<Vec<DisplayRect>>,
+    epoch: Instant,
+    /// Microseconds since `epoch` of the last uinput write; remappers (keyd, kanata,
+    /// input-remapper) grab our virtual devices and re-emit on their own virtual
+    /// devices, and the activity monitor uses this to recognise those echoes.
+    last_injection: AtomicU64,
 }
 
 impl Shared {
+    pub fn note_injection(&self) {
+        self.last_injection
+            .store(self.epoch.elapsed().as_micros() as u64, Ordering::Release);
+    }
+
+    /// Time since the last uinput write, or None if nothing was ever injected.
+    pub fn since_injection(&self) -> Option<std::time::Duration> {
+        let last = self.last_injection.load(Ordering::Acquire);
+        if last == 0 {
+            return None;
+        }
+        Some(self.epoch.elapsed().saturating_sub(std::time::Duration::from_micros(last)))
+    }
+
     pub fn emit(&self, ev: PlatformEvent) {
         let _ = self.tx.send(ev);
     }
@@ -123,6 +144,8 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         tx,
         health: Mutex::new(HealthReport::default()),
         displays: RwLock::new(Vec::new()),
+        epoch: Instant::now(),
+        last_injection: AtomicU64::new(0),
     });
 
     let displays = displays::spawn(shared.clone())?;
