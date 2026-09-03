@@ -28,7 +28,7 @@ use zbus::zvariant::{OwnedFd, Value};
 
 use super::portal::{self, Options};
 use super::tokens::{TokenKind, TokenStore};
-use super::WaylandShared;
+use super::{PanicRelease, Shared, Stop};
 use crate::{Capture, CaptureEvent, EdgeSide, EdgeSpec, PlatformError, PlatformEvent, Result};
 
 const IFACE: &str = "org.freedesktop.portal.InputCapture";
@@ -46,22 +46,7 @@ const BTN_LEFT: u32 = 0x110;
 enum Command {
     EndCapture { warp_to: Option<Vec2> },
     Panic,
-}
-
-/// A locally-owned emergency release path used by the physical evdev monitor.
-/// It talks directly to the portal pump and does not depend on the engine/network.
-#[derive(Clone)]
-pub struct PanicRelease {
-    cmd: mpsc::UnboundedSender<Command>,
-    active: Arc<AtomicBool>,
-}
-
-impl PanicRelease {
-    pub fn trigger(&self) {
-        if self.active.load(Ordering::Acquire) {
-            let _ = self.cmd.send(Command::Panic);
-        }
-    }
+    Shutdown,
 }
 
 /// The engine's edge map, consulted on every `Activated`; `changed` wakes the session
@@ -102,11 +87,11 @@ impl Capture for WaylandCapture {
 }
 
 pub fn create(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Shared>,
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
-) -> (Arc<WaylandCapture>, PanicRelease) {
+) -> (Arc<WaylandCapture>, PanicRelease, Stop) {
     let map = Arc::new(EdgeMap::default());
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let active = Arc::new(AtomicBool::new(false));
@@ -140,10 +125,21 @@ pub fn create(
             ));
         });
 
-    (
-        Arc::new(WaylandCapture { map, cmd: cmd.clone() }),
-        PanicRelease { cmd, active },
-    )
+    let panic = PanicRelease::new({
+        let cmd = cmd.clone();
+        move || {
+            if active.load(Ordering::Acquire) {
+                let _ = cmd.send(Command::Panic);
+            }
+        }
+    });
+    let stop = Stop::new({
+        let cmd = cmd.clone();
+        move || {
+            let _ = cmd.send(Command::Shutdown);
+        }
+    });
+    (Arc::new(WaylandCapture { map, cmd }), panic, stop)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -303,6 +299,8 @@ struct ActiveCapture {
     activation_id: u32,
 }
 
+type Signals = zbus::proxy::SignalStream<'static>;
+
 struct Session {
     ic: zbus::Proxy<'static>,
     session_path: String,
@@ -312,6 +310,13 @@ struct Session {
     zones: Vec<Zone>,
     zone_set: u32,
     barriers: Vec<Barrier>,
+    /// Subscribed before Enable: D-Bus does not replay signals, and a pointer already
+    /// pressing against a barrier activates the moment the session is enabled.
+    session_proxy: zbus::Proxy<'static>,
+    closed: Signals,
+    activated: Signals,
+    deactivated: Signals,
+    zones_changed: Signals,
 }
 
 async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<Session> {
@@ -395,6 +400,19 @@ async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<Sessi
     let zone_set = portal::get::<u32>(&zones_result, "zone_set").unwrap_or(0);
     tracing::info!(zone_set, zones = ?zones, "input capture zones discovered");
 
+    let session_proxy = portal::session_proxy(conn, &session_path).await?;
+    let closed = session_proxy
+        .receive_signal("Closed")
+        .await
+        .map_err(portal::err_ctx("Session.Closed"))?;
+    let (activated, deactivated, zones_changed) = futures::future::try_join3(
+        ic.receive_signal("Activated"),
+        ic.receive_signal("Deactivated"),
+        ic.receive_signal("ZonesChanged"),
+    )
+    .await
+    .map_err(portal::err_ctx("InputCapture signals"))?;
+
     let mut session = Session {
         ic,
         session_path,
@@ -404,8 +422,16 @@ async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<Sessi
         zones,
         zone_set,
         barriers: Vec::new(),
+        session_proxy,
+        closed,
+        activated,
+        deactivated,
+        zones_changed,
     };
-    arm_barriers(conn, &mut session).await?;
+    if let Err(err) = arm_barriers(conn, &mut session).await {
+        close_session(&session.session_proxy).await;
+        return Err(err);
+    }
     Ok(session)
 }
 
@@ -471,7 +497,7 @@ async fn release(session: &Session, capture: &mut Option<ActiveCapture>, warp_to
 }
 
 async fn run(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Shared>,
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
@@ -489,7 +515,7 @@ async fn run(
             tokio::select! {
                 _ = map.changed.notified() => {}
                 cmd = cmd_rx.recv() => {
-                    if cmd.is_none() {
+                    if matches!(cmd, None | Some(Command::Shutdown)) {
                         return;
                     }
                 }
@@ -497,12 +523,19 @@ async fn run(
         }
         let since = last_recreate.elapsed();
         if since < RECREATE_MIN_INTERVAL {
-            tokio::time::sleep((RECREATE_MIN_INTERVAL - since).max(RECREATE_MIN_BACKOFF)).await;
+            let wait = (RECREATE_MIN_INTERVAL - since).max(RECREATE_MIN_BACKOFF);
+            if wait_or_shutdown(&mut cmd_rx, tokio::time::sleep(wait)).await {
+                return;
+            }
         }
         last_recreate = Instant::now();
 
         match establish(&conn, &tokens).await {
             Ok(session) => {
+                if drain_shutdown(&mut cmd_rx) {
+                    close_session(&session.session_proxy).await;
+                    return;
+                }
                 shared.set_health(|h| h.capture = None);
                 let end = run_session(
                     &shared,
@@ -514,13 +547,20 @@ async fn run(
                     &mut cmd_rx,
                 )
                 .await;
-                if matches!(end, SessionEnd::Reconfigure) {
-                    continue;
+                match end {
+                    SessionEnd::Reconfigure => continue,
+                    SessionEnd::Shutdown => return,
+                    SessionEnd::Broken | SessionEnd::Closed => {}
                 }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "input capture session setup failed");
                 shared.set_health(|h| h.capture = Some(format!("{err}")));
+                if matches!(err, PlatformError::Permission(_))
+                    && wait_or_shutdown(&mut cmd_rx, map.changed.notified()).await
+                {
+                    return;
+                }
             }
         }
         shared.emit(PlatformEvent::Capture(CaptureEvent::Broken {
@@ -529,10 +569,37 @@ async fn run(
     }
 }
 
+/// Waits for `until`, servicing commands meanwhile; true when Shutdown arrived.
+async fn wait_or_shutdown(cmd_rx: &mut mpsc::UnboundedReceiver<Command>, until: impl std::future::Future<Output = ()>) -> bool {
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            _ = &mut until => return false,
+            cmd = cmd_rx.recv() => {
+                if matches!(cmd, None | Some(Command::Shutdown)) {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+fn drain_shutdown(cmd_rx: &mut mpsc::UnboundedReceiver<Command>) -> bool {
+    let mut shutdown = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        if matches!(cmd, Command::Shutdown) {
+            shutdown = true;
+        }
+    }
+    shutdown
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionEnd {
     Reconfigure,
     Broken,
+    Shutdown,
+    Closed,
 }
 
 async fn close_session(session_proxy: &zbus::Proxy<'_>) {
@@ -541,10 +608,32 @@ async fn close_session(session_proxy: &zbus::Proxy<'_>) {
     }
 }
 
+/// Every exit except the portal's own Closed signal closes the session explicitly, so
+/// a broken session never lingers on the portal side while its replacement is made.
 async fn run_session(
-    shared: &Arc<WaylandShared>,
+    shared: &Arc<Shared>,
     conn: &zbus::Connection,
-    mut session: Session,
+    session: Session,
+    panic_chord: &[u32],
+    map: &EdgeMap,
+    active_flag: Arc<AtomicBool>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
+) -> SessionEnd {
+    let mut session = session;
+    let end = run_session_inner(shared, conn, &mut session, panic_chord, map, active_flag, cmd_rx).await;
+    if !matches!(end, SessionEnd::Closed) {
+        close_session(&session.session_proxy).await;
+    }
+    match end {
+        SessionEnd::Closed => SessionEnd::Broken,
+        other => other,
+    }
+}
+
+async fn run_session_inner(
+    shared: &Arc<Shared>,
+    conn: &zbus::Connection,
+    session: &mut Session,
     panic_chord: &[u32],
     map: &EdgeMap,
     active_flag: Arc<AtomicBool>,
@@ -557,40 +646,14 @@ async fn run_session(
         }
     }
     let _clear_active = ClearActive(active_flag.clone());
-    let session_proxy = match portal::session_proxy(conn, &session.session_path).await {
-        Ok(p) => p,
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot watch capture session");
-            return SessionEnd::Broken;
-        }
-    };
-    let mut closed = match session_proxy.receive_signal("Closed").await {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot subscribe to Session.Closed");
-            return SessionEnd::Broken;
-        }
-    };
-    let (mut activated, mut deactivated, mut zones_changed) = match futures::future::try_join3(
-        session.ic.receive_signal("Activated"),
-        session.ic.receive_signal("Deactivated"),
-        session.ic.receive_signal("ZonesChanged"),
-    )
-    .await
-    {
-        Ok(streams) => streams,
-        Err(err) => {
-            tracing::warn!(error = %err, "cannot subscribe to InputCapture signals");
-            return SessionEnd::Broken;
-        }
-    };
+    let _ = conn;
 
     let mut capture: Option<ActiveCapture> = None;
     let mut pressed: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     loop {
         tokio::select! {
-            msg = activated.next() => {
+            msg = session.activated.next() => {
                 let Some(msg) = msg else { return SessionEnd::Broken };
                 let Some((path, opts)) = portal::session_signal(&msg) else { continue };
                 if path != session.session_path {
@@ -612,7 +675,7 @@ async fn run_session(
                 let Some(edge) = edge else {
                     // Nothing mapped on this stretch of the boundary: hand the cursor
                     // straight back. This is the price of never re-arming the session.
-                    release(&session, &mut capture, None).await;
+                    release(session, &mut capture, None).await;
                     active_flag.store(false, Ordering::Release);
                     continue;
                 };
@@ -623,7 +686,7 @@ async fn run_session(
                 pressed.clear();
                 shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }));
             }
-            msg = deactivated.next() => {
+            msg = session.deactivated.next() => {
                 let Some(msg) = msg else { return SessionEnd::Broken };
                 let Some((path, opts)) = portal::session_signal(&msg) else { continue };
                 if path != session.session_path {
@@ -642,32 +705,41 @@ async fn run_session(
                     return SessionEnd::Broken;
                 }
             }
-            msg = zones_changed.next() => {
+            msg = session.zones_changed.next() => {
                 if msg.is_none() {
                     return SessionEnd::Broken;
                 }
-                // GNOME requires a disabled session to replace barriers. Recreate it
-                // instead of using Disable, whose re-enable path is broken on affected
-                // Mutter versions. This is the one remaining consent prompt after launch.
-                close_session(&session_proxy).await;
+                if capture.is_some() {
+                    release(session, &mut capture, None).await;
+                    active_flag.store(false, Ordering::Release);
+                    pressed.clear();
+                    shared.emit(PlatformEvent::Capture(CaptureEvent::Broken {
+                        reason: "display layout changed while capturing".into(),
+                    }));
+                }
                 return SessionEnd::Reconfigure;
             }
-            _ = closed.next() => {
+            _ = session.closed.next() => {
                 tracing::warn!("capture session closed by portal");
-                return SessionEnd::Broken;
+                return SessionEnd::Closed;
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { return SessionEnd::Broken };
+                let Some(cmd) = cmd else { return SessionEnd::Shutdown };
                 match cmd {
+                    Command::Shutdown => {
+                        release(session, &mut capture, None).await;
+                        active_flag.store(false, Ordering::Release);
+                        return SessionEnd::Shutdown;
+                    }
                     Command::EndCapture { warp_to } => {
-                        release(&session, &mut capture, warp_to).await;
+                        release(session, &mut capture, warp_to).await;
                         active_flag.store(false, Ordering::Release);
                         pressed.clear();
                     }
                     Command::Panic => {
                         if capture.is_some() {
                             tracing::warn!("panic chord pressed");
-                            release(&session, &mut capture, None).await;
+                            release(session, &mut capture, None).await;
                             active_flag.store(false, Ordering::Release);
                             pressed.clear();
                             shared.emit(PlatformEvent::Capture(CaptureEvent::Panic));
@@ -686,7 +758,7 @@ async fn run_session(
                         return SessionEnd::Broken;
                     }
                     Some(Ok(event)) => {
-                        if handle_ei_event(shared, &session, event, &mut capture, &mut pressed, panic_chord).await {
+                        if handle_ei_event(shared, session, event, &mut capture, &mut pressed, panic_chord).await {
                             return SessionEnd::Broken;
                         }
                     }
@@ -698,7 +770,7 @@ async fn run_session(
 
 /// Returns true when the session must be torn down and re-established.
 async fn handle_ei_event(
-    shared: &Arc<WaylandShared>,
+    shared: &Arc<Shared>,
     session: &Session,
     event: EiEvent,
     capture: &mut Option<ActiveCapture>,

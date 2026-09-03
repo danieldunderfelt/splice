@@ -1,8 +1,18 @@
 # Set up Splice on Linux
 
-Splice needs a Wayland session on GNOME 46 or later or KDE Plasma 6.4 or later. Those are the
-desktops whose portal backends implement Input Capture. The host must run Tailscale and be
-connected to the same tailnet as the other Splice machines.
+Splice needs a Wayland session. The host must run Tailscale and be connected to the same tailnet
+as the other Splice machines. Which desktops work, and how:
+
+| Desktop | Capture (this machine as source) | Injection (this machine as target) | Clipboard |
+|---|---|---|---|
+| GNOME 46+ | Input Capture portal (asks once per launch on GNOME 50, remembered from GNOME 51) | uinput, or Remote Desktop portal | Clipboard portal |
+| KDE Plasma 6.x | Wayland overlay (no prompt, cursor hidden) or Input Capture portal | uinput, or Remote Desktop portal | data-control |
+| Hyprland, sway, river, labwc, Wayfire, niri | Wayland overlay | uinput | data-control |
+| COSMIC | Wayland overlay | uinput (single-monitor targets only) | data-control |
+
+X11 sessions are not supported: Splice needs a Wayland display for its own geometry and edge
+handling even when it only injects. Splice picks the best available combination automatically. The **Input backends** section of the
+window shows what is active and lets you force a choice; a change takes effect immediately.
 
 ## Install Splice
 
@@ -35,6 +45,18 @@ Flatpak, for SteamOS, Bazzite, Silverblue and other immutable systems (needs `fl
 ```sh
 packaging/flatpak/generate-sources.sh
 flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.danieldunderfelt.Splice.yml
+```
+
+A Flatpak cannot install host udev rules, so add them yourself once (works on immutable
+systems too, `/etc` is writable there):
+
+```sh
+sudo install -m 0644 packaging/linux/70-splice.rules /etc/udev/rules.d/
+sudo install -m 0644 packaging/linux/splice-modules.conf /etc/modules-load.d/splice.conf
+sudo modprobe uinput
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=input --action=change
+sudo udevadm trigger --sysname-match=uinput --action=change
 ```
 
 Per-user install without a package:
@@ -70,15 +92,42 @@ to it, unless started from a terminal. Flatpak installs cannot register a system
 
 ## Input-device access
 
-The physical-input monitor reads `/dev/input/event*` in read-only mode. Portal-injected input
-never appears there, so evdev is how Splice tells which machine last received real input. The
-`70-splice.rules` udev rule tags input devices `uaccess`, which makes systemd-logind grant the
-active seat's user an access control list on those devices. There is no group to join and no
-re-login; the access follows your session and ends when it is inactive.
+The `70-splice.rules` udev rule tags `/dev/input/event*` and `/dev/uinput` with `uaccess`, which
+makes systemd-logind grant the active seat's user an access control list on them. There is no
+group to join and no re-login; the access follows your session and ends when it is inactive.
 
-Without the rule, capture still works, but source auto-switching is limited and Splice shows a
-warning in its health panel. Membership in the `input` group also satisfies the requirement on
-distributions that use it.
+- `/dev/input` (read-only) is the physical-input monitor: portal-injected input never appears
+  there, so evdev is how Splice tells which machine last received real input. It also detects
+  the panic chord on the raw devices.
+- `/dev/uinput` is the virtual keyboard and pointer used to inject input from other machines
+  without a portal session. Injected events appear on `/dev/input` under the names
+  `Splice Virtual Pointer` and `Splice Virtual Keyboard`; the monitor ignores them.
+
+The packages also install `modules-load.d/splice.conf` so the `uinput` module is loaded at boot;
+the access control list can only be applied to a loaded module's device node. Without the rule,
+capture still works through the portal, injection falls back to the Remote Desktop portal where
+one exists, source auto-switching is limited, and Splice shows the missing pieces in its health
+panel and backend picker. Splice re-checks access every 15 seconds, so installing the rule while
+it runs is picked up without a restart. Membership in the `input` group also satisfies the
+`/dev/input` half on distributions that use it.
+
+## Choosing backends
+
+**Capture.** The Wayland overlay places invisible 2 px strips on the shared edges; pushing the
+pointer through one locks it, hides the cursor and forwards input until it comes back. It never
+prompts and works on every compositor with layer-shell support (KDE, wlroots, COSMIC, niri).
+GNOME has no layer-shell, so it uses the Input Capture portal, which leaves the cursor visible
+at the edge while you are on another machine. Hyprland releases after v0.50.x currently do not
+enforce pointer locks on layer surfaces; Splice detects that, reports it in the health panel and
+ends the crossing. Hyprland has no Input Capture portal, so until that regression is fixed a
+Hyprland machine can only be driven by other machines, not drive them.
+
+**Injection.** The uinput backend creates a virtual absolute pointer and keyboard, so input from
+other machines is indistinguishable from a local device: no portal prompt, no libei state
+machine, and it works at the lock screen so a remote machine can unlock this one. Your global
+mouse settings apply to it: natural scrolling inverts the wheel and left-handed mode swaps the
+buttons, as they would for any mouse. The Remote Desktop portal is the alternative on GNOME and
+KDE. On GNOME the Remote Desktop session is kept for the clipboard even when uinput injects.
 
 ## Approve portal access
 

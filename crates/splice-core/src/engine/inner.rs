@@ -9,7 +9,10 @@ use crate::ledger::HeldLedger;
 use crate::net::{self, NetControl, NetOpts, PeerEvent, TsApi};
 use crate::ui_state::{UiConnection, UiEdge, UiFocus, UiMachine, UiState};
 use crate::config;
-use splice_platform::{CaptureEvent, ClipboardOffer, EdgeSide, HealthReport, PlatformEvent};
+use splice_platform::{
+    BackendPrefs, BackendStatus, CaptureEvent, ClipboardOffer, EdgeSide, HealthReport,
+    PlatformEvent,
+};
 use splice_proto::{
     caps, DisplayRect, Frame, InputEvent, LayoutDoc, LeaveReason, MachineId, MachineInfo,
     MachinePlacement, Os, Stamp, Vec2, Vec2I, CLIP_CHUNK, CLIP_MAX_TOTAL,
@@ -133,6 +136,8 @@ pub struct Inner {
     armed: Vec<EdgeLink>,
     armed_specs: Vec<splice_platform::EdgeSpec>,
     health: HealthReport,
+    backends: Option<watch::Sender<BackendPrefs>>,
+    backend_status: Option<BackendStatus>,
     tailscale_error: Option<String>,
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
@@ -161,7 +166,11 @@ impl Inner {
     ) -> Self {
         let cfg = config::load(&data_dir);
         let layout_lamport = cfg.layout.as_ref().map(|d| d.stamp.lamport).unwrap_or(0);
-        let splice_platform::Platform { capture, emulate, clipboard, displays, events } = platform;
+        let splice_platform::Platform { capture, emulate, clipboard, displays, events, backends } =
+            platform;
+        if let Some(backends) = &backends {
+            let _ = backends.send(cfg.backends);
+        }
         Inner {
             self_info: MachineInfo {
                 id: MachineId(String::new()),
@@ -202,6 +211,8 @@ impl Inner {
             armed: Vec::new(),
             armed_specs: Vec::new(),
             health: HealthReport::default(),
+            backends,
+            backend_status: None,
             tailscale_error: None,
             ui_deadline: None,
             cfg_deadline: None,
@@ -494,6 +505,11 @@ impl Inner {
             PlatformEvent::Health(report) => {
                 tracing::info!(?report, "platform health");
                 self.health = report;
+                self.touch_ui();
+            }
+            PlatformEvent::Backends(status) => {
+                tracing::info!(?status, "platform backends");
+                self.backend_status = Some(status);
                 self.touch_ui();
             }
         }
@@ -1226,6 +1242,19 @@ impl Inner {
                 self.mark_cfg_dirty();
                 self.touch_ui();
             }
+            Command::SetBackends(prefs) => {
+                self.cfg.backends = prefs;
+                if let Err(err) = config::save(&self.data_dir, &self.cfg) {
+                    tracing::warn!(error = %err, "cannot persist backend preferences");
+                }
+                if let Some(backends) = &self.backends {
+                    let _ = backends.send(prefs);
+                }
+                if let Some(status) = &mut self.backend_status {
+                    status.prefs = prefs;
+                }
+                self.touch_ui();
+            }
             Command::Panic => self.panic().await,
             Command::Refresh => self.discover().await,
         }
@@ -1612,6 +1641,7 @@ impl Inner {
             panic_chord: format_chord(&self.cfg.panic_chord),
             sensitivity: doc.as_ref().map(|d| d.sensitivity.clone()).unwrap_or_default(),
             tailscale_error: self.tailscale_error.clone(),
+            backends: self.backend_status.clone(),
         }
     }
 }

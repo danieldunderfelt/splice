@@ -12,8 +12,9 @@ finish-args:
   - --share=network
   - --socket=wayland
   - --device=dri
-  # Physical-activity monitor reads /dev/input (read-only).
-  - --device=input
+  # /dev/input (read-only physical-activity monitor) and /dev/uinput (virtual input
+  # devices for injection); uinput is not covered by --device=input.
+  - --device=all
   # Tailscale LocalAPI socket for peer discovery.
   - --filesystem=/run/tailscale:ro
   # "Start at login" writes an XDG autostart entry.

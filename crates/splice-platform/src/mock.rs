@@ -118,6 +118,7 @@ pub fn create(displays: Vec<DisplayRect>) -> (Platform, MockHandle) {
         clipboard: Arc::new(MockClipboard(handle.clone())),
         displays,
         events: rx,
+        backends: None,
     };
     (platform, handle)
 }

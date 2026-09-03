@@ -82,8 +82,9 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     macOS injection is absolute-position (no acceleration stage exists). So the wire carries the
     source's accelerated deltas in logical px (f64 — never i16), scaled by a per-link sensitivity
     factor (0.25–4.0). Do NOT send raw/unaccelerated deltas — the target would not accelerate
-    them and the pointer would feel linear and slow. (Optional future: uinput target backend so
-    libinput applies the local curve natively.)
+    them and the pointer would feel linear and slow. The Linux uinput target backend keeps this
+    rule by injecting through an ABSOLUTE virtual pointer, which libinput never accelerates; a
+    relative uinput device would re-accelerate and drift away from the source's virtual cursor.
 11. **Edge crossing is a timed state machine** (Apple's design): enter edge zone → tiny dwell
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
@@ -230,7 +231,14 @@ Trait contracts live in `splice-platform/src/lib.rs` (authoritative). Implementa
   (pixel + momentum mapping to ScrollStop); NSPasteboard changeCount poll 300 ms + promised items;
   physical-vs-injected via CGEventSourceUserData magic; IOPMAssertion while entered;
   display reconfiguration callback → republish displays.
-- `wayland/` — see `docs/research/wayland-input.md`. ashpd `InputCapture` (capture) +
+- `linux/` — a supervisor (`backends.rs`) hot-swaps one implementation per concern from the
+  user's preference (`Command::SetBackends`, persisted in config) and what the session offers:
+  capture = InputCapture portal (GNOME, KDE) or layer-shell overlay strips + pointer lock
+  (KDE, wlroots, COSMIC, niri; cursor hidden while away, never prompts); injection =
+  RemoteDesktop portal + libei or a uinput absolute pointer + keyboard (compositor-independent,
+  works at the lock screen); clipboard = Clipboard portal on the RemoteDesktop session or
+  ext/wlr data-control. See `docs/research/linux-native-input.md`. The portal path:
+  see `docs/research/wayland-input.md`. ashpd `InputCapture` (capture) +
   `RemoteDesktop` (inject) sessions with persist_mode=2 + restore tokens (store in config dir);
   reis receiver/sender contexts; barriers from core-provided edges; keymap from `ei_keyboard`
   used verbatim (evdev codes pass through); scroll smooth + scroll_stop; clipboard portal
@@ -301,7 +309,8 @@ tokens), atomic writes (tmp + rename). Machine-local; layout replicates via Layo
   onboard users to exactly one toggle.
 - Linux: single binary + `packaging/linux/` (desktop entry, AppStream metainfo, systemd user
   unit named `app-splice.service` for a portal-compatible cgroup name, `70-splice.rules` udev
-  rule tagging input devices `uaccess` so the evdev monitor needs no group membership).
+  rule tagging input devices and `/dev/uinput` `uaccess` so neither the evdev monitor nor the
+  uinput injector needs group membership).
   Distribution routes: cargo-deb metadata in `splice-app`, `packaging/rpm` spec, `packaging/arch`
   PKGBUILD, `packaging/flatpak` manifest. Process model: winit cannot hide a window on
   Wayland, so `splice service` (engine + tray + `$XDG_RUNTIME_DIR/splice.sock`) is separate from

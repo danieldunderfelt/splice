@@ -17,8 +17,8 @@ use wayland_client::{
     globals::registry_queue_init, protocol::wl_output, Connection, QueueHandle,
 };
 
-use super::WaylandShared;
-use crate::{PlatformError, PlatformEvent, Result};
+use super::Shared;
+use crate::{PlatformError, Result};
 
 struct State {
     registry_state: RegistryState,
@@ -129,7 +129,7 @@ fn snapshot(state: &State) -> Result<Vec<DisplayRect>> {
     Ok(displays)
 }
 
-fn run(shared: Arc<WaylandShared>, ready: std::sync::mpsc::SyncSender<Result<Vec<DisplayRect>>>) {
+fn run(shared: Arc<Shared>, ready: std::sync::mpsc::SyncSender<Result<Vec<DisplayRect>>>) {
     let initialized = (|| -> Result<_> {
         let conn = Connection::connect_to_env().map_err(|err| {
             PlatformError::Unavailable(format!("cannot connect to Wayland display: {err}"))
@@ -172,7 +172,7 @@ fn run(shared: Arc<WaylandShared>, ready: std::sync::mpsc::SyncSender<Result<Vec
             match snapshot(&state) {
                 Ok(displays) if displays != last => {
                     last = displays.clone();
-                    shared.emit(PlatformEvent::DisplaysChanged { displays });
+                    shared.set_displays(displays);
                 }
                 Ok(_) => {}
                 Err(err) => tracing::warn!(error = %err, "ignoring incomplete Wayland output update"),
@@ -181,7 +181,7 @@ fn run(shared: Arc<WaylandShared>, ready: std::sync::mpsc::SyncSender<Result<Vec
     }
 }
 
-pub fn spawn(shared: Arc<WaylandShared>) -> Result<Vec<DisplayRect>> {
+pub fn spawn(shared: Arc<Shared>) -> Result<Vec<DisplayRect>> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("splice-wayland-outputs".into())

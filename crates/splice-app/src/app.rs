@@ -18,6 +18,10 @@ use splice_proto::{LayoutDoc, MachineId, Os};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// How long a backend choice is shown optimistically before the engine confirms it.
+#[cfg(target_os = "linux")]
+const PENDING_PREF_TTL: Duration = Duration::from_secs(3);
+
 /// Uniform gap between the fitted cluster and the canvas edges.
 const CANVAS_MARGIN: f32 = 24.0;
 /// Fit clamps: the max also caps a single machine at a sane on-screen size.
@@ -45,6 +49,9 @@ pub struct SpliceApp {
     screenshot_requested: bool,
     #[cfg(target_os = "linux")]
     autostart: bool,
+    /// Backend choice sent but not yet echoed back by the engine snapshot.
+    #[cfg(target_os = "linux")]
+    pending_backends: Option<(splice_platform::BackendPrefs, Instant)>,
 }
 
 impl SpliceApp {
@@ -64,6 +71,8 @@ impl SpliceApp {
             exit_at: exit_after.map(|secs| Instant::now() + Duration::from_secs_f64(secs)),
             #[cfg(target_os = "linux")]
             autostart: crate::autostart::is_enabled(),
+            #[cfg(target_os = "linux")]
+            pending_backends: None,
             screenshot_to: std::env::var_os("SPLICE_UI_SCREENSHOT").map(Into::into),
             screenshot_requested: false,
         }
@@ -166,6 +175,12 @@ impl SpliceApp {
                         }
                         #[cfg(target_os = "linux")]
                         {
+                            if state.backends.is_some() {
+                                self.backends_section(ui, state);
+                                ui.add_space(14.0);
+                                ui.separator();
+                                ui.add_space(10.0);
+                            }
                             self.startup_section(ui);
                             ui.add_space(14.0);
                             ui.separator();
@@ -220,6 +235,104 @@ impl SpliceApp {
                 self.ctrl.send(Command::SetSensitivity { link_key, factor });
             }
             ui.add_space(4.0);
+        }
+    }
+
+    /// Linux: pick the capture and injection implementations; the service hot-swaps them.
+    #[cfg(target_os = "linux")]
+    fn backends_section(&mut self, ui: &mut egui::Ui, state: &UiState) {
+        use splice_platform::{CapturePref, InjectPref};
+        let Some(status) = &state.backends else { return };
+        ui.label(RichText::new("Input backends").size(15.5).strong());
+        ui.label(
+            RichText::new("How Splice captures input here and injects input from other machines.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(6.0);
+        let live = self.ctrl.is_live();
+        let shown = match self.pending_backends {
+            Some((pending, since)) if pending != status.prefs && since.elapsed() < PENDING_PREF_TTL => pending,
+            _ => {
+                self.pending_backends = None;
+                status.prefs
+            }
+        };
+        let mut prefs = shown;
+
+        let capture_label = |pref: CapturePref| match pref {
+            CapturePref::Auto => "Automatic",
+            CapturePref::Portal => "Input Capture portal",
+            CapturePref::Overlay => "Wayland overlay",
+        };
+        let inject_label = |pref: InjectPref| match pref {
+            InjectPref::Auto => "Automatic",
+            InjectPref::Portal => "Remote Desktop portal",
+            InjectPref::Uinput => "Virtual device (uinput)",
+        };
+
+        egui::Grid::new("backend-picker").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("Capture");
+            ui.add_enabled_ui(live, |ui| {
+                egui::ComboBox::from_id_salt("capture-pref")
+                    .selected_text(capture_label(prefs.capture))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut prefs.capture, CapturePref::Auto, capture_label(CapturePref::Auto));
+                        ui.add_enabled_ui(status.portal_capture_available, |ui| {
+                            ui.selectable_value(&mut prefs.capture, CapturePref::Portal, capture_label(CapturePref::Portal));
+                        });
+                        ui.add_enabled_ui(status.overlay_available, |ui| {
+                            ui.selectable_value(&mut prefs.capture, CapturePref::Overlay, capture_label(CapturePref::Overlay));
+                        });
+                    });
+            });
+            ui.end_row();
+            ui.label("Injection");
+            ui.add_enabled_ui(live, |ui| {
+                egui::ComboBox::from_id_salt("inject-pref")
+                    .selected_text(inject_label(prefs.inject))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut prefs.inject, InjectPref::Auto, inject_label(InjectPref::Auto));
+                        ui.add_enabled_ui(status.portal_inject_available, |ui| {
+                            ui.selectable_value(&mut prefs.inject, InjectPref::Portal, inject_label(InjectPref::Portal));
+                        });
+                        ui.add_enabled_ui(status.uinput_available, |ui| {
+                            ui.selectable_value(&mut prefs.inject, InjectPref::Uinput, inject_label(InjectPref::Uinput));
+                        });
+                    });
+            });
+            ui.end_row();
+        });
+        if prefs != shown {
+            self.pending_backends = Some((prefs, Instant::now()));
+            self.ctrl.send(Command::SetBackends(prefs));
+        }
+        ui.add_space(6.0);
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.label(RichText::new(format!("Capture: {}", status.capture)).small());
+                ui.label(RichText::new(format!("Injection: {}", status.inject)).small());
+                ui.label(RichText::new(format!("Clipboard: {}", status.clipboard)).small());
+            });
+        if !status.uinput_available {
+            ui.label(
+                RichText::new(
+                    "Virtual-device injection needs /dev/uinput access: install \
+                     packaging/linux/70-splice.rules (see docs/linux-setup.md).",
+                )
+                .small()
+                .color(theme::WARN),
+            );
+        }
+        if !status.overlay_available && !status.portal_capture_available {
+            ui.label(
+                RichText::new("No capture implementation is available on this compositor.")
+                    .small()
+                    .color(theme::WARN),
+            );
         }
     }
 
@@ -1077,7 +1190,8 @@ fn health_rows(state: &UiState) -> Vec<(String, String, String)> {
         rows.push((
             "Physical-input monitor".into(),
             detail.clone(),
-            "Add your user to the input group: sudo usermod -aG input $USER — then re-login."
+            "Install packaging/linux/70-splice.rules into /etc/udev/rules.d and replug or run \
+             udevadm trigger; see docs/linux-setup.md."
                 .into(),
         ));
     }

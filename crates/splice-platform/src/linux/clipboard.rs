@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::portal::{self, Options};
-use super::WaylandShared;
+use super::{Shared, Stop};
 use crate::{ClipFetch, Clipboard, ClipboardOffer, PlatformError, PlatformEvent, Result};
 use zbus::zvariant;
 
@@ -94,16 +94,26 @@ impl Clipboard for WaylandClipboard {
 }
 
 pub fn create(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Shared>,
     conn: zbus::Connection,
     session_rx: watch::Receiver<Option<ClipSession>>,
-) -> Arc<WaylandClipboard> {
+) -> (Arc<WaylandClipboard>, Stop) {
     let offer: Arc<Mutex<Option<OfferState>>> = Arc::new(Mutex::new(None));
 
-    let _ = tokio::spawn(observe(shared, conn.clone(), session_rx.clone(), offer.clone()));
-    let _ = tokio::spawn(serve_transfers(conn.clone(), session_rx.clone(), offer.clone()));
+    let observer = tokio::spawn(observe(shared, conn.clone(), session_rx.clone(), offer.clone()));
+    let server = tokio::spawn(serve_transfers(conn.clone(), session_rx.clone(), offer.clone()));
+    let stop = Stop::new({
+        let observer = observer.abort_handle();
+        let server = server.abort_handle();
+        let offer = offer.clone();
+        move || {
+            observer.abort();
+            server.abort();
+            *offer.lock() = None;
+        }
+    });
 
-    Arc::new(WaylandClipboard { conn, session_rx, offer })
+    (Arc::new(WaylandClipboard { conn, session_rx, offer }), stop)
 }
 
 fn normalize_mimes(mimes: &[String]) -> Vec<String> {
@@ -147,7 +157,7 @@ async fn selection_read(conn: &zbus::Connection, session_path: &str, mime: &str)
 /// Observes SelectionOwnerChanged; on a real (non-self) change, reads small text inline
 /// and republishes the offer. Re-applies a pending remote offer on session (re)grant.
 async fn observe(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Shared>,
     conn: zbus::Connection,
     mut session_rx: watch::Receiver<Option<ClipSession>>,
     offer: Arc<Mutex<Option<OfferState>>>,

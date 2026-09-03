@@ -3513,6 +3513,7 @@ dependencies = [
  "ashpd",
  "async-trait",
  "block2 0.6.2",
+ "calloop 0.13.0",
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "evdev",
@@ -3533,6 +3534,8 @@ dependencies = [
  "tokio",
  "tracing",
  "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "zbus",
 ]
 

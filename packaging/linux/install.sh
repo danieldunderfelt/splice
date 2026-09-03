@@ -23,6 +23,8 @@ applications_directory="${HOME}/.local/share/applications"
 systemd_user_directory="${HOME}/.config/systemd/user"
 udev_rule="${script_directory}/70-splice.rules"
 udev_target="/etc/udev/rules.d/70-splice.rules"
+modules_conf="${script_directory}/splice-modules.conf"
+modules_target="/etc/modules-load.d/splice.conf"
 
 if [[ ! -x "$binary_path" ]]; then
     printf 'Build the release binary first: cargo build -p splice-app --release\n' >&2
@@ -43,21 +45,30 @@ systemctl --user enable app-splice.service
 
 printf 'Installed Splice at %s.\n' "$binary_directory/splice"
 
-if cmp -s "$udev_rule" "$udev_target" 2>/dev/null; then
+if cmp -s "$udev_rule" "$udev_target" 2>/dev/null && cmp -s "$modules_conf" "$modules_target" 2>/dev/null; then
     printf 'Input device access rule already installed at %s.\n' "$udev_target"
 elif [[ -t 0 ]] && command -v sudo >/dev/null 2>&1; then
     printf '\nInstalling the input device access rule to %s (asks for sudo).\n' "$udev_target"
     sudo install -m 0644 "$udev_rule" "$udev_target"
+    sudo install -m 0644 "$modules_conf" "$modules_target"
+    sudo modprobe uinput
     sudo udevadm control --reload
     sudo udevadm trigger --subsystem-match=input --action=change
+    sudo udevadm trigger --sysname-match=uinput --action=change
+    sudo udevadm settle --timeout=5
     printf 'Input device access rule installed; it takes effect immediately.\n'
 else
     cat <<MSG
 
-Physical-input detection needs read access to /dev/input. Install the udev rule as root:
+Physical-input detection needs access to /dev/input and remote input injection needs
+/dev/uinput. Install the udev rule and the module list as root:
   sudo install -m 0644 "$udev_rule" "$udev_target"
+  sudo install -m 0644 "$modules_conf" "$modules_target"
+  sudo modprobe uinput
   sudo udevadm control --reload
   sudo udevadm trigger --subsystem-match=input --action=change
+  sudo udevadm trigger --sysname-match=uinput --action=change
+  sudo udevadm settle --timeout=5
 MSG
 fi
 

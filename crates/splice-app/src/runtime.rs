@@ -285,6 +285,7 @@ pub async fn bootstrap() -> anyhow::Result<EngineHandle> {
     let platform = splice_platform::create(splice_platform::PlatformOpts {
         data_dir: data_dir.clone(),
         panic_chord: cfg.panic_chord.clone(),
+        backends: cfg.backends,
     })
     .await
     .context("initializing platform backend")?;
@@ -418,6 +419,16 @@ pub mod preview {
                 ..HealthReport::default()
             },
             panic_chord: "Left Shift+Right Shift+Esc".into(),
+            backends: cfg!(target_os = "linux").then(|| splice_platform::BackendStatus {
+                prefs: Default::default(),
+                capture: "Wayland overlay (cursor hidden while away)".into(),
+                inject: "virtual device (uinput)".into(),
+                clipboard: "Wayland data-control".into(),
+                overlay_available: true,
+                uinput_available: true,
+                portal_capture_available: true,
+                portal_inject_available: true,
+            }),
             sensitivity: BTreeMap::new(),
             tailscale_error: None,
         };
@@ -456,6 +467,11 @@ pub mod preview {
             }
             Command::Panic => {
                 state.focus = UiFocus::Local;
+            }
+            Command::SetBackends(prefs) => {
+                if let Some(backends) = &mut state.backends {
+                    backends.prefs = *prefs;
+                }
             }
             Command::Refresh => {}
         }

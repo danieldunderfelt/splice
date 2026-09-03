@@ -1,5 +1,10 @@
-# Splice software KVM: grant the active seat's user read access to input devices so the
-# physical-activity monitor can tell which machine last received real input. The
-# uaccess tag makes systemd-logind manage an ACL that follows the active session, so no
-# group membership or re-login is needed and access ends when the session is inactive.
+# Splice software KVM. The uaccess tag makes systemd-logind manage an ACL (read+write,
+# like any other uaccess device) that follows the active seat's session, so no group
+# membership or re-login is needed and access ends when the session is inactive.
+#
+# Input devices: Splice opens them read-only for the physical-activity monitor (which
+# machine last received real input) and to detect the panic chord on the raw devices.
 SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"
+# uinput: the virtual keyboard and pointer used to inject input from other machines.
+# The module must be loaded for the ACL to be applied (see modules-load.d/splice.conf).
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

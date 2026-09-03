@@ -206,5 +206,6 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         clipboard,
         displays,
         events,
+        backends: None,
     })
 }

@@ -50,6 +50,7 @@ assets = [
     ["../../packaging/linux/io.github.danieldunderfelt.Splice.metainfo.xml", "usr/share/metainfo/", "644"],
     ["../../packaging/linux/app-splice.service", "usr/lib/systemd/user/", "644"],
     ["../../packaging/linux/70-splice.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../packaging/linux/splice-modules.conf", "usr/lib/modules-load.d/splice.conf", "644"],
     ["../../README.md", "usr/share/doc/splice/", "644"],
     ["../../docs/linux-setup.md", "usr/share/doc/splice/", "644"],
 ]

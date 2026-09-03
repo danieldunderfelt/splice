@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let platform = splice_platform::create(splice_platform::PlatformOpts {
         data_dir: data_dir.clone(),
         panic_chord: cfg.panic_chord.clone(),
+        backends: cfg.backends,
     })
     .await
     .context("initializing platform backend")?;

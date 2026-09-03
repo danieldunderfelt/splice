@@ -1,6 +1,7 @@
 //! Persistent configuration: settings + last-known layout. Atomic writes (tmp + rename).
 
 use serde::{Deserialize, Serialize};
+use splice_platform::BackendPrefs;
 use splice_proto::LayoutDoc;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,8 @@ pub struct Config {
     pub edge_dwell_ms: u32,
     /// Corner dead-zone size in logical px.
     pub corner_dead_zone: u32,
+    /// Linux capture/injection implementation preferences.
+    pub backends: BackendPrefs,
 }
 
 impl Default for Config {
@@ -28,6 +31,7 @@ impl Default for Config {
             layout: None,
             edge_dwell_ms: 0,
             corner_dead_zone: 16,
+            backends: BackendPrefs::default(),
         }
     }
 }

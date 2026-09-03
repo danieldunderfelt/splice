@@ -2,7 +2,7 @@
 //! activity, and system health — implemented per OS.
 //!
 //! This file is the CONTRACT between `splice-core` and the backends. Backends live in
-//! `macos/` and `wayland/` (cfg-gated). `mock` provides a scriptable in-memory
+//! `macos/` and `linux/` (cfg-gated). `mock` provides a scriptable in-memory
 //! implementation for core's tests.
 //!
 //! Threading model: backends run their own event pumps (CFRunLoop thread on macOS; tokio
@@ -16,7 +16,7 @@ pub mod mock;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "linux")]
-pub mod wayland;
+pub mod linux;
 
 use splice_proto::{DisplayRect, InputEvent, Vec2};
 use std::sync::Arc;
@@ -142,6 +142,8 @@ pub enum PlatformEvent {
     DisplaysChanged { displays: Vec<DisplayRect> },
     /// Health/permission state changed (drives the UI status panel).
     Health(HealthReport),
+    /// Linux: the active backend selection changed (drives the UI backend picker).
+    Backends(BackendStatus),
 }
 
 /// Per-concern health status for the UI. `None` = OK.
@@ -153,10 +155,55 @@ pub struct HealthReport {
     pub emulate: Option<String>,
     /// macOS: Secure Input active — value is the culprit process description.
     pub secure_input: Option<String>,
-    /// Linux: evdev monitor unavailable (input group missing).
+    /// Linux: evdev monitor unavailable (udev rule missing).
     pub activity_monitor: Option<String>,
     /// Clipboard backend degraded.
     pub clipboard: Option<String>,
+}
+
+/// Capture implementation preference (Linux). `Auto` prefers the overlay where the
+/// compositor supports it, because it never prompts and hides the cursor while away.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CapturePref {
+    #[default]
+    Auto,
+    /// xdg-desktop-portal InputCapture (GNOME, KDE).
+    Portal,
+    /// Wayland layer-shell edge strips + pointer lock (KDE, wlroots, COSMIC, niri…).
+    Overlay,
+}
+
+/// Injection implementation preference (Linux). `Auto` prefers uinput when
+/// `/dev/uinput` is accessible: it is compositor-independent and skips the EIS path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InjectPref {
+    #[default]
+    Auto,
+    /// xdg-desktop-portal RemoteDesktop + libei.
+    Portal,
+    /// Virtual absolute pointer + keyboard on `/dev/uinput`.
+    Uinput,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BackendPrefs {
+    pub capture: CapturePref,
+    pub inject: InjectPref,
+}
+
+/// What the Linux backend supervisor resolved the preferences to (drives the UI's
+/// backend picker). Strings are human-readable implementation names.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BackendStatus {
+    pub prefs: BackendPrefs,
+    pub capture: String,
+    pub inject: String,
+    pub clipboard: String,
+    pub overlay_available: bool,
+    pub uinput_available: bool,
+    pub portal_capture_available: bool,
+    pub portal_inject_available: bool,
 }
 
 /// Everything the engine needs from the OS, bundled.
@@ -168,6 +215,9 @@ pub struct Platform {
     pub displays: Vec<DisplayRect>,
     /// Unified event stream (capture events, activity, clipboard, displays, health).
     pub events: tokio::sync::mpsc::UnboundedReceiver<PlatformEvent>,
+    /// Live backend selection (Linux only); the backend hot-swaps implementations when
+    /// the engine publishes new preferences here.
+    pub backends: Option<tokio::sync::watch::Sender<BackendPrefs>>,
 }
 
 /// Options for constructing the platform backend.
@@ -179,6 +229,8 @@ pub struct PlatformOpts {
     /// this LOCALLY (must work even if the engine/network is wedged), releases capture,
     /// then emits [`CaptureEvent::Panic`].
     pub panic_chord: Vec<u32>,
+    /// Initial Linux backend preferences (ignored elsewhere).
+    pub backends: BackendPrefs,
 }
 
 /// Construct the real platform backend for this OS.
@@ -191,7 +243,7 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     }
     #[cfg(target_os = "linux")]
     {
-        wayland::create(opts).await
+        linux::create(opts).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

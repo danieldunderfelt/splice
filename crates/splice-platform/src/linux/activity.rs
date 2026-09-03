@@ -17,11 +17,10 @@ use std::time::{Duration, Instant};
 
 use evdev::{Device, EventType};
 use futures::StreamExt;
-use inotify::{EventOwned, EventStream, Inotify, WatchMask};
+use inotify::{EventMask, EventOwned, EventStream, Inotify, WatchMask};
 use tokio::sync::mpsc;
 
-use super::WaylandShared;
-use super::capture::PanicRelease;
+use super::{PanicRelease, Shared, VIRTUAL_DEVICE_PREFIX};
 use crate::PlatformEvent;
 
 const INPUT_DIR: &str = "/dev/input";
@@ -32,7 +31,7 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 const HOTPLUG_RETRIES: u32 = 3;
 const HOTPLUG_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-pub fn spawn(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u32>) {
+pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
     let _ = tokio::spawn(run(shared, panic, panic_chord));
 }
 
@@ -41,9 +40,12 @@ enum PhysicalEvent {
     Activity,
     Key { device: PathBuf, code: u32, pressed: bool },
     DeviceGone(PathBuf),
+    /// The node could not be opened; a later ATTRIB (ACL change) event retries it.
+    OpenFailed(PathBuf),
+    Opened,
 }
 
-async fn run(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u32>) {
+async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
     let (activity_tx, mut activity_rx) = mpsc::channel::<PhysicalEvent>(64);
     let eacces_reported = Arc::new(AtomicBool::new(false));
     let mut known: HashSet<PathBuf> = HashSet::new();
@@ -92,7 +94,19 @@ async fn run(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u
                     }
                     PhysicalEvent::DeviceGone(device) => {
                         held.remove(&device);
+                        known.remove(&device);
                         panic_latched = false;
+                        continue;
+                    }
+                    PhysicalEvent::OpenFailed(device) => {
+                        known.remove(&device);
+                        continue;
+                    }
+                    PhysicalEvent::Opened => {
+                        if eacces_reported.swap(false, Ordering::Relaxed) {
+                            shared.set_health(|h| h.activity_monitor = None);
+                        }
+                        continue;
                     }
                 }
                 let now = Instant::now();
@@ -107,7 +121,10 @@ async fn run(shared: Arc<WaylandShared>, panic: PanicRelease, panic_chord: Vec<u
                         if let Some(name) = event.name {
                             if name.as_encoded_bytes().starts_with(b"event") {
                                 let path = PathBuf::from(INPUT_DIR).join(name);
-                                if known.insert(path.clone()) {
+                                if event.mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
+                                    known.remove(&path);
+                                    held.remove(&path);
+                                } else if known.insert(path.clone()) {
                                     spawn_reader(path, activity_tx.clone(), &shared, &eacces_reported, HOTPLUG_RETRIES);
                                 }
                             }
@@ -136,7 +153,10 @@ fn watch_input_dir() -> io::Result<EventStream<[u8; 1024]>> {
     let inotify = Inotify::init()?;
     inotify
         .watches()
-        .add(INPUT_DIR, WatchMask::CREATE | WatchMask::MOVED_TO)?;
+        .add(
+            INPUT_DIR,
+            WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::DELETE | WatchMask::MOVED_FROM | WatchMask::ATTRIB,
+        )?;
     inotify.into_event_stream([0; 1024])
 }
 
@@ -160,7 +180,7 @@ fn enumerate() -> Vec<PathBuf> {
 fn spawn_reader(
     path: PathBuf,
     activity: mpsc::Sender<PhysicalEvent>,
-    shared: &Arc<WaylandShared>,
+    shared: &Arc<Shared>,
     eacces_reported: &Arc<AtomicBool>,
     retries: u32,
 ) {
@@ -192,14 +212,21 @@ fn spawn_reader(
                     } else {
                         tracing::warn!(path = %path.display(), error = %err, "cannot open input device");
                     }
+                    let _ = activity.send(PhysicalEvent::OpenFailed(path.clone())).await;
                     return;
                 }
             }
         };
+        if device.name().is_some_and(|name| name.starts_with(VIRTUAL_DEVICE_PREFIX)) {
+            let _ = activity.send(PhysicalEvent::OpenFailed(path.clone())).await;
+            return;
+        }
+        let _ = activity.send(PhysicalEvent::Opened).await;
         let mut stream = match device.into_event_stream() {
             Ok(stream) => stream,
             Err(err) => {
                 tracing::warn!(path = %path.display(), error = %err, "cannot stream input device");
+                let _ = activity.send(PhysicalEvent::DeviceGone(path.clone())).await;
                 return;
             }
         };

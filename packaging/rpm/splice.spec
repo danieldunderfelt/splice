@@ -49,9 +49,14 @@ install -Dpm0644 packaging/linux/app-splice.service \
     %{buildroot}%{_userunitdir}/app-splice.service
 install -Dpm0644 packaging/linux/70-splice.rules \
     %{buildroot}%{_udevrulesdir}/70-splice.rules
+%{_modulesloaddir}/splice.conf
+install -Dpm0644 packaging/linux/splice-modules.conf \
+    %{buildroot}%{_modulesloaddir}/splice.conf
 
 %post
 %udev_rules_update
+modprobe uinput >/dev/null 2>&1 || :
+udevadm trigger --sysname-match=uinput --action=change >/dev/null 2>&1 || :
 
 %postun
 %udev_rules_update

@@ -1,7 +1,7 @@
 //! UI-facing state snapshot. `splice-app` renders this and nothing else.
 
 use serde::{Deserialize, Serialize};
-use splice_platform::HealthReport;
+use splice_platform::{BackendStatus, HealthReport};
 use splice_proto::{DisplayRect, MachineId, Os, Vec2I};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -67,6 +67,8 @@ pub struct UiState {
     pub sensitivity: std::collections::BTreeMap<String, f64>,
     /// True while Tailscale/LocalAPI is unreachable.
     pub tailscale_error: Option<String>,
+    /// Linux: which capture/injection/clipboard implementations are active.
+    pub backends: Option<BackendStatus>,
 }
 
 impl UiState {
@@ -83,6 +85,7 @@ impl UiState {
             panic_chord: "Left Shift+Right Shift+Esc".into(),
             sensitivity: Default::default(),
             tailscale_error: None,
+            backends: None,
         }
     }
 }

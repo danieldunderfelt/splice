@@ -24,8 +24,11 @@ reis = { workspace = true }
 evdev = { workspace = true }
 zbus = { workspace = true }
 inotify = "0.11"
-smithay-client-toolkit = { version = "0.19.2", default-features = false }
+smithay-client-toolkit = { version = "0.19.2", default-features = false, features = ["calloop"] }
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.13"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { workspace = true }

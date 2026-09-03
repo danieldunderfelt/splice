@@ -1,6 +1,11 @@
 #!/bin/sh
 set -e
-if [ "$1" = "configure" ] && command -v udevadm >/dev/null 2>&1; then
-    udevadm control --reload || true
-    udevadm trigger --subsystem-match=input --action=change || true
+if [ "$1" = "configure" ]; then
+    modprobe uinput 2>/dev/null || true
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload || true
+        udevadm trigger --subsystem-match=input --action=change || true
+        udevadm trigger --sysname-match=uinput --action=change || true
+        udevadm settle --timeout=5 || true
+    fi
 fi

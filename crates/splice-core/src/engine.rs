@@ -21,6 +21,8 @@ pub enum Command {
     SetArrangement(Vec<(MachineId, Vec2I)>),
     SetSensitivity { link_key: String, factor: f64 },
     SetClipboardSync(bool),
+    /// Linux: choose capture/injection implementations (hot-swapped by the backend).
+    SetBackends(splice_platform::BackendPrefs),
     /// Local panic: end any session, release everything, broadcast Leave+ReleaseAll.
     Panic,
     /// Force a discovery refresh now.

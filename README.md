@@ -4,7 +4,7 @@ Splice shares one mouse, keyboard, and clipboard across macOS and Linux computer
 
 The current release is Splice 1.0.
 
-Splice is under active development. Linux support targets Fedora 44 or later in a GNOME or KDE Wayland session.
+Splice is under active development. Linux support targets Wayland sessions: GNOME and KDE through the desktop portals, and KDE, Hyprland, sway, niri, COSMIC and other layer-shell compositors through a native overlay and uinput backend.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ Install these on every computer that will run Splice:
 - [Rust and Cargo](https://rustup.rs/)
 - [Tailscale](https://tailscale.com/download), connected to the same tailnet
 
-On Linux, use a Wayland session. The portals for keyboard, pointer, and clipboard access come from your desktop environment. See [the Linux setup guide](docs/linux-setup.md) for permissions and troubleshooting.
+On Linux, use a Wayland session. Splice picks the best capture, injection and clipboard implementation your compositor offers, and the window lets you switch. See [the Linux setup guide](docs/linux-setup.md) for the support table, the udev rule, and troubleshooting.
 
 ## Run from source
 
@@ -64,7 +64,7 @@ Keep the signing identity when rebuilding. macOS can lose the app's Accessibilit
 
 ### Install on Linux
 
-Splice runs in a Wayland session on GNOME or KDE Plasma. Pick the route that matches your
+Splice runs in a Wayland session. Pick the route that matches your
 distribution; all of them install the binary, the desktop entry, the `app-splice.service` user
 unit, and the udev rule that grants input-device access.
 

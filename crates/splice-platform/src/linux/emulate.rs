@@ -26,8 +26,9 @@ use zbus::zvariant::{OwnedFd, Value};
 
 use super::clipboard::ClipSession;
 use super::portal::{self, Options};
+use super::screensaver::ScreenSaver;
 use super::tokens::{TokenKind, TokenStore};
-use super::WaylandShared;
+use super::{Shared, Stop};
 use crate::{Emulate, PlatformError, Result};
 
 const RD_IFACE: &str = "org.freedesktop.portal.RemoteDesktop";
@@ -92,15 +93,27 @@ impl WaylandEmulate {
     }
 }
 
+/// `injects` says whether this session is the active injection backend; when it only
+/// exists to host the Clipboard portal, it stays out of the `emulate` health field.
 pub fn create(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Shared>,
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
-) -> (Arc<WaylandEmulate>, watch::Receiver<Option<ClipSession>>) {
+    injects: Arc<AtomicBool>,
+) -> (Arc<WaylandEmulate>, watch::Receiver<Option<ClipSession>>, Stop) {
     let (cmd, cmd_rx) = mpsc::channel(64);
     let abort = Arc::new(Notify::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
     let (clip_tx, clip_rx) = watch::channel(None);
-    let screensaver = Arc::new(ScreenSaver::new(conn.clone()));
+    let screensaver = Arc::new(ScreenSaver::new(Some(conn.clone())));
+    let stop = Stop::new({
+        let abort = abort.clone();
+        let shutdown = shutdown.clone();
+        move || {
+            shutdown.store(true, Ordering::Release);
+            abort.notify_one();
+        }
+    });
 
     // reis's EiConvertEventStream is not Send (its converter holds boxed FnOnce
     // callbacks), so the portal/reis pump cannot be tokio::spawn'd. It runs on a
@@ -120,90 +133,24 @@ pub fn create(
                         return;
                     }
                 };
-                rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver, abort));
+                let shared = Arc::new(Health { shared, injects });
+                rt.block_on(run(shared, tokens, conn, cmd_rx, clip_tx, screensaver, abort, shutdown));
             }
         });
 
-    (Arc::new(WaylandEmulate { cmd, abort }), clip_rx)
+    (Arc::new(WaylandEmulate { cmd, abort }), clip_rx, stop)
 }
 
-/// org.freedesktop.ScreenSaver keep-awake + lock detection. GNOME exposes the interface
-/// at /org/freedesktop/ScreenSaver, KDE at /ScreenSaver; the first working path wins.
-struct ScreenSaver {
-    conn: zbus::Connection,
-    locked: AtomicBool,
-    cookie: AtomicU32,
+/// Health writes routed through the "is this the injector" flag.
+struct Health {
+    shared: Arc<Shared>,
+    injects: Arc<AtomicBool>,
 }
 
-impl ScreenSaver {
-    fn new(conn: zbus::Connection) -> Self {
-        Self { conn, locked: AtomicBool::new(false), cookie: AtomicU32::new(0) }
-    }
-
-    async fn proxy(&self) -> Option<zbus::Proxy<'static>> {
-        for path in ["/org/freedesktop/ScreenSaver", "/ScreenSaver"] {
-            let Ok(proxy) = zbus::Proxy::new(
-                &self.conn,
-                "org.freedesktop.ScreenSaver",
-                path,
-                "org.freedesktop.ScreenSaver",
-            )
-            .await
-            else {
-                continue;
-            };
-            if proxy.call::<_, _, bool>("GetActive", &()).await.is_ok() {
-                return Some(proxy);
-            }
-        }
-        None
-    }
-
-    fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
-    }
-
-    async fn inhibit(&self) {
-        let Some(proxy) = self.proxy().await else { return };
-        match proxy
-            .call::<_, _, u32>("Inhibit", &("splice", "Remote input active"))
-            .await
-        {
-            Ok(cookie) => self.cookie.store(cookie, Ordering::Relaxed),
-            Err(err) => tracing::warn!(error = %err, "ScreenSaver.Inhibit failed"),
-        }
-    }
-
-    async fn uninhibit(&self) {
-        let cookie = self.cookie.swap(0, Ordering::Relaxed);
-        if cookie == 0 {
-            return;
-        }
-        let Some(proxy) = self.proxy().await else { return };
-        if let Err(err) = proxy.call::<_, _, ()>("UnInhibit", &(cookie,)).await {
-            tracing::warn!(error = %err, "ScreenSaver.UnInhibit failed");
-        }
-    }
-
-    /// Tracks GetActive + ActiveChanged and drives the "screen locked" health note.
-    /// While locked, RemoteDesktop injection errors out, so injections are dropped.
-    async fn monitor(self: Arc<Self>, shared: Arc<WaylandShared>) {
-        let Some(proxy) = self.proxy().await else { return };
-        let active = proxy.call::<_, _, bool>("GetActive", &()).await.unwrap_or(false);
-        self.locked.store(active, Ordering::Relaxed);
-        shared.set_health(|h| {
-            h.emulate = active.then(|| "screen locked: remote input paused".to_string())
-        });
-        let mut changes = match proxy.receive_signal("ActiveChanged").await {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        while let Some(msg) = changes.next().await {
-            let Ok((active,)) = msg.body().deserialize::<(bool,)>() else { continue };
-            self.locked.store(active, Ordering::Relaxed);
-            shared.set_health(|h| {
-                h.emulate = active.then(|| "screen locked: remote input paused".to_string())
-            });
+impl Health {
+    fn set_health(&self, f: impl FnOnce(&mut crate::HealthReport)) {
+        if self.injects.load(Ordering::Acquire) {
+            self.shared.set_health(f);
         }
     }
 }
@@ -446,18 +393,20 @@ static EMULATE_SEQ: AtomicU32 = AtomicU32::new(1);
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    shared: Arc<WaylandShared>,
+    shared: Arc<Health>,
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
     mut cmd_rx: mpsc::Receiver<Command>,
     clip_tx: watch::Sender<Option<ClipSession>>,
     screensaver: Arc<ScreenSaver>,
     abort: Arc<Notify>,
+    shutdown: Arc<AtomicBool>,
 ) {
     {
-        let shared = shared.clone();
+        let inner = shared.shared.clone();
+        let injects = shared.injects.clone();
         let screensaver = screensaver.clone();
-        let _ = tokio::spawn(async move { screensaver.monitor(shared).await });
+        let _ = tokio::spawn(async move { screensaver.monitor(inner, injects).await });
     }
 
     // Survives session death: a session that was entered is re-entered after recreation.
@@ -465,19 +414,33 @@ async fn run(
     let mut clip_retried = false;
     let mut last_recreate = Instant::now() - RECREATE_MIN_INTERVAL;
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let since = last_recreate.elapsed();
         if since < RECREATE_MIN_INTERVAL {
-            tokio::time::sleep((RECREATE_MIN_INTERVAL - since).max(RECREATE_MIN_BACKOFF)).await;
+            tokio::select! {
+                _ = tokio::time::sleep((RECREATE_MIN_INTERVAL - since).max(RECREATE_MIN_BACKOFF)) => {}
+                _ = abort.notified() => {}
+            }
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
         }
         last_recreate = Instant::now();
 
         match establish(&conn, &tokens).await {
             Ok((session, used_token)) => {
+                if shutdown.load(Ordering::Acquire) {
+                    close_session(&conn, &session.session_path).await;
+                    return;
+                }
                 // A restored session that lost the clipboard grant is recreated once
                 // with a fresh prompt (Deskflow's trick).
                 if !session.clipboard_enabled && used_token && !clip_retried {
                     clip_retried = true;
                     tokens.clear(TokenKind::RemoteDesktop);
+                    close_session(&conn, &session.session_path).await;
                     continue;
                 }
                 if !session.clipboard_enabled {
@@ -492,7 +455,7 @@ async fn run(
                     path: session.session_path.clone(),
                     enabled: session.clipboard_enabled,
                 }));
-                let resume = entered.take();
+                let resume = entered;
                 run_session(
                     &shared,
                     &conn,
@@ -508,12 +471,21 @@ async fn run(
                 .await;
                 let _ = clip_tx.send(None);
                 screensaver.uninhibit().await;
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "remote desktop session setup failed");
                 shared.set_health(|h| h.emulate = Some(format!("{err}")));
             }
         }
+    }
+}
+
+async fn close_session(conn: &zbus::Connection, path: &str) {
+    if let Ok(proxy) = portal::session_proxy(conn, path).await {
+        let _ = proxy.call::<_, _, ()>("Close", &()).await;
     }
 }
 
@@ -526,7 +498,7 @@ struct RunState<'a> {
 /// Runs one live session. `resume` re-enters a session that was active when the previous
 /// portal session died.
 async fn run_session(
-    shared: &Arc<WaylandShared>,
+    shared: &Arc<Health>,
     conn: &zbus::Connection,
     mut session: Session,
     cmd_rx: &mut mpsc::Receiver<Command>,
@@ -567,6 +539,8 @@ async fn run_session(
         tokio::select! {
             _ = state.abort.notified() => {
                 *state.entered = None;
+                do_leave(&session, &mut devices, &mut active, state.screensaver);
+                let _ = flush_eis(&session);
                 let _ = session_proxy.call::<_, _, ()>("Close", &()).await;
                 return;
             }
