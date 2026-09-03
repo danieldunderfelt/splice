@@ -54,13 +54,22 @@ struct Devices {
 
 impl Devices {
     fn emit_pointer(&mut self, events: &[InputEvent]) -> Result<()> {
-        self.shared.note_injection();
+        self.note(events);
         emit(&mut self.pointer, events)
     }
 
     fn emit_keyboard(&mut self, events: &[InputEvent]) -> Result<()> {
-        self.shared.note_injection();
+        self.note(events);
         emit(&mut self.keyboard, events)
+    }
+
+    fn note(&self, events: &[InputEvent]) {
+        self.shared.note_injection();
+        for event in events {
+            if event.event_type() == EventType::KEY {
+                self.shared.note_injected_key(u32::from(event.code()), event.value() != 0);
+            }
+        }
     }
 }
 

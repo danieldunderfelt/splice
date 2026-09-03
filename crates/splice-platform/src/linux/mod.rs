@@ -57,12 +57,35 @@ pub struct Shared {
     /// input-remapper) grab our virtual devices and re-emit on their own virtual
     /// devices, and the activity monitor uses this to recognise those echoes.
     last_injection: AtomicU64,
+    /// Recently injected key/button edges (code, pressed, when), newest last.
+    injected_keys: Mutex<std::collections::VecDeque<(u32, bool, Instant)>>,
 }
+
+const INJECTED_KEYS_KEPT: usize = 64;
 
 impl Shared {
     pub fn note_injection(&self) {
         self.last_injection
             .store(self.epoch.elapsed().as_micros() as u64, Ordering::Release);
+    }
+
+    pub fn note_injected_key(&self, code: u32, pressed: bool) {
+        let mut keys = self.injected_keys.lock();
+        if keys.len() == INJECTED_KEYS_KEPT {
+            keys.pop_front();
+        }
+        keys.push_back((code, pressed, Instant::now()));
+    }
+
+    /// Whether `code` with this state was injected within `window`.
+    pub fn injected_recently(&self, code: u32, pressed: bool, window: std::time::Duration) -> bool {
+        let now = Instant::now();
+        self.injected_keys
+            .lock()
+            .iter()
+            .rev()
+            .take_while(|(_, _, at)| now.duration_since(*at) <= window)
+            .any(|(c, p, _)| *c == code && *p == pressed)
     }
 
     /// Time since the last uinput write, or None if nothing was ever injected.
@@ -146,6 +169,7 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         displays: RwLock::new(Vec::new()),
         epoch: Instant::now(),
         last_injection: AtomicU64::new(0),
+        injected_keys: Mutex::new(std::collections::VecDeque::with_capacity(INJECTED_KEYS_KEPT)),
     });
 
     let displays = displays::spawn(shared.clone())?;
@@ -160,7 +184,7 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         prefs_rx,
     )
     .await;
-    activity::spawn(shared.clone(), handles.panic.clone(), opts.panic_chord);
+    activity::spawn(shared.clone(), handles.panic.clone(), opts.panic_chord, handles.driven.clone());
 
     if handles.capture_unavailable && handles.inject_unavailable {
         return Err(PlatformError::Unavailable(

@@ -61,7 +61,13 @@ keyboard with `KEY_ESC..KEY_UNKNOWN` (1..240) and nothing else.
   that arrive within 150 ms of one of our own uinput writes. Physical keyboards on such
   machines are only visible through the remapper's device anyway (the grab hides them),
   so a real keystroke that coincides with injected input merely delays the source claim.
-  `cargo run -p splice-platform --example uinput_echo` reproduces the check.
+  keyd's virtual keyboard also has EV_REP, so the kernel autorepeats any injected key held
+  longer than 250 ms on keyd's device, long after the injection: autorepeat events are
+  never counted as activity (the press already was), and a software-device key whose code
+  and state we injected within the last second is treated as an echo as well.
+  `cargo run -p splice-platform --example uinput_echo` reproduces the basic check and
+  `cargo run -p splice-core --example real_target` drives this machine's real platform
+  from an in-process mock peer through keys held up to 1.5 s, motion, clicks and scroll.
 - The kernel filters an ABS value equal to the previous one (and the SYN with it), so
   placing the pointer at the last written cell would be a no-op: `enter` takes a one-unit
   detour when needed. Only whole detents are emitted for the wheel, from an f64

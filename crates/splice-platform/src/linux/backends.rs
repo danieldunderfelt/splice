@@ -308,6 +308,7 @@ pub struct Handles {
     pub emulate: Arc<dyn Emulate>,
     pub clipboard: Arc<dyn Clipboard>,
     pub panic: PanicRelease,
+    pub driven: Arc<Driven>,
     pub capture_unavailable: bool,
     pub inject_unavailable: bool,
 }
@@ -584,7 +585,7 @@ pub async fn spawn(
         capture: capture.clone(),
         emulate: emulate.clone(),
         clipboard: clipboard.clone(),
-        driven,
+        driven: driven.clone(),
         running: Running {
             capture: None,
             portal_rd: None,
@@ -608,6 +609,7 @@ pub async fn spawn(
         emulate,
         clipboard,
         panic,
+        driven: driven.clone(),
         capture_unavailable: plan.capture.is_none(),
         inject_unavailable: plan.inject.is_none(),
     };

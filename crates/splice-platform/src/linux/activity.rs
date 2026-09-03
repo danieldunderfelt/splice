@@ -20,6 +20,7 @@ use futures::StreamExt;
 use inotify::{EventMask, EventOwned, EventStream, Inotify, WatchMask};
 use tokio::sync::mpsc;
 
+use super::backends::Driven;
 use super::{PanicRelease, Shared, VIRTUAL_DEVICE_PREFIX};
 use crate::PlatformEvent;
 
@@ -33,9 +34,12 @@ const HOTPLUG_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Remapper re-emission latency is single-digit milliseconds; the window is generous
 /// because a missed physical event only delays a source claim to the next one.
 const ECHO_WINDOW: Duration = Duration::from_millis(150);
+/// A remapper may hold an injected key back (layer or overload resolution) before
+/// re-emitting it; the same code with the same state within this window is an echo.
+const ECHO_CODE_WINDOW: Duration = Duration::from_secs(1);
 
-pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
-    let _ = tokio::spawn(run(shared, panic, panic_chord));
+pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>, driven: Arc<Driven>) {
+    let _ = tokio::spawn(run(shared, panic, panic_chord, driven));
 }
 
 #[derive(Debug)]
@@ -48,7 +52,7 @@ enum PhysicalEvent {
     Opened,
 }
 
-async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
+async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>, driven: Arc<Driven>) {
     let (activity_tx, mut activity_rx) = mpsc::channel::<PhysicalEvent>(64);
     let eacces_reported = Arc::new(AtomicBool::new(false));
     let mut known: HashSet<PathBuf> = HashSet::new();
@@ -121,7 +125,11 @@ async fn run(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>) {
                 let now = Instant::now();
                 if now.duration_since(last_emit) >= DEBOUNCE {
                     last_emit = now;
-                    tracing::debug!(device = ?last_device, "physical activity");
+                    if driven.suppressed() {
+                        tracing::info!(device = ?last_device, "physical activity while driven; taking over");
+                    } else {
+                        tracing::debug!(device = ?last_device, "physical activity");
+                    }
                     shared.emit(PlatformEvent::PhysicalActivity);
                 }
             }
@@ -260,13 +268,18 @@ fn spawn_reader(
                 Ok(ev) => {
                     if software
                         && matches!(ev.event_type(), EventType::KEY | EventType::RELATIVE)
-                        && shared.since_injection().is_some_and(|since| since < ECHO_WINDOW)
+                        && (shared.since_injection().is_some_and(|since| since < ECHO_WINDOW)
+                            || (ev.event_type() == EventType::KEY
+                                && shared.injected_recently(
+                                    ev.code() as u32,
+                                    ev.value() != 0,
+                                    ECHO_CODE_WINDOW,
+                                )))
                     {
                         continue;
                     }
                     match ev.event_type() {
                         EventType::KEY => {
-                            // value 2 is autorepeat: activity, but not a state transition.
                             let event = match ev.value() {
                                 0 => Some(PhysicalEvent::Key {
                                     device: path.clone(),
@@ -278,7 +291,7 @@ fn spawn_reader(
                                     code: ev.code() as u32,
                                     pressed: true,
                                 }),
-                                _ => Some(PhysicalEvent::Activity(path.clone())),
+                                _ => None,
                             };
                             if let Some(event) = event {
                                 if activity.send(event).await.is_err() {
