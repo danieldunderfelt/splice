@@ -78,6 +78,16 @@ the macOS 26 SDK on this machine or live-tested. Follow it.
   the engine thread stops heartbeating. Re-associate before any panic path exits.
 - Warp deltas: the next real event's delta after a warp INCLUDES the warp displacement —
   track lastWarp and subtract (only relevant on re-entry).
+- `CGDisplayHideCursor` is a per-process counter. Any path that hides more often than it
+  shows leaves the pointer working but INVISIBLE after the session ends (hover and scroll
+  react, nothing is drawn). Track the depth and unwind all of it on every restore path
+  rather than trusting call sites to stay balanced.
+- The system can re-associate the pointer behind our back (display sleep/wake, another
+  process calling associate(true), space switches); detect it from event locations
+  drifting off the frozen point. Anchor on the first location reported ~250 ms AFTER
+  `associate(false)`, never on a position sampled before it: the cursor keeps moving
+  between the edge hit and the freeze, and events already in flight still carry
+  pre-freeze locations. Anchoring early produced false re-freezes on every crossing.
 
 ## Coordinates & displays
 
