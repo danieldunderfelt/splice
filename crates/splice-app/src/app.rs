@@ -5,7 +5,7 @@
 use crate::drag::CardDrag;
 use crate::runtime::{BootStatus, Controller};
 use crate::theme;
-use crate::tray::{Tray, TrayAction};
+use crate::tray::{Tray, AppAction};
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Layout, Margin, Pos2, Rect,
     RichText, Sense, Shadow, Shape, Stroke, StrokeKind, UiBuilder, Vec2, pos2, vec2,
@@ -34,7 +34,7 @@ const VIEW_TAU: f32 = 0.12;
 pub struct SpliceApp {
     ctrl: Controller,
     tray: Tray,
-    tray_actions: mpsc::Receiver<TrayAction>,
+    actions: mpsc::Receiver<AppAction>,
     drag: Option<CardDrag>,
     /// The canvas→screen fit as currently shown; eases toward the fit of what is painted.
     view: Option<CanvasFit>,
@@ -43,23 +43,27 @@ pub struct SpliceApp {
     /// SPLICE_UI_SCREENSHOT=<path>: capture one frame to PNG (preview smoke runs).
     screenshot_to: Option<std::path::PathBuf>,
     screenshot_requested: bool,
+    #[cfg(target_os = "linux")]
+    autostart: bool,
 }
 
 impl SpliceApp {
     pub fn new(
         ctrl: Controller,
         tray: Tray,
-        tray_actions: mpsc::Receiver<TrayAction>,
+        actions: mpsc::Receiver<AppAction>,
         exit_after: Option<f64>,
     ) -> Self {
         SpliceApp {
             ctrl,
             tray,
-            tray_actions,
+            actions,
             drag: None,
             view: None,
             allow_close: false,
             exit_at: exit_after.map(|secs| Instant::now() + Duration::from_secs_f64(secs)),
+            #[cfg(target_os = "linux")]
+            autostart: crate::autostart::is_enabled(),
             screenshot_to: std::env::var_os("SPLICE_UI_SCREENSHOT").map(Into::into),
             screenshot_requested: false,
         }
@@ -160,6 +164,13 @@ impl SpliceApp {
                             banner(ui, theme::WARN, &hint);
                             ui.add_space(8.0);
                         }
+                        #[cfg(target_os = "linux")]
+                        {
+                            self.startup_section(ui);
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(10.0);
+                        }
 
                         self.sensitivity_section(ui, state);
                         ui.add_space(14.0);
@@ -209,6 +220,36 @@ impl SpliceApp {
                 self.ctrl.send(Command::SetSensitivity { link_key, factor });
             }
             ui.add_space(4.0);
+        }
+    }
+
+    /// Linux: autostart entry for the service plus a way to stop it without a tray.
+    #[cfg(target_os = "linux")]
+    fn startup_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Startup").size(15.5).strong());
+        ui.add_space(6.0);
+        let mut autostart = self.autostart;
+        if ui.checkbox(&mut autostart, "Start Splice at login").changed() {
+            match crate::autostart::set_enabled(autostart) {
+                Ok(()) => self.autostart = autostart,
+                Err(err) => tracing::warn!(error = %err, "cannot update the autostart entry"),
+            }
+        }
+        ui.label(
+            RichText::new("Closing this window keeps Splice running in the background.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(8.0);
+        let quit = egui::Button::new(RichText::new("Quit Splice").color(theme::ERR));
+        if ui
+            .add(quit)
+            .on_hover_text("Release all captured input and stop the Splice service")
+            .clicked()
+        {
+            self.ctrl.quit();
+            self.allow_close = true;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -496,28 +537,39 @@ impl eframe::App for SpliceApp {
             }
         }
 
-        // Window close = hide; the app keeps running. Tray Open re-shows, Quit exits.
+        // macOS: window close = hide; the app keeps running and the menu bar Open
+        // re-shows it. Linux: the window is its own process, so closing it is real and
+        // the service keeps running.
+        #[cfg(not(target_os = "linux"))]
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        if self.ctrl.take_focus_request() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.ctrl.take_quit_request() {
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         self.tray.poll();
         self.tray.sync(&self.ctrl.state());
-        while let Ok(action) = self.tray_actions.try_recv() {
+        while let Ok(action) = self.actions.try_recv() {
             match action {
-                TrayAction::Open => {
+                AppAction::Open => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                TrayAction::Quit => {
-                    self.ctrl.send(Command::Panic);
+                AppAction::Quit => {
+                    self.ctrl.quit();
                     self.allow_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                TrayAction::DisconnectAll => self.ctrl.send(Command::Panic),
-                TrayAction::ToggleMachine(id) => {
+                AppAction::DisconnectAll => self.ctrl.send(Command::Panic),
+                AppAction::ToggleMachine(id) => {
                     let current = self
                         .ctrl
                         .state()

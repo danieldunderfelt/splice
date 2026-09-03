@@ -3,6 +3,10 @@ name = "splice-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Software KVM: share one keyboard and mouse across your Tailscale machines"
+homepage = "https://github.com/danieldunderfelt/splice"
+repository = "https://github.com/danieldunderfelt/splice"
+authors = ["Daniel Dunderfelt <dev@developsuperpowers.com>"]
 
 [[bin]]
 name = "splice"
@@ -20,11 +24,35 @@ tracing-subscriber = { workspace = true }
 eframe = { workspace = true, features = ["glow"] }
 egui = { workspace = true }
 parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { workspace = true }
 libc = "0.2"
+
+[package.metadata.deb]
+name = "splice"
+section = "utils"
+priority = "optional"
+depends = "libc6, libgcc-s1, libwayland-client0, libxkbcommon0"
+recommends = "tailscale, libvulkan1, mesa-vulkan-drivers, xdg-desktop-portal-gnome | xdg-desktop-portal-kde"
+maintainer-scripts = "../../packaging/deb"
+extended-description = """\
+Splice shares one keyboard and mouse between the computers on your Tailscale
+network. Move the pointer through a screen edge and the keyboard follows.
+Clipboard contents are shared as well. On Linux it uses the Wayland
+Input Capture and Remote Desktop portals, so it needs GNOME or KDE Plasma."""
+assets = [
+    ["target/release/splice", "usr/bin/", "755"],
+    ["../../packaging/linux/io.github.danieldunderfelt.Splice.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/io.github.danieldunderfelt.Splice.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../packaging/linux/app-splice.service", "usr/lib/systemd/user/", "644"],
+    ["../../packaging/linux/70-splice.rules", "usr/lib/udev/rules.d/", "644"],
+    ["../../README.md", "usr/share/doc/splice/", "644"],
+    ["../../docs/linux-setup.md", "usr/share/doc/splice/", "644"],
+]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { workspace = true }

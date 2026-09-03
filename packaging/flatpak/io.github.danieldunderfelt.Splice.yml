@@ -1,0 +1,45 @@
+# Build: packaging/flatpak/generate-sources.sh, then
+#   flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.danieldunderfelt.Splice.yml
+app-id: io.github.danieldunderfelt.Splice
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: splice
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --device=dri
+  # Physical-activity monitor reads /dev/input (read-only).
+  - --device=input
+  # Tailscale LocalAPI socket for peer discovery.
+  - --filesystem=/run/tailscale:ro
+  # "Start at login" writes an XDG autostart entry.
+  - --filesystem=xdg-config/autostart:create
+  # Optional tray icon; harmless when no StatusNotifier host exists.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Keep-awake while a remote machine drives this one.
+  - --talk-name=org.freedesktop.ScreenSaver
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/splice/cargo
+modules:
+  - name: splice
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked -p splice-app
+      - install -Dm0755 target/release/splice /app/bin/splice
+      - install -Dm0644 packaging/linux/io.github.danieldunderfelt.Splice.desktop -t /app/share/applications/
+      - install -Dm0644 packaging/linux/io.github.danieldunderfelt.Splice.metainfo.xml -t /app/share/metainfo/
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - build-dir
+          - .flatpak-builder
+      - cargo-sources.json

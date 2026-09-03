@@ -1,0 +1,5 @@
+# Splice software KVM: grant the active seat's user read access to input devices so the
+# physical-activity monitor can tell which machine last received real input. The
+# uaccess tag makes systemd-logind manage an ACL that follows the active session, so no
+# group membership or re-login is needed and access ends when the session is inactive.
+SUBSYSTEM=="input", KERNEL=="event*", TAG+="uaccess"

@@ -1,9 +1,10 @@
 [Unit]
 Description=Splice software KVM
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/splice-launch
+ExecStart=/usr/bin/splice service
 Restart=on-failure
 RestartSec=3
 

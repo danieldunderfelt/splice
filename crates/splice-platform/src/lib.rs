@@ -145,7 +145,7 @@ pub enum PlatformEvent {
 }
 
 /// Per-concern health status for the UI. `None` = OK.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HealthReport {
     /// macOS: Accessibility missing / tap dead. Linux: capture portal problem.
     pub capture: Option<String>,

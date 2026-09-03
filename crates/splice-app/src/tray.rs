@@ -2,20 +2,25 @@
 //!
 //! macOS: `tray-icon` (no default features) + its muda menu API, created on the main
 //! thread inside the eframe creation callback; menu events are polled from the UI loop.
-//! Linux: `ksni` StatusNotifierItem spawned on the background tokio runtime; if no
-//! StatusNotifierWatcher owns `org.kde.StatusNotifierWatcher`, spawn fails and we surface
-//! a UI hint instead of failing the app.
+//! Linux: `ksni` StatusNotifierItem owned by the `splice service` process (service.rs),
+//! so it outlives windows. If no StatusNotifierWatcher owns
+//! `org.kde.StatusNotifierWatcher`, spawn fails and the window shows a hint instead.
 
-use crate::runtime::Controller;
+#[cfg(not(target_os = "linux"))]
 use parking_lot::Mutex;
 use splice_core::UiState;
 use splice_core::ui_state::{UiConnection, UiMachine};
 use splice_proto::MachineId;
-use std::sync::{Arc, mpsc};
+#[cfg(not(target_os = "linux"))]
+use std::sync::Arc;
+use std::sync::mpsc;
 
-/// Actions requested from the tray menu, drained by the app every frame.
+use crate::runtime::Controller;
+
+/// Actions requested from outside the UI loop (tray menu, service), drained by the app
+/// every frame.
 #[derive(Clone, Debug)]
-pub enum TrayAction {
+pub enum AppAction {
     Open,
     Quit,
     ToggleMachine(MachineId),
@@ -23,50 +28,57 @@ pub enum TrayAction {
 }
 
 pub struct Tray {
+    #[cfg(not(target_os = "linux"))]
     hint: Arc<Mutex<Option<String>>>,
+    #[cfg(target_os = "linux")]
+    ctrl: Controller,
     #[cfg(target_os = "macos")]
     macos: Option<macos::MacTray>,
-    #[cfg(target_os = "linux")]
-    linux: Option<linux::LinuxTray>,
 }
 
 impl Tray {
     /// Create the platform tray. Never fails hard: problems become `hint()` text.
-    pub fn new(ctrl: &Controller) -> (Self, mpsc::Receiver<TrayAction>) {
-        let (tx, rx) = mpsc::channel();
-        let hint = Arc::new(Mutex::new(None));
-
-        #[cfg(target_os = "macos")]
-        let macos = match macos::MacTray::new(ctrl, tx.clone()) {
-            Ok(tray) => Some(tray),
-            Err(err) => {
-                tracing::warn!("tray unavailable: {err}");
-                *hint.lock() = Some(format!("menu bar icon unavailable: {err}"));
-                None
-            }
-        };
+    #[cfg_attr(target_os = "linux", allow(unused_variables))]
+    pub fn new(ctrl: &Controller, tx: mpsc::Sender<AppAction>) -> Self {
         #[cfg(target_os = "linux")]
-        let linux = linux::spawn(ctrl, tx.clone(), hint.clone());
-
-        #[allow(unused_mut)]
-        let mut tray = Tray {
-            hint,
-            #[cfg(target_os = "macos")]
-            macos,
-            #[cfg(target_os = "linux")]
-            linux,
-        };
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = tx;
-            *tray.hint.lock() = Some("system tray unsupported on this OS".into());
+            Tray { ctrl: ctrl.clone() }
         }
-        (tray, rx)
+        #[cfg(not(target_os = "linux"))]
+        {
+            let hint = Arc::new(Mutex::new(None));
+            #[cfg(target_os = "macos")]
+            let macos = match macos::MacTray::new(ctrl, tx.clone()) {
+                Ok(tray) => Some(tray),
+                Err(err) => {
+                    tracing::warn!("tray unavailable: {err}");
+                    *hint.lock() = Some(format!("menu bar icon unavailable: {err}"));
+                    None
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = tx;
+                *hint.lock() = Some("system tray unsupported on this OS".into());
+            }
+            Tray {
+                hint,
+                #[cfg(target_os = "macos")]
+                macos,
+            }
+        }
     }
 
     /// A user-visible tray problem (rendered in the side panel), if any.
     pub fn hint(&self) -> Option<String> {
-        self.hint.lock().clone()
+        #[cfg(target_os = "linux")]
+        {
+            self.ctrl.tray_hint()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.hint.lock().clone()
+        }
     }
 
     /// Drain pending native menu events into the action channel (macOS). Per-frame.
@@ -84,15 +96,10 @@ impl Tray {
         if let Some(macos) = &self.macos {
             macos.sync(state);
         }
-        #[cfg(target_os = "linux")]
-        if let Some(linux) = &self.linux {
-            linux.sync(state);
-        }
     }
 }
 
 /// Tray menu label for one machine: hostname plus a compact connection suffix.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn machine_menu_label(machine: &UiMachine) -> String {
     let suffix = match &machine.connection {
         UiConnection::SelfMachine => return machine.hostname.clone(),
@@ -106,7 +113,6 @@ fn machine_menu_label(machine: &UiMachine) -> String {
 
 /// Generated tray icon (no asset files): accent rounded square with two overlapping
 /// white "display" rectangles. Returns RGBA8.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn icon_rgba(size: u32) -> Vec<u8> {
     let s = size as f32;
     let mut out = vec![0u8; (size * size * 4) as usize];
@@ -166,7 +172,7 @@ pub fn set_activation_policy_accessory() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{TrayAction, icon_rgba, machine_menu_label};
+    use super::{AppAction, icon_rgba, machine_menu_label};
     use crate::runtime::Controller;
     use splice_core::UiState;
     use splice_proto::MachineId;
@@ -182,12 +188,12 @@ mod macos {
 
     pub struct MacTray {
         tray: tray_icon::TrayIcon,
-        actions: mpsc::Sender<TrayAction>,
+        actions: mpsc::Sender<AppAction>,
         menu_sig: Mutex<u64>,
     }
 
     impl MacTray {
-        pub fn new(ctrl: &Controller, actions: mpsc::Sender<TrayAction>) -> Result<Self, String> {
+        pub fn new(ctrl: &Controller, actions: mpsc::Sender<AppAction>) -> Result<Self, String> {
             let icon = tray_icon::Icon::from_rgba(icon_rgba(64), 64, 64)
                 .map_err(|err| format!("icon: {err}"))?;
             let tray = tray_icon::TrayIconBuilder::new()
@@ -209,12 +215,12 @@ mod macos {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 let id = event.id().0.clone();
                 let action = match id.as_str() {
-                    OPEN_ID => Some(TrayAction::Open),
-                    DISCONNECT_ID => Some(TrayAction::DisconnectAll),
-                    QUIT_ID => Some(TrayAction::Quit),
+                    OPEN_ID => Some(AppAction::Open),
+                    DISCONNECT_ID => Some(AppAction::DisconnectAll),
+                    QUIT_ID => Some(AppAction::Quit),
                     _ => id
                         .strip_prefix(MACHINE_PREFIX)
-                        .map(|mid| TrayAction::ToggleMachine(MachineId(mid.to_owned()))),
+                        .map(|mid| AppAction::ToggleMachine(MachineId(mid.to_owned()))),
                 };
                 if let Some(action) = action {
                     let _ = self.actions.send(action);
@@ -269,53 +275,55 @@ mod macos {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
-    use super::{TrayAction, icon_rgba, machine_menu_label};
-    use crate::runtime::Controller;
+pub mod linux {
+    use super::{AppAction, icon_rgba, machine_menu_label};
     use parking_lot::{Mutex, RwLock};
     use splice_core::UiState;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc;
 
     pub struct LinuxTray {
         slot: Arc<Mutex<Option<ksni::Handle<SpliceTray>>>>,
         tokio: tokio::runtime::Handle,
         menu_sig: Mutex<u64>,
+        available: Arc<AtomicBool>,
     }
 
-    /// Spawn the StatusNotifierItem on the background runtime. A missing
-    /// StatusNotifierWatcher makes ksni's spawn fail; that becomes a UI hint.
+    /// Spawn the StatusNotifierItem on the runtime. A missing StatusNotifierWatcher makes
+    /// ksni's spawn fail; `available()` then stays false and windows show a hint.
     pub fn spawn(
-        ctrl: &Controller,
-        actions: mpsc::Sender<TrayAction>,
-        hint: Arc<Mutex<Option<String>>>,
-    ) -> Option<LinuxTray> {
-        let tokio = ctrl.tokio.clone()?;
-        let tray = SpliceTray {
-            state: ctrl.shared_state(),
-            actions,
-        };
+        state: Arc<RwLock<UiState>>,
+        actions: mpsc::UnboundedSender<AppAction>,
+        tokio: tokio::runtime::Handle,
+    ) -> LinuxTray {
+        let tray = SpliceTray { state, actions };
         let slot: Arc<Mutex<Option<ksni::Handle<SpliceTray>>>> = Arc::new(Mutex::new(None));
+        let available = Arc::new(AtomicBool::new(false));
         let task_slot = slot.clone();
+        let task_available = available.clone();
         tokio.spawn(async move {
             use ksni::TrayMethods;
             match tray.spawn().await {
                 Ok(handle) => {
                     *task_slot.lock() = Some(handle);
+                    task_available.store(true, Ordering::Release);
                 }
                 Err(err) => {
-                    tracing::warn!("ksni tray failed: {err}");
-                    *hint.lock() = Some(format!(
-                        "no system tray found ({err}); on GNOME enable the AppIndicator extension"
-                    ));
+                    tracing::info!("no status notifier host; running without a tray icon: {err}");
                 }
             }
         });
-        Some(LinuxTray { slot, tokio, menu_sig: Mutex::new(0) })
+        LinuxTray { slot, tokio, menu_sig: Mutex::new(0), available }
     }
 
     impl LinuxTray {
+        pub fn available(&self) -> bool {
+            self.available.load(Ordering::Acquire)
+        }
+
         /// Menus are generated from state on demand; nudge ksni to re-read them.
         pub fn sync(&self, state: &UiState) {
             let Some(handle) = self.slot.lock().clone() else {
@@ -343,9 +351,8 @@ mod linux {
 
     struct SpliceTray {
         state: Arc<RwLock<UiState>>,
-        actions: mpsc::Sender<TrayAction>,
+        actions: mpsc::UnboundedSender<AppAction>,
     }
-
     impl ksni::Tray for SpliceTray {
         fn id(&self) -> String {
             "splice".into()
@@ -376,7 +383,7 @@ mod linux {
                 StandardItem {
                     label: "Open Splice".into(),
                     activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.actions.send(TrayAction::Open);
+                        let _ = tray.actions.send(AppAction::Open);
                     }),
                     ..Default::default()
                 }
@@ -390,7 +397,7 @@ mod linux {
                         label: machine_menu_label(machine),
                         checked: machine.enabled,
                         activate: Box::new(move |tray: &mut Self| {
-                            let _ = tray.actions.send(TrayAction::ToggleMachine(id.clone()));
+                            let _ = tray.actions.send(AppAction::ToggleMachine(id.clone()));
                         }),
                         ..Default::default()
                     }
@@ -402,7 +409,7 @@ mod linux {
                 StandardItem {
                     label: "Disconnect all".into(),
                     activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.actions.send(TrayAction::DisconnectAll);
+                        let _ = tray.actions.send(AppAction::DisconnectAll);
                     }),
                     ..Default::default()
                 }
@@ -411,7 +418,7 @@ mod linux {
                 StandardItem {
                     label: "Quit Splice".into(),
                     activate: Box::new(|tray: &mut Self| {
-                        let _ = tray.actions.send(TrayAction::Quit);
+                        let _ = tray.actions.send(AppAction::Quit);
                     }),
                     ..Default::default()
                 }

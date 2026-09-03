@@ -2,8 +2,12 @@
 //!
 //! Load-bearing rules from docs/research/wayland-input.md:
 //! - NEVER call `Disable()` (mutter bug #3908). GNOME also rejects barrier changes on an
-//!   enabled session, so start disabled when no edges exist and recreate only when a real
-//!   barrier/topology change cannot be applied to the current disabled session.
+//!   enabled session, and GNOME 50's backend (InputCapture v1) shows the consent dialog
+//!   on every CreateSession. The session is therefore armed exactly once, with barriers
+//!   on the whole outer boundary of the zone union, and never touched again for peer or
+//!   layout changes: `set_edges` only updates the in-memory map that `Activated` is
+//!   resolved against, and a hit on a boundary with no edge is released immediately.
+//!   Only ZonesChanged (display hotplug) recreates the session.
 //! - Restore tokens are single-use; the replacement is persisted on every Start.
 //! - Capture activates only when the cursor hits a barrier; there is no way to force it,
 //!   so `begin_capture` is a no-op and forwarding starts at `Activated`.
@@ -32,8 +36,6 @@ const CAP_KEYBOARD: u32 = 1;
 const CAP_POINTER: u32 = 2;
 /// persist_mode: persist until explicitly revoked.
 const PERSIST: u32 = 2;
-/// set_edges calls are batched; barriers are applied after this quiet period.
-const EDGE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Session re-establishment: at least 1 s of backoff, at most one recreation per 5 s
 /// (lan-mouse's 34-reconnects-per-2h fd leak is the failure mode this prevents).
 const RECREATE_MIN_BACKOFF: Duration = Duration::from_secs(1);
@@ -42,7 +44,6 @@ const RECREATE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const BTN_LEFT: u32 = 0x110;
 
 enum Command {
-    ApplyEdges(Vec<EdgeSpec>),
     EndCapture { warp_to: Option<Vec2> },
     Panic,
 }
@@ -63,23 +64,30 @@ impl PanicRelease {
     }
 }
 
+/// The engine's edge map, consulted on every `Activated`; `changed` wakes the session
+/// bootstrap once the first edge appears.
+#[derive(Default)]
+struct EdgeMap {
+    edges: RwLock<Vec<EdgeSpec>>,
+    changed: Notify,
+}
+
 pub struct WaylandCapture {
-    edges: Arc<RwLock<Vec<EdgeSpec>>>,
-    edges_dirty: Arc<Notify>,
+    map: Arc<EdgeMap>,
     cmd: mpsc::UnboundedSender<Command>,
 }
 
 #[async_trait::async_trait]
 impl Capture for WaylandCapture {
     async fn set_edges(&self, edges: Vec<EdgeSpec>) -> Result<()> {
-        let mut current = self.edges.write();
+        let mut current = self.map.edges.write();
         if *current == edges {
             return Ok(());
         }
-        tracing::info!(edges = ?edges, "capture barrier geometry changed");
+        tracing::info!(edges = ?edges, "capture edge map changed");
         *current = edges;
         drop(current);
-        self.edges_dirty.notify_one();
+        self.map.changed.notify_one();
         Ok(())
     }
 
@@ -99,32 +107,14 @@ pub fn create(
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
 ) -> (Arc<WaylandCapture>, PanicRelease) {
-    let edges = Arc::new(RwLock::new(Vec::new()));
-    let edges_dirty = Arc::new(Notify::new());
+    let map = Arc::new(EdgeMap::default());
     let (cmd, cmd_rx) = mpsc::unbounded_channel();
     let active = Arc::new(AtomicBool::new(false));
-
-    {
-        let edges = edges.clone();
-        let edges_dirty = edges_dirty.clone();
-        let cmd = cmd.clone();
-        let _ = tokio::spawn(async move {
-            loop {
-                edges_dirty.notified().await;
-                // Trailing debounce: keep waiting while more edge updates arrive.
-                while tokio::time::timeout(EDGE_DEBOUNCE, edges_dirty.notified())
-                    .await
-                    .is_ok()
-                {}
-                let _ = cmd.send(Command::ApplyEdges(edges.read().clone()));
-            }
-        });
-    }
 
     // reis's EiConvertEventStream is not Send (its converter holds boxed FnOnce
     // callbacks), so the portal/reis pump cannot be tokio::spawn'd. It runs on a
     // dedicated current-thread runtime where block_on needs no Send bound.
-    let edges_handle = edges.clone();
+    let map_for_thread = map.clone();
     let active_for_thread = active.clone();
     let _ = std::thread::Builder::new()
         .name("splice-capture".into())
@@ -144,14 +134,14 @@ pub fn create(
                 tokens,
                 conn,
                 panic_chord,
-                edges,
+                map_for_thread,
                 active_for_thread,
                 cmd_rx,
             ));
         });
 
     (
-        Arc::new(WaylandCapture { edges: edges_handle, edges_dirty, cmd: cmd.clone() }),
+        Arc::new(WaylandCapture { map, cmd: cmd.clone() }),
         PanicRelease { cmd, active },
     )
 }
@@ -195,33 +185,118 @@ fn clamp_to_zones(zones: &[Zone], x: f64, y: f64) -> (f64, f64) {
     best.map(|(_, cx, cy)| (cx, cy)).unwrap_or((x, y))
 }
 
-/// EdgeSpec → portal barrier geometry. `at` is the boundary coordinate (origin for
-/// left/top edges, origin+extent for right/bottom) and is used verbatim; `from..to` is a
-/// half-open span, so the inclusive barrier end coordinate is `to - 1`.
-fn edge_barrier(edge: &EdgeSpec) -> Option<(i32, i32, i32, i32)> {
-    if edge.to <= edge.from {
-        return None;
-    }
-    let (lo, hi) = (edge.from, edge.to - 1);
-    Some(match edge.side {
-        EdgeSide::Left | EdgeSide::Right => (edge.at, lo, edge.at, hi),
-        EdgeSide::Top | EdgeSide::Bottom => (lo, edge.at, hi, edge.at),
-    })
+/// One armed pointer barrier: an outer boundary segment of the zone union. Portal
+/// barrier ids are 1-based indexes into the session's barrier list. `from..to` is a
+/// half-open span along the edge; `at` is the boundary coordinate on the crossing axis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Barrier {
+    side: EdgeSide,
+    at: i32,
+    from: i32,
+    to: i32,
 }
 
-/// KDE sometimes reports barrier_id 0 on Activated: fall back to the armed edge with the
-/// smallest point-to-segment distance from the reported cursor position.
-fn nearest_edge(edges: &[EdgeSpec], x: f64, y: f64) -> Option<EdgeSpec> {
-    let dist = |e: &EdgeSpec| {
-        let (cross, along) = match e.side {
-            EdgeSide::Left | EdgeSide::Right => (x, y),
-            EdgeSide::Top | EdgeSide::Bottom => (y, x),
+impl Barrier {
+    /// Portal geometry: inclusive pixel endpoints, `at` used verbatim (origin for
+    /// left/top, origin+extent for right/bottom).
+    fn position(&self) -> (i32, i32, i32, i32) {
+        let (lo, hi) = (self.from, self.to - 1);
+        match self.side {
+            EdgeSide::Left | EdgeSide::Right => (self.at, lo, self.at, hi),
+            EdgeSide::Top | EdgeSide::Bottom => (lo, self.at, hi, self.at),
+        }
+    }
+
+    fn along(&self, x: f64, y: f64) -> f64 {
+        match self.side {
+            EdgeSide::Left | EdgeSide::Right => y,
+            EdgeSide::Top | EdgeSide::Bottom => x,
+        }
+    }
+
+    fn distance(&self, x: f64, y: f64) -> f64 {
+        let cross = match self.side {
+            EdgeSide::Left | EdgeSide::Right => x,
+            EdgeSide::Top | EdgeSide::Bottom => y,
         };
-        let hi = (e.to - 1).max(e.from) as f64;
-        let clamped = along.clamp(e.from as f64, hi);
-        (cross - e.at as f64).abs() + (along - clamped).abs()
-    };
-    edges.iter().min_by(|a, b| dist(a).total_cmp(&dist(b))).cloned()
+        let along = self.along(x, y);
+        let clamped = along.clamp(self.from as f64, (self.to - 1).max(self.from) as f64);
+        (cross - self.at as f64).abs() + (along - clamped).abs()
+    }
+}
+
+/// The outer boundary of the zone union, split wherever another zone is flush against a
+/// side. Compositors deny interior barriers, so these segments are exactly the set that
+/// can ever be armed; arming all of them up front means peer changes never touch the
+/// portal session.
+fn outer_barriers(zones: &[Zone]) -> Vec<Barrier> {
+    let mut barriers = Vec::new();
+    for (i, z) in zones.iter().enumerate() {
+        let (x0, y0, x1, y1) = (z.x, z.y, z.x + z.w as i32, z.y + z.h as i32);
+        let sides = [
+            (EdgeSide::Left, x0, y0, y1),
+            (EdgeSide::Right, x1, y0, y1),
+            (EdgeSide::Top, y0, x0, x1),
+            (EdgeSide::Bottom, y1, x0, x1),
+        ];
+        for (side, at, from, to) in sides {
+            let mut spans = vec![(from, to)];
+            for o in zones.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o) {
+                let (ox0, oy0, ox1, oy1) = (o.x, o.y, o.x + o.w as i32, o.y + o.h as i32);
+                let (flush, lo, hi) = match side {
+                    EdgeSide::Left => (ox1 == at, oy0, oy1),
+                    EdgeSide::Right => (ox0 == at, oy0, oy1),
+                    EdgeSide::Top => (oy1 == at, ox0, ox1),
+                    EdgeSide::Bottom => (oy0 == at, ox0, ox1),
+                };
+                if flush {
+                    spans = spans
+                        .into_iter()
+                        .flat_map(|span| subtract_span(span, (lo, hi)))
+                        .collect();
+                }
+            }
+            barriers.extend(
+                spans
+                    .into_iter()
+                    .filter(|(a, b)| b > a)
+                    .map(|(from, to)| Barrier { side, at, from, to }),
+            );
+        }
+    }
+    barriers
+}
+
+fn subtract_span((a, b): (i32, i32), (lo, hi): (i32, i32)) -> Vec<(i32, i32)> {
+    if hi <= a || lo >= b {
+        return vec![(a, b)];
+    }
+    let mut rest = Vec::new();
+    if lo > a {
+        rest.push((a, lo));
+    }
+    if hi < b {
+        rest.push((hi, b));
+    }
+    rest
+}
+
+/// KDE sometimes reports barrier_id 0 on Activated: fall back to the armed barrier with
+/// the smallest point-to-segment distance from the reported cursor position.
+fn nearest_barrier(barriers: &[Barrier], x: f64, y: f64) -> Option<&Barrier> {
+    barriers
+        .iter()
+        .min_by(|a, b| a.distance(x, y).total_cmp(&b.distance(x, y)))
+}
+
+/// The engine edge the cursor crossed: same side as the barrier, spanning the along-axis
+/// position, closest boundary coordinate. None when nothing is mapped there.
+fn edge_for(edges: &[EdgeSpec], barrier: &Barrier, along: f64) -> Option<EdgeSpec> {
+    edges
+        .iter()
+        .filter(|e| e.side == barrier.side && along >= e.from as f64 && along < e.to as f64)
+        .min_by_key(|e| (e.at - barrier.at).abs())
+        .cloned()
 }
 
 struct ActiveCapture {
@@ -236,15 +311,10 @@ struct Session {
     ei_stream: reis::tokio::EiConvertEventStream,
     zones: Vec<Zone>,
     zone_set: u32,
-    enabled: bool,
-    applied_edges: Vec<EdgeSpec>,
+    barriers: Vec<Barrier>,
 }
 
-async fn establish(
-    conn: &zbus::Connection,
-    tokens: &TokenStore,
-    edges: &[EdgeSpec],
-) -> Result<Session> {
+async fn establish(conn: &zbus::Connection, tokens: &TokenStore) -> Result<Session> {
     let ic = portal::proxy(conn, IFACE).await?;
     let version = portal::version(&ic).await;
     let (created, already_started) = if version >= 2 {
@@ -323,6 +393,7 @@ async fn establish(
         .map(|&(w, h, x, y)| Zone { x, y, w, h })
         .collect();
     let zone_set = portal::get::<u32>(&zones_result, "zone_set").unwrap_or(0);
+    tracing::info!(zone_set, zones = ?zones, "input capture zones discovered");
 
     let mut session = Session {
         ic,
@@ -332,66 +403,45 @@ async fn establish(
         ei_stream,
         zones,
         zone_set,
-        enabled: false,
-        applied_edges: Vec::new(),
+        barriers: Vec::new(),
     };
-    tracing::info!(
-        zone_set = session.zone_set,
-        zones = ?session.zones,
-        "input capture zones discovered"
-    );
-    apply_barriers(conn, &mut session, edges).await?;
+    arm_barriers(conn, &mut session).await?;
     Ok(session)
 }
 
-/// Sets barriers on a disabled session and enables capture. Barrier ids are 1-based
-/// indexes into `edges`; an empty set deliberately leaves a new session disabled.
-async fn apply_barriers(
-    conn: &zbus::Connection,
-    session: &mut Session,
-    edges: &[EdgeSpec],
-) -> Result<()> {
-    let mut barriers = Vec::new();
-    for (i, edge) in edges.iter().enumerate() {
-        if let Some(pos) = edge_barrier(edge) {
-            let mut barrier = Options::new();
-            barrier.insert("barrier_id", Value::new(i as u32 + 1));
-            barrier.insert("position", Value::new(pos));
-            barriers.push(barrier);
-        }
+/// Arms the whole outer boundary of the zone union and enables capture. Barriers the
+/// compositor denies are dropped from the id map; at least one must survive.
+async fn arm_barriers(conn: &zbus::Connection, session: &mut Session) -> Result<()> {
+    let candidates = outer_barriers(&session.zones);
+    if candidates.is_empty() {
+        return Err(PlatformError::Unavailable("input capture zones have no outer edges".into()));
     }
-    // GNOME's portal rejects SetPointerBarriers while a session is enabled,
-    // despite the portal specification saying that the call suspends it. Keep
-    // a newly created session disabled until there is something useful to arm.
-    if barriers.is_empty() {
-        session.applied_edges = edges.to_vec();
-        return Ok(());
-    }
-    if session.enabled {
-        return Err(PlatformError::Unavailable(
-            "cannot update pointer barriers on an enabled GNOME session".into(),
-        ));
-    }
-    tracing::debug!(
-        zone_set = session.zone_set,
-        zones = ?session.zones,
-        edges = ?edges,
-        "arming pointer barriers"
-    );
+    let barriers: Vec<Options> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, barrier)| {
+            let mut opts = Options::new();
+            opts.insert("barrier_id", Value::new(i as u32 + 1));
+            opts.insert("position", Value::new(barrier.position()));
+            opts
+        })
+        .collect();
+    tracing::debug!(zone_set = session.zone_set, barriers = ?candidates, "arming pointer barriers");
     let session_opath = session.session_opath.clone();
     let zone_set = session.zone_set;
-    let response =
-        portal::request(conn, &session.ic, "SetPointerBarriers", |token| {
-            let mut opts = Options::new();
-            opts.insert("handle_token", Value::new(token.to_owned()));
-            (session_opath, opts, barriers, zone_set)
-        })
-        .await?;
+    let response = portal::request(conn, &session.ic, "SetPointerBarriers", |token| {
+        let mut opts = Options::new();
+        opts.insert("handle_token", Value::new(token.to_owned()));
+        (session_opath, opts, barriers, zone_set)
+    })
+    .await?;
     let failed = portal::get::<Vec<u32>>(&response, "failed_barriers").unwrap_or_default();
     if !failed.is_empty() {
         tracing::warn!(failed = ?failed, "pointer barriers denied by compositor");
+    }
+    if failed.len() >= candidates.len() {
         return Err(PlatformError::Unavailable(format!(
-            "compositor rejected pointer barrier IDs {failed:?}"
+            "compositor rejected every pointer barrier: {failed:?}"
         )));
     }
     session
@@ -399,8 +449,7 @@ async fn apply_barriers(
         .call::<_, _, ()>("Enable", &(session.session_opath.clone(), Options::new()))
         .await
         .map_err(portal::err_ctx("Enable"))?;
-    session.enabled = true;
-    session.applied_edges = edges.to_vec();
+    session.barriers = candidates;
     Ok(())
 }
 
@@ -426,20 +475,24 @@ async fn run(
     tokens: Arc<TokenStore>,
     conn: zbus::Connection,
     panic_chord: Vec<u32>,
-    edges: Arc<RwLock<Vec<EdgeSpec>>>,
+    map: Arc<EdgeMap>,
     active: Arc<AtomicBool>,
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
 ) {
     // First attempt is immediate; subsequent ones are rate-limited.
     let mut last_recreate = Instant::now() - RECREATE_MIN_INTERVAL;
     loop {
-        // Do not create a v1 InputCapture session until a real adjacent machine
-        // produces a barrier. On GNOME v1, CreateSession itself presents consent.
-        while edges.read().is_empty() {
-            match cmd_rx.recv().await {
-                Some(Command::ApplyEdges(_)) => {}
-                Some(Command::EndCapture { .. } | Command::Panic) => {}
-                None => return,
+        // Do not create an InputCapture session until a real adjacent machine produces
+        // an edge: on GNOME v1, CreateSession itself presents consent. Once the session
+        // exists it stays up regardless of how the edge map changes afterwards.
+        while map.edges.read().is_empty() {
+            tokio::select! {
+                _ = map.changed.notified() => {}
+                cmd = cmd_rx.recv() => {
+                    if cmd.is_none() {
+                        return;
+                    }
+                }
             }
         }
         let since = last_recreate.elapsed();
@@ -448,21 +501,19 @@ async fn run(
         }
         last_recreate = Instant::now();
 
-        let current_edges = edges.read().clone();
-        match establish(&conn, &tokens, &current_edges).await {
+        match establish(&conn, &tokens).await {
             Ok(session) => {
                 shared.set_health(|h| h.capture = None);
-                let end =
-                    run_session(
-                        &shared,
-                        &conn,
-                        session,
-                        &panic_chord,
-                        &edges,
-                        active.clone(),
-                        &mut cmd_rx,
-                    )
-                        .await;
+                let end = run_session(
+                    &shared,
+                    &conn,
+                    session,
+                    &panic_chord,
+                    &map,
+                    active.clone(),
+                    &mut cmd_rx,
+                )
+                .await;
                 if matches!(end, SessionEnd::Reconfigure) {
                     continue;
                 }
@@ -495,7 +546,7 @@ async fn run_session(
     conn: &zbus::Connection,
     mut session: Session,
     panic_chord: &[u32],
-    edges: &Arc<RwLock<Vec<EdgeSpec>>>,
+    map: &EdgeMap,
     active_flag: Arc<AtomicBool>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
 ) -> SessionEnd {
@@ -534,10 +585,6 @@ async fn run_session(
         }
     };
 
-    // Desired edges may have changed while the portal setup requests were in
-    // flight, so use what establish() actually submitted rather than rereading
-    // the shared desired set here.
-    let mut applied_edges = session.applied_edges.clone();
     let mut capture: Option<ActiveCapture> = None;
     let mut pressed: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -549,34 +596,30 @@ async fn run_session(
                 if path != session.session_path {
                     continue;
                 }
-                let edge_list = edges.read().clone();
                 let activation_id = portal::get::<u32>(&opts, "activation_id").unwrap_or(0);
                 // cursor_position usually overshoots past the barrier; only the
-                // along-axis coordinate is used, clamped to the armed span.
+                // along-axis coordinate is used, clamped to the edge's span.
                 let pos = portal::get::<(f64, f64)>(&opts, "cursor_position").unwrap_or((0.0, 0.0));
-                let edge = match portal::get::<u32>(&opts, "barrier_id").filter(|id| *id != 0) {
-                    Some(id) => edge_list.get(id as usize - 1).cloned(),
-                    None => nearest_edge(&edge_list, pos.0, pos.1),
+                let barrier = match portal::get::<u32>(&opts, "barrier_id").filter(|id| *id != 0) {
+                    Some(id) => session.barriers.get(id as usize - 1),
+                    None => nearest_barrier(&session.barriers, pos.0, pos.1),
                 };
-                let Some(edge) = edge else {
-                    tracing::warn!("activated with no matching barrier");
-                    capture = Some(ActiveCapture {
-                        activation_id,
-                    });
-                    active_flag.store(true, Ordering::Release);
-                    release(&session, &mut capture, None).await;
-                    active_flag.store(false, Ordering::Release);
-                    continue;
-                };
-                let along = match edge.side {
-                    EdgeSide::Left | EdgeSide::Right => pos.1,
-                    EdgeSide::Top | EdgeSide::Bottom => pos.0,
-                }
-                .clamp(edge.from as f64, (edge.to - 1).max(edge.from) as f64);
+                let edge = barrier.and_then(|b| edge_for(&map.edges.read(), b, b.along(pos.0, pos.1)));
                 capture = Some(ActiveCapture {
                     activation_id,
                 });
                 active_flag.store(true, Ordering::Release);
+                let Some(edge) = edge else {
+                    // Nothing mapped on this stretch of the boundary: hand the cursor
+                    // straight back. This is the price of never re-arming the session.
+                    release(&session, &mut capture, None).await;
+                    active_flag.store(false, Ordering::Release);
+                    continue;
+                };
+                let along = barrier
+                    .map(|b| b.along(pos.0, pos.1))
+                    .unwrap_or(0.0)
+                    .clamp(edge.from as f64, (edge.to - 1).max(edge.from) as f64);
                 pressed.clear();
                 shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }));
             }
@@ -598,18 +641,14 @@ async fn run_session(
                     }));
                     return SessionEnd::Broken;
                 }
-                if *edges.read() != applied_edges {
-                    close_session(&session_proxy).await;
-                    return SessionEnd::Reconfigure;
-                }
             }
             msg = zones_changed.next() => {
                 if msg.is_none() {
                     return SessionEnd::Broken;
                 }
-                // GNOME also requires the session to be disabled before querying
-                // and replacing barriers. Recreate it instead of using Disable,
-                // whose re-enable path is broken on affected Mutter versions.
+                // GNOME requires a disabled session to replace barriers. Recreate it
+                // instead of using Disable, whose re-enable path is broken on affected
+                // Mutter versions. This is the one remaining consent prompt after launch.
                 close_session(&session_proxy).await;
                 return SessionEnd::Reconfigure;
             }
@@ -620,26 +659,6 @@ async fn run_session(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return SessionEnd::Broken };
                 match cmd {
-                    Command::ApplyEdges(new_edges) => {
-                        if new_edges == applied_edges || capture.is_some() {
-                            continue;
-                        }
-                        if session.enabled {
-                            close_session(&session_proxy).await;
-                            return SessionEnd::Reconfigure;
-                        }
-                        match apply_barriers(conn, &mut session, &new_edges).await {
-                            Ok(()) => {
-                                applied_edges = new_edges;
-                                shared.set_health(|h| h.capture = None);
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "SetPointerBarriers failed");
-                                shared.set_health(|h| h.capture = Some(format!("{err}")));
-                                return SessionEnd::Broken;
-                            }
-                        }
-                    }
                     Command::EndCapture { warp_to } => {
                         release(&session, &mut capture, warp_to).await;
                         active_flag.store(false, Ordering::Release);
@@ -813,54 +832,62 @@ async fn handle_ei_event(
 mod tests {
     use super::*;
 
-    fn left_edge() -> EdgeSpec {
-        EdgeSpec {
-            id: 0,
+    fn zone(x: i32, y: i32, w: u32, h: u32) -> Zone {
+        Zone { x, y, w, h }
+    }
+
+    fn barrier(side: EdgeSide, at: i32, from: i32, to: i32) -> Barrier {
+        Barrier { side, at, from, to }
+    }
+
+    #[test]
+    fn single_zone_arms_all_four_outer_edges_with_inclusive_endpoints() {
+        let barriers = outer_barriers(&[zone(0, 0, 1920, 1080)]);
+        let positions: Vec<_> = barriers.iter().map(Barrier::position).collect();
+        assert_eq!(
+            positions,
+            vec![(0, 0, 0, 1079), (1920, 0, 1920, 1079), (0, 0, 1919, 0), (0, 1080, 1919, 1080)]
+        );
+    }
+
+    #[test]
+    fn flush_neighbours_remove_interior_barriers() {
+        let barriers = outer_barriers(&[zone(0, 0, 1920, 1080), zone(1920, 0, 1920, 1080)]);
+        assert!(!barriers.iter().any(|b| b.side == EdgeSide::Right && b.at == 1920));
+        assert!(!barriers.iter().any(|b| b.side == EdgeSide::Left && b.at == 1920));
+        assert!(barriers.contains(&barrier(EdgeSide::Right, 3840, 0, 1080)));
+        assert_eq!(barriers.len(), 6);
+    }
+
+    #[test]
+    fn offset_neighbours_leave_partial_outer_segments() {
+        let barriers = outer_barriers(&[zone(0, 0, 1920, 1080), zone(1920, 200, 1920, 1080)]);
+        assert!(barriers.contains(&barrier(EdgeSide::Right, 1920, 0, 200)));
+        assert!(barriers.contains(&barrier(EdgeSide::Left, 1920, 1080, 1280)));
+        assert!(barriers.contains(&barrier(EdgeSide::Bottom, 1080, 0, 1920)));
+        assert!(barriers.contains(&barrier(EdgeSide::Top, 200, 1920, 3840)));
+    }
+
+    #[test]
+    fn activation_resolves_to_mapped_edge_only() {
+        let edges = vec![EdgeSpec {
+            id: 7,
             side: EdgeSide::Left,
             at: 0,
             from: 108,
             to: 1080,
-        }
+        }];
+        let left = barrier(EdgeSide::Left, 0, 0, 1080);
+        assert_eq!(edge_for(&edges, &left, 500.0).map(|e| e.id), Some(7));
+        assert_eq!(edge_for(&edges, &left, 50.0), None);
+        let right = barrier(EdgeSide::Right, 1920, 0, 1080);
+        assert_eq!(edge_for(&edges, &right, 500.0), None);
     }
 
     #[test]
-    fn edge_barrier_uses_inclusive_portal_endpoints() {
-        assert_eq!(edge_barrier(&left_edge()), Some((0, 108, 0, 1079)));
-        assert_eq!(
-            edge_barrier(&EdgeSpec {
-                id: 1,
-                side: EdgeSide::Bottom,
-                at: 1080,
-                from: 20,
-                to: 1920,
-            }),
-            Some((20, 1080, 1919, 1080))
-        );
-    }
-
-    #[tokio::test]
-    async fn identical_edge_sets_do_not_schedule_portal_updates() {
-        let edges = Arc::new(RwLock::new(Vec::new()));
-        let edges_dirty = Arc::new(Notify::new());
-        let (cmd, _cmd_rx) = mpsc::unbounded_channel();
-        let capture = WaylandCapture {
-            edges,
-            edges_dirty: edges_dirty.clone(),
-            cmd,
-        };
-        let desired = vec![left_edge()];
-
-        capture.set_edges(desired.clone()).await.unwrap();
-        tokio::time::timeout(Duration::from_millis(20), edges_dirty.notified())
-            .await
-            .expect("changed edges must schedule an update");
-
-        capture.set_edges(desired).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), edges_dirty.notified())
-                .await
-                .is_err(),
-            "unchanged edges must not churn an enabled portal session"
-        );
+    fn nearest_barrier_falls_back_by_perpendicular_distance() {
+        let barriers = outer_barriers(&[zone(0, 0, 1920, 1080)]);
+        let hit = nearest_barrier(&barriers, 1935.0, 400.0).unwrap();
+        assert_eq!(hit.side, EdgeSide::Right);
     }
 }

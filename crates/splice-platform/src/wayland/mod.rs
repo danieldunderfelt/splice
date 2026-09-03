@@ -6,7 +6,7 @@
 //! (never Disable(), never churn, single-use restore tokens) are load-bearing.
 //!
 //! Structure (implement in these modules):
-//!   capture.rs   — InputCapture session, portal zones, EdgeSpec→barriers,
+//!   capture.rs   — InputCapture session, portal zones, outer-boundary barriers armed once,
 //!                  Activated/Deactivated/ZonesChanged handling, reis receiver pump,
 //!                  KDE barrier-id fallback, panic-chord detection from captured keys.
 //!   emulate.rs   — RemoteDesktop session + reis sender pump, device management,

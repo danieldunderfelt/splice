@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Splice
+Comment=Share one keyboard and mouse across your Tailscale machines
+Exec=splice
+Icon=input-mouse
+Categories=Utility;
+Keywords=KVM;keyboard;mouse;Tailscale;
+Terminal=false
+StartupNotify=false
+Actions=Quit;
+
+[Desktop Action Quit]
+Name=Quit Splice
+Exec=splice quit

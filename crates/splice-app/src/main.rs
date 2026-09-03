@@ -1,38 +1,35 @@
-//! Splice app: engine + tray + egui arrangement window in one process.
+//! Splice app: engine + tray + egui arrangement window.
 //!
 //! Spec: docs/DESIGN.md "UI (crates/splice-app)".
-//!   app.rs    — eframe App: arrangement canvas (draggable machine cards, snapping,
-//!               green/red edges), side panel, header. Pure function of UiState + Commands.
-//!   theme.rs  — custom egui Style (NOT default-looking): accent #5B8DEF, rounded cards,
-//!               dark/light follow system.
-//!   tray.rs   — cfg-gated tray (ksni / tray-icon), menu wired to Commands; window
-//!               opened on demand; app continues with window closed.
-//!   runtime.rs— tokio runtime thread + engine bootstrap; macOS ActivationPolicy::Accessory.
+//!   app.rs     — eframe App: arrangement canvas (draggable machine cards, snapping,
+//!                green/red edges), side panel, header. Pure function of UiState + Commands.
+//!   theme.rs   — custom egui Style (NOT default-looking): accent #5B8DEF, rounded cards,
+//!                dark/light follow system.
+//!   tray.rs    — cfg-gated tray (ksni / tray-icon), menu wired to Commands.
+//!   runtime.rs — UI-side controller; macOS bootstraps the engine in-process.
+//!
+//! Linux process model (Wayland cannot hide a window, so closing one must not stop the
+//! engine): `splice service` owns engine + tray + IPC socket (service.rs, ipc.rs);
+//! `splice window` is a closeable client (remote.rs); `splice` opens a window, starting
+//! the service if needed; `splice quit` stops everything.
 
 mod app;
+#[cfg(target_os = "linux")]
+mod autostart;
 mod drag;
+#[cfg(target_os = "linux")]
+mod ipc;
+#[cfg(target_os = "linux")]
+mod remote;
 mod runtime;
+#[cfg(target_os = "linux")]
+mod service;
 mod theme;
 mod tray;
 
-#[cfg(target_os = "linux")]
-fn restore_dumpability_after_group_activation() {
-    // `sg` is setgid, so Linux marks its descendants non-dumpable. Desktop
-    // portals inspect /proc/<pid>/root using a ptrace-style access check and
-    // reject the session while that flag is clear. Splice now has ordinary
-    // user credentials again, so restore the normal exec-time value.
-    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
-    if result != 0 {
-        eprintln!(
-            "warning: could not restore process dumpability after input-group activation: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-/// Finder/launchd-started apps have no stderr, so the log goes to `splice.log` in the
-/// config directory unless a terminal is attached.
-fn init_tracing() {
+/// Finder/launchd/systemd-started processes have no stderr, so the log goes to
+/// `log_name` in the config directory unless a terminal is attached.
+fn init_tracing(log_name: &str) {
     use std::io::IsTerminal;
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,7 +40,7 @@ fn init_tracing() {
     }
     let file = splice_core::config::config_dir()
         .ok()
-        .and_then(|dir| std::fs::File::create(dir.join("splice.log")).ok());
+        .and_then(|dir| std::fs::File::create(dir.join(log_name)).ok());
     match file {
         Some(file) => tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -54,13 +51,57 @@ fn init_tracing() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn dispatch(preview: bool) {
+    use std::process::exit;
+
+    let mode = std::env::args().nth(1);
+    match mode.as_deref() {
+        Some("window") => {}
+        Some("service") => {
+            init_tracing("splice.log");
+            if let Err(err) = service::run() {
+                tracing::error!("splice service failed: {err:#}");
+                exit(1);
+            }
+            exit(0);
+        }
+        Some("quit") => match ipc::connect() {
+            Ok(mut stream) => {
+                if let Err(err) = ipc::write_message(&mut stream, &ipc::ClientMessage::Quit) {
+                    eprintln!("cannot stop Splice: {err}");
+                    exit(1);
+                }
+                exit(0);
+            }
+            Err(_) => {
+                println!("Splice is not running.");
+                exit(0);
+            }
+        },
+        None if preview => {}
+        None => {
+            let opened = ipc::ensure_service()
+                .and_then(|mut stream| ipc::write_message(&mut stream, &ipc::ClientMessage::Open));
+            if let Err(err) = opened {
+                eprintln!("cannot start Splice: {err}");
+                exit(1);
+            }
+            exit(0);
+        }
+        Some(other) => {
+            eprintln!("unknown command {other:?}\nusage: splice [window|service|quit]");
+            exit(2);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    #[cfg(target_os = "linux")]
-    restore_dumpability_after_group_activation();
-
-    init_tracing();
-
     let preview = std::env::var("SPLICE_UI_PREVIEW").ok().as_deref() == Some("1");
+    #[cfg(target_os = "linux")]
+    dispatch(preview);
+    init_tracing(if cfg!(target_os = "linux") { "splice-window.log" } else { "splice.log" });
+
     let exit_after = if preview {
         std::env::var("SPLICE_UI_EXIT_AFTER")
             .ok()
@@ -80,7 +121,7 @@ fn main() -> eframe::Result<()> {
         renderer,
         viewport: egui::ViewportBuilder::default()
             .with_title("Splice")
-            .with_app_id("splice")
+            .with_app_id("io.github.danieldunderfelt.Splice")
             .with_inner_size([1060.0, 680.0])
             .with_min_inner_size([780.0, 480.0]),
         ..Default::default()
@@ -94,11 +135,12 @@ fn main() -> eframe::Result<()> {
             #[cfg(target_os = "macos")]
             tray::set_activation_policy_accessory();
             let ctrl = runtime::start(preview, cc.egui_ctx.clone());
-            let (tray, tray_actions) = tray::Tray::new(&ctrl);
+            let (actions_tx, actions_rx) = std::sync::mpsc::channel();
+            let tray = tray::Tray::new(&ctrl, actions_tx);
             Ok(Box::new(app::SpliceApp::new(
                 ctrl,
                 tray,
-                tray_actions,
+                actions_rx,
                 exit_after,
             )))
         }),

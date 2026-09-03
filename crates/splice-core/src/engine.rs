@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 /// Commands from UI / tray / daemon control.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     SetMasterEnabled(bool),
     SetMachineEnabled(MachineId, bool),

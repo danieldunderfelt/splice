@@ -1,10 +1,10 @@
 //! UI-facing state snapshot. `splice-app` renders this and nothing else.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use splice_platform::HealthReport;
 use splice_proto::{DisplayRect, MachineId, Os, Vec2I};
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UiConnection {
     /// This machine.
     SelfMachine,
@@ -14,7 +14,7 @@ pub enum UiConnection {
     Offline,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiMachine {
     pub id: MachineId,
     pub hostname: String,
@@ -28,7 +28,7 @@ pub struct UiMachine {
 }
 
 /// A shared-edge strip between two machines, for canvas rendering.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiEdge {
     pub a: MachineId,
     pub b: MachineId,
@@ -41,7 +41,7 @@ pub struct UiEdge {
     pub crossable: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UiFocus {
     Local,
     /// Cursor is on the given remote machine (we are the source).
@@ -50,7 +50,7 @@ pub enum UiFocus {
     Driven(MachineId),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
     pub self_id: MachineId,
     pub master_enabled: bool,

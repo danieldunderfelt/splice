@@ -3,9 +3,10 @@
 //! Portal-injected input never appears on /dev/input, so any EV_KEY/EV_REL seen here IS
 //! physical input — the engine uses it for source arbitration
 //! (docs/research/wayland-input.md). Devices are opened non-exclusively (no EVIOCGRAB);
-//! an inotify watch on /dev/input handles hotplug. Reading evdev needs the `input`
-//! group (docs/linux-setup.md): on EACCES the health report names the fix once and
-//! everything else keeps running.
+//! an inotify watch on /dev/input handles hotplug. Reading evdev needs the Splice udev
+//! rule (packaging/linux/70-splice.rules, installed by the packages) or `input` group
+//! membership: on EACCES the health report names the fix once and everything else
+//! keeps running.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -181,9 +182,9 @@ fn spawn_reader(
                         if !eacces_reported.swap(true, Ordering::Relaxed) {
                             shared.set_health(|h| {
                                 h.activity_monitor = Some(format!(
-                                    "cannot read {}: permission denied — add yourself to the \
-                                     `input` group (docs/linux-setup.md); source auto-switching \
-                                     is limited on this machine",
+                                    "cannot read {}: permission denied — install the Splice udev \
+                                     rule (packaging/linux/70-splice.rules, see docs/linux-setup.md); \
+                                     source auto-switching is limited on this machine",
                                     path.display()
                                 ));
                             });

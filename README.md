@@ -64,21 +64,43 @@ Keep the signing identity when rebuilding. macOS can lose the app's Accessibilit
 
 ### Install on Linux
 
-Build and install the app for your user:
+Splice runs in a Wayland session on GNOME or KDE Plasma. Pick the route that matches your
+distribution; all of them install the binary, the desktop entry, the `app-splice.service` user
+unit, and the udev rule that grants input-device access.
+
+| Distribution | Route |
+|---|---|
+| Debian, Ubuntu, Mint | `cargo install cargo-deb && cargo deb -p splice-app`, then `sudo apt install ./target/debian/splice_*.deb` |
+| Fedora, RHEL, openSUSE | `packaging/rpm/build.sh` (needs `rpm-build` and `rpmdevtools`), then `sudo dnf install ~/rpmbuild/RPMS/*/splice-*.rpm` |
+| Arch, CachyOS, EndeavourOS | `cd packaging/arch && makepkg -si` |
+| SteamOS, Bazzite, Silverblue and other immutable systems | Flatpak: see `packaging/flatpak/` |
+| Any distribution, per user | `cargo build -p splice-app --release && packaging/linux/install.sh` |
+
+The per-user installer puts the binary in `~/.local/bin` and asks for `sudo` once to install the
+udev rule. Remove that install again with `packaging/linux/install.sh --uninstall`, for example
+before switching to a distribution package.
+
+Then start Splice from the app menu, or from a terminal:
 
 ```sh
-cargo build -p splice-app --release
-packaging/linux/install.sh
-systemctl --user start app-splice.service
+splice          # start the background service if needed and open the window
+splice quit     # stop the service
 ```
 
-The installer copies the binary to `~/.local/bin/splice` and enables the `app-splice.service` user service. Complete the portal and physical-input setup in [the Linux setup guide](docs/linux-setup.md).
+Closing the window leaves the service running. Tick **Start Splice at login** in the window, or
+enable the systemd user unit, to have it start with your session:
+
+```sh
+systemctl --user enable --now app-splice.service
+```
+
+Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
 1. Start Splice on every computer.
 2. Approve the operating system permission prompts.
-3. Open Splice from its menu bar or system tray icon.
+3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
 5. Enable the machines that you want to control.
 6. Move the pointer through a shared edge. The keyboard follows the pointer to the other machine.

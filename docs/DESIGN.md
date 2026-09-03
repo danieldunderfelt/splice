@@ -299,9 +299,15 @@ tokens), atomic writes (tmp + rename). Machine-local; layout replicates via Layo
   Note: `NSAccessibilityUsageDescription` / `NSInputMonitoringUsageDescription` do NOT exist —
   don't cargo-cult them. Accessibility alone transitively grants listen+post on macOS 13+;
   onboard users to exactly one toggle.
-- Linux: single binary + `packaging/linux/`: `splice.desktop`, systemd user unit named
-  `app-splice.service` (portal-compatible cgroup name), udev rule + group doc for the evdev
-  monitor (`docs/linux-setup.md`). RPM later.
+- Linux: single binary + `packaging/linux/` (desktop entry, AppStream metainfo, systemd user
+  unit named `app-splice.service` for a portal-compatible cgroup name, `70-splice.rules` udev
+  rule tagging input devices `uaccess` so the evdev monitor needs no group membership).
+  Distribution routes: cargo-deb metadata in `splice-app`, `packaging/rpm` spec, `packaging/arch`
+  PKGBUILD, `packaging/flatpak` manifest. Process model: winit cannot hide a window on
+  Wayland, so `splice service` (engine + tray + `$XDG_RUNTIME_DIR/splice.sock`) is separate from
+  `splice window` (closeable IPC client, newline-delimited JSON snapshots/commands); `splice`
+  opens a window, `splice quit` stops the service. Tray is optional; the window has Quit and a
+  "Start at login" XDG autostart toggle.
 
 ## Testing
 

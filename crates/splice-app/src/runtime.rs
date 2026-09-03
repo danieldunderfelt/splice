@@ -1,11 +1,12 @@
-//! Tokio runtime on a background thread + engine bootstrap.
+//! UI-side controller.
 //!
-//! Bootstrap: config_dir -> config load -> platform::create -> tailscale Client::discover
-//! -> Engine::spawn. Any failure (including a panic from the still-stubbed core engine)
-//! is surfaced as `BootStatus::Offline` and retried every 15 s (or immediately via the
-//! UI's Retry button) — the app itself never crashes on bootstrap problems.
+//! macOS: tokio runtime on a background thread + in-process engine bootstrap. Any failure
+//! (including a panic from bootstrap) is surfaced as `BootStatus::Offline` and retried
+//! every 15 s (or immediately via the UI's Retry button); the app never crashes on it.
+//! Linux: the engine lives in the `splice service` process; the window is an IPC client
+//! (remote.rs) with the same retry semantics, where Retry also starts the service.
 //!
-//! Preview mode (`SPLICE_UI_PREVIEW=1`) skips bootstrap entirely and drives the UI from a
+//! Preview mode (`SPLICE_UI_PREVIEW=1`) skips all of that and drives the UI from a
 //! canned, mutable UiState (see `preview`).
 
 use anyhow::Context;
@@ -13,12 +14,13 @@ use parking_lot::{Mutex, RwLock};
 use splice_core::{Command, EngineHandle, UiState};
 use splice_proto::MachineId;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-const RETRY_INTERVAL: Duration = Duration::from_secs(15);
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// What the UI should show about engine connectivity.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum BootStatus {
     Starting,
     Online,
@@ -33,17 +35,21 @@ pub struct Controller {
     state: Arc<RwLock<UiState>>,
     status: Arc<Mutex<BootStatus>>,
     mode: Mode,
-    /// Handle of the background tokio runtime (Linux: used to spawn the ksni tray task).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub tokio: Option<tokio::runtime::Handle>,
+    /// Why there is no tray icon, if so (Linux: reported by the service).
+    tray_hint: Arc<Mutex<Option<String>>>,
+    focus_request: Arc<AtomicBool>,
+    quit_request: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
 enum Mode {
+    #[cfg(not(target_os = "linux"))]
     Engine {
         handle: Arc<Mutex<Option<EngineHandle>>>,
         retry: tokio::sync::mpsc::UnboundedSender<()>,
     },
+    #[cfg(target_os = "linux")]
+    Remote(Arc<crate::remote::Remote>),
     Preview,
 }
 
@@ -61,12 +67,13 @@ impl Controller {
     pub fn is_live(&self) -> bool {
         match &self.mode {
             Mode::Preview => true,
-            Mode::Engine { .. } => matches!(*self.status.lock(), BootStatus::Online),
+            _ => matches!(*self.status.lock(), BootStatus::Online),
         }
     }
 
     pub fn send(&self, cmd: Command) {
         match &self.mode {
+            #[cfg(not(target_os = "linux"))]
             Mode::Engine { handle, .. } => {
                 if let Some(handle) = handle.lock().as_ref() {
                     handle.send(cmd);
@@ -74,6 +81,8 @@ impl Controller {
                     tracing::debug!(?cmd, "engine offline; dropping command");
                 }
             }
+            #[cfg(target_os = "linux")]
+            Mode::Remote(remote) => remote.send(crate::ipc::ClientMessage::Command(cmd)),
             Mode::Preview => {
                 preview::apply(&mut self.state.write(), &cmd);
             }
@@ -82,94 +91,117 @@ impl Controller {
 
     /// Ask the bootstrap loop to retry now instead of waiting out the interval.
     pub fn retry(&self) {
-        if let Mode::Engine { retry, .. } = &self.mode {
-            let _ = retry.send(());
+        match &self.mode {
+            #[cfg(not(target_os = "linux"))]
+            Mode::Engine { retry, .. } => {
+                let _ = retry.send(());
+            }
+            #[cfg(target_os = "linux")]
+            Mode::Remote(remote) => remote.retry(),
+            Mode::Preview => {}
         }
     }
 
-    /// Shared UiState for the Linux ksni tray task (menus are generated from state).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn shared_state(&self) -> Arc<RwLock<UiState>> {
-        self.state.clone()
+    /// Stop Splice: release captured input everywhere, then (Linux) stop the service.
+    pub fn quit(&self) {
+        match &self.mode {
+            #[cfg(not(target_os = "linux"))]
+            Mode::Engine { .. } => self.send(Command::Panic),
+            #[cfg(target_os = "linux")]
+            Mode::Remote(remote) => remote.send(crate::ipc::ClientMessage::Quit),
+            Mode::Preview => {}
+        }
+    }
+
+    pub fn tray_hint(&self) -> Option<String> {
+        self.tray_hint.lock().clone()
+    }
+
+    pub fn take_focus_request(&self) -> bool {
+        self.focus_request.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_quit_request(&self) -> bool {
+        self.quit_request.swap(false, Ordering::AcqRel)
     }
 }
 
-/// Start the background runtime thread and return the UI-side controller.
+/// Start the engine connection (or the preview driver) and return the UI-side controller.
 pub fn start(preview: bool, ctx: egui::Context) -> Controller {
+    let (state, status) = if preview {
+        (preview::initial_state(), BootStatus::Preview)
+    } else {
+        (UiState::initial(MachineId("self".into())), BootStatus::Starting)
+    };
+    let state = Arc::new(RwLock::new(state));
+    let status = Arc::new(Mutex::new(status));
+    let tray_hint = Arc::new(Mutex::new(None));
+    let focus_request = Arc::new(AtomicBool::new(false));
+    let quit_request = Arc::new(AtomicBool::new(false));
+    let mode = if preview {
+        Mode::Preview
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            Mode::Remote(crate::remote::start(
+                ctx,
+                crate::remote::Mirror {
+                    state: state.clone(),
+                    status: status.clone(),
+                    tray_hint: tray_hint.clone(),
+                    focus_request: focus_request.clone(),
+                    quit_request: quit_request.clone(),
+                },
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            engine_mode(ctx, state.clone(), status.clone())
+        }
+    };
+    Controller {
+        state,
+        status,
+        mode,
+        tray_hint,
+        focus_request,
+        quit_request,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn engine_mode(ctx: egui::Context, state: Arc<RwLock<UiState>>, status: Arc<Mutex<BootStatus>>) -> Mode {
+    let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let handle_slot: Arc<Mutex<Option<EngineHandle>>> = Arc::new(Mutex::new(None));
+    let mode = Mode::Engine {
+        handle: handle_slot.clone(),
+        retry: retry_tx,
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("splice-tokio")
         .enable_all()
         .build();
-
-    match runtime {
-        Ok(runtime) => start_with_runtime(runtime, preview, ctx),
+    let runtime = match runtime {
+        Ok(runtime) => runtime,
         Err(err) => {
-            // No runtime: engine mode can never come up, but the UI must still run.
             tracing::error!("failed to build tokio runtime: {err}");
-            Controller {
-                state: Arc::new(RwLock::new(UiState::initial(MachineId("self".into())))),
-                status: Arc::new(Mutex::new(BootStatus::Offline(format!(
-                    "failed to start background runtime: {err}"
-                )))),
-                mode: Mode::Preview,
-                tokio: None,
-            }
+            *status.lock() = BootStatus::Offline(format!("failed to start background runtime: {err}"));
+            return mode;
         }
-    }
-}
-
-fn start_with_runtime(
-    runtime: tokio::runtime::Runtime,
-    preview: bool,
-    ctx: egui::Context,
-) -> Controller {
-    let tokio = Some(runtime.handle().clone());
-
-    if preview {
-        let spawned = std::thread::Builder::new()
-            .name("splice-runtime".into())
-            .spawn(move || {
-                // No bootstrap in preview; keep the runtime parked for tray tasks (Linux).
-                runtime.block_on(std::future::pending::<()>());
-            });
-        if let Err(err) = spawned {
-            tracing::error!("failed to spawn runtime thread: {err}");
-        }
-        return Controller {
-            state: Arc::new(RwLock::new(preview::initial_state())),
-            status: Arc::new(Mutex::new(BootStatus::Preview)),
-            mode: Mode::Preview,
-            tokio,
-        };
-    }
-
-    let state = Arc::new(RwLock::new(UiState::initial(MachineId("self".into()))));
-    let status = Arc::new(Mutex::new(BootStatus::Starting));
-    let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let handle_slot: Arc<Mutex<Option<EngineHandle>>> = Arc::new(Mutex::new(None));
-
-    let ctrl = Controller {
-        state: state.clone(),
-        status: status.clone(),
-        mode: Mode::Engine {
-            handle: handle_slot.clone(),
-            retry: retry_tx,
-        },
-        tokio,
     };
-
+    let thread_status = status.clone();
     let spawned = std::thread::Builder::new()
         .name("splice-runtime".into())
-        .spawn(move || runtime_thread(runtime, retry_rx, state, status, handle_slot, ctx));
+        .spawn(move || runtime_thread(runtime, retry_rx, state, thread_status, handle_slot, ctx));
     if let Err(err) = spawned {
         tracing::error!("failed to spawn runtime thread: {err}");
-        *ctrl.status.lock() = BootStatus::Offline(format!("failed to spawn runtime: {err}"));
+        *status.lock() = BootStatus::Offline(format!("failed to spawn runtime: {err}"));
     }
-
-    ctrl
+    mode
 }
 
+#[cfg(not(target_os = "linux"))]
 fn runtime_thread(
     runtime: tokio::runtime::Runtime,
     mut retry_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -195,7 +227,7 @@ fn runtime_thread(
                 continue;
             }
             Err(payload) => {
-                let msg = panic_message(&payload);
+                let msg = panic_message(&*payload);
                 tracing::warn!("engine bootstrap panicked: {msg}");
                 *status.lock() =
                     BootStatus::Offline(format!("engine crashed during startup: {msg}"));
@@ -234,6 +266,7 @@ fn runtime_thread(
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn wait_for_retry(
     runtime: &tokio::runtime::Runtime,
     retry_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
@@ -246,7 +279,7 @@ fn wait_for_retry(
     });
 }
 
-async fn bootstrap() -> anyhow::Result<EngineHandle> {
+pub async fn bootstrap() -> anyhow::Result<EngineHandle> {
     let data_dir = splice_core::config::config_dir().context("resolving config dir")?;
     let cfg = splice_core::config::load(&data_dir);
     let platform = splice_platform::create(splice_platform::PlatformOpts {
@@ -263,7 +296,7 @@ async fn bootstrap() -> anyhow::Result<EngineHandle> {
         .context("spawning engine")
 }
 
-fn panic_message(payload: &dyn std::any::Any) -> String {
+pub fn panic_message(payload: &dyn std::any::Any) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
         (*msg).to_owned()
     } else if let Some(msg) = payload.downcast_ref::<String>() {

@@ -56,9 +56,12 @@ Signals:
 **NEVER call `Disable()` on a live session** — mutter bug #3908: after Disable, events stop
 flowing to the EIS socket permanently while Activated still fires. GNOME 50 also rejects
 SetPointerBarriers while enabled even though the portal specification says that call suspends
-the session. Leave a new session disabled while the barrier set is empty; apply the first
-non-empty set and Enable once. Deduplicate unchanged sets. For a real later change, close and
-recreate the session with the usual rate limit.
+the session. GNOME 50's backend is InputCapture v1 (impl version 0): no restore tokens, and
+every CreateSession shows the consent dialog, so recreating the session per peer change means
+a prompt per peer change. Instead, arm the ENTIRE outer boundary of the zone union once per
+session (compute segments from GetZones, subtracting flush neighbours) and resolve `Activated`
+against the engine's edge map in software; a hit on an unmapped stretch is Released at once.
+Peer/layout changes then never touch the portal. Only ZonesChanged recreates the session.
 
 **Do not rely on `ei_keyboard.modifiers` events on GNOME** (mutter #3375: never sent to ei
 clients). Track modifier state from raw key up/down + the keymap. Do this on all compositors.

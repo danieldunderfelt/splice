@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.danieldunderfelt.Splice</id>
+  <name>Splice</name>
+  <summary>Share one keyboard and mouse across your Tailscale machines</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.danieldunderfelt">
+    <name>Daniel Dunderfelt</name>
+  </developer>
+  <description>
+    <p>
+      Splice is a software KVM. Move the pointer through a screen edge and it continues on the
+      neighbouring computer, with the keyboard and clipboard following. Machines discover each
+      other over your Tailscale network, so there is nothing to configure beyond arranging them.
+    </p>
+    <p>
+      On Linux, Splice uses the Wayland Input Capture and Remote Desktop portals and requires
+      GNOME or KDE Plasma running Wayland.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.danieldunderfelt.Splice.desktop</launchable>
+  <url type="homepage">https://github.com/danieldunderfelt/splice</url>
+  <url type="bugtracker">https://github.com/danieldunderfelt/splice/issues</url>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <requires>
+    <display_length compare="ge">780</display_length>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.0.0" date="2026-09-03" />
+  </releases>
+</component>
