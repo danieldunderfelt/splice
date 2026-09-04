@@ -30,6 +30,12 @@ Session flow (ashpd `desktop::input_capture` module has a complete worked exampl
      (0,0) is (0,0,0,1079). Right edge of a zone at (1920,0): x = 1920+1920 = 3840 →
      (3840,0,3840,1079). Left/top edges use origin; right/bottom use origin+extent (not −1).
    - Barriers between two adjacent local monitors are DENIED (interior). Only true outer edges.
+   - KDE (xdg-desktop-portal-kde `checkAndMakeBarrier`) additionally requires a barrier to span
+     a WHOLE screen edge (y1 == screen.top && y2 == screen.bottom); a partial span fails with
+     "Barrier N doesnt fill or on edge to another screen". Mutter accepts partial spans. Splice
+     therefore arms every outer boundary segment of the zone union up front, independent of
+     which links are mapped, and resolves the crossed link from the barrier's side and the
+     Activated along-axis position (releasing immediately when nothing is mapped there).
    - Setting barriers suspends the session → must call `Enable()` after.
    - Zero-length barrier array clears all.
 6. `Enable()` arms capture. **Capture activates ONLY when the compositor decides** (pointer

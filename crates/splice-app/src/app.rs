@@ -1166,7 +1166,7 @@ fn health_rows(state: &UiState) -> Vec<(String, String, String)> {
         let hint = if macos {
             "Grant Accessibility: System Settings → Privacy & Security → Accessibility → Splice."
         } else {
-            "The InputCapture portal session failed; log out and back in, then restart Splice."
+            "Splice retries the InputCapture portal session every few seconds; if this persists, check the portal backend log (journalctl --user -u xdg-desktop-portal-kde or -gnome)."
         };
         rows.push(("Input capture".into(), detail.clone(), hint.into()));
     }
