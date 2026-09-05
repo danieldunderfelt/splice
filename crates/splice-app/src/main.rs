@@ -19,6 +19,7 @@ mod autostart;
 mod drag;
 mod diagnostics;
 mod updates;
+mod input;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]

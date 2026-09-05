@@ -214,7 +214,7 @@ fn open_devices(shared: Arc<Shared>) -> Result<Devices> {
 /// udev tags the node after it appears; the compositor only opens it once the udev
 /// database entry (`/run/udev/data/c13:N`) exists. Events written before that are
 /// lost, so a device that does not settle is a setup failure, not a warning.
-fn wait_for_udev(device: &mut VirtualDevice) -> Result<()> {
+pub(super) fn wait_for_udev(device: &mut VirtualDevice) -> Result<()> {
     let deadline = Instant::now() + UDEV_SETTLE_TIMEOUT;
     let mut db: Option<(String, std::path::PathBuf)> = None;
     while Instant::now() < deadline {

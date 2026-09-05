@@ -16,15 +16,27 @@ impl Drop for Fixture {
     }
 }
 
+fn next_version() -> String {
+    let mut version = semver::Version::parse(&BuildInfo::current().version).unwrap();
+    version.minor += 1;
+    version.patch = 0;
+    version.pre = semver::Prerelease::EMPTY;
+    version.to_string()
+}
+
 async fn fixture(tampered: bool, wrong_build: bool) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let target = directory.path().join("splice");
     std::fs::write(&target, "old executable").unwrap();
     let mut build = BuildInfo::current();
-    build.version = if wrong_build { "8.0.0" } else { "1.2.0" }.into();
+    build.version = if wrong_build {
+        BuildInfo::current().version
+    } else {
+        next_version()
+    };
     build.commit = "b".repeat(40);
     build.dirty = false;
-    build.protocol = 4;
+    build.protocol += 1;
     let script = format!(
         "#!/bin/sh\nprintf '%s\\n' '{}'\n",
         serde_json::to_string(&build).unwrap()
@@ -45,9 +57,9 @@ async fn fixture(tampered: bool, wrong_build: bool) -> Fixture {
     let name = format!("splice-{target_name}.tar.gz");
     let manifest = manifest::Manifest {
         schema: 1,
-        version: "1.2.0".into(),
+        version: next_version(),
         commit: "b".repeat(40),
-        protocol: 4,
+        protocol: build.protocol,
         assets: BTreeMap::from([(
             target_name,
             manifest::Asset {
@@ -66,11 +78,11 @@ async fn fixture(tampered: bool, wrong_build: bool) -> Fixture {
     let routes = BTreeMap::from([
         (
             "/latest".to_string(),
-            br#"{"tag_name":"v1.2.0","draft":false,"prerelease":false}"#.to_vec(),
+            serde_json::to_vec(&serde_json::json!({"tag_name": format!("v{}", next_version()), "draft": false, "prerelease": false})).unwrap(),
         ),
-        ("/releases/v1.2.0/splice-update.json".into(), bytes),
-        ("/releases/v1.2.0/splice-update.sig".into(), signature),
-        (format!("/releases/v1.2.0/{name}"), archive),
+        (format!("/releases/v{}/splice-update.json", next_version()), bytes),
+        (format!("/releases/v{}/splice-update.sig", next_version()), signature),
+        (format!("/releases/v{}/{name}", next_version()), archive),
     ]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -150,7 +162,7 @@ async fn signed_download_is_preflighted_before_explicit_restart() {
     assert!(host.request(control::Action::Check).is_err());
     wait(host, Phase::Available).await;
     host.request(control::Action::Prepare {
-        version: "1.2.0".into(),
+        version: next_version(),
     })
     .unwrap();
     wait(host, Phase::Ready).await;
@@ -162,7 +174,7 @@ async fn signed_download_is_preflighted_before_explicit_restart() {
     let state = host.state().borrow().clone();
     assert_eq!(state.downloaded, state.total);
     host.request(control::Action::Install {
-        version: "1.2.0".into(),
+        version: next_version(),
     })
     .unwrap();
     let mut restart = host.restart();
@@ -191,7 +203,7 @@ async fn invalid_archive_or_executable_never_becomes_installable() {
         fixture
             .host
             .request(control::Action::Prepare {
-                version: "1.2.0".into(),
+                version: next_version(),
             })
             .unwrap();
         wait(&fixture.host, Phase::Failed).await;
@@ -225,7 +237,7 @@ async fn downgrade_and_install_without_preparation_are_explicit_failures() {
     fixture
         .host
         .request(control::Action::Install {
-            version: "1.2.0".into(),
+            version: next_version(),
         })
         .unwrap();
     wait(&fixture.host, Phase::Failed).await;
@@ -297,7 +309,7 @@ async fn startup_cannot_remove_staging_owned_by_another_live_update() {
 #[tokio::test]
 async fn a_prepared_download_can_be_checked_and_prepared_again() {
     let fixture = fixture(false, false).await;
-    fixture.host.prepare("1.2.0").await.unwrap();
+    fixture.host.prepare(&next_version()).await.unwrap();
     let first = fixture
         .host
         .0
@@ -311,21 +323,21 @@ async fn a_prepared_download_can_be_checked_and_prepared_again() {
         .to_path_buf();
     fixture.host.check().await.unwrap();
     assert!(!first.exists());
-    fixture.host.prepare("1.2.0").await.unwrap();
+    fixture.host.prepare(&next_version()).await.unwrap();
     assert_eq!(fixture.host.state().borrow().phase, Phase::Ready);
 }
 
 #[tokio::test]
 async fn stale_failure_for_the_same_version_cannot_cancel_a_new_attempt() {
     let fixture = fixture(false, false).await;
-    fixture.host.prepare("1.2.0").await.unwrap();
+    fixture.host.prepare(&next_version()).await.unwrap();
     fixture.host.change(Phase::Restarting, None);
     let path = fixture.directory.path().join("updates/result.json");
     install::durable_json(
         &path,
         &Receipt {
             transaction: "previous-attempt".into(),
-            version: "1.2.0".into(),
+            version: next_version(),
             installed: false,
             error: Some("old failure".into()),
         },
@@ -333,7 +345,7 @@ async fn stale_failure_for_the_same_version_cannot_cancel_a_new_attempt() {
     .unwrap();
     fixture.host.refresh_result();
     assert_eq!(fixture.host.state().borrow().phase, Phase::Restarting);
-    fixture.host.install("1.2.0").await.unwrap();
+    fixture.host.install(&next_version()).await.unwrap();
     fixture.host.refresh_result();
     assert!(*fixture.host.restart().borrow());
     assert!(fixture.host.request(control::Action::Check).is_err());
@@ -347,15 +359,15 @@ async fn helper_launch_failure_leaves_the_running_installation_and_allows_retry(
     let mut fixture = fixture(false, false).await;
     let helper = fixture.host.0.helper;
     Arc::get_mut(&mut fixture.host.0).unwrap().helper = |_| anyhow::bail!("helper launch denied");
-    fixture.host.prepare("1.2.0").await.unwrap();
-    assert!(fixture.host.install("1.2.0").await.is_err());
+    fixture.host.prepare(&next_version()).await.unwrap();
+    assert!(fixture.host.install(&next_version()).await.is_err());
     assert!(!*fixture.host.restart().borrow());
     assert_eq!(
         std::fs::read_to_string(fixture.directory.path().join("splice")).unwrap(),
         "old executable"
     );
     Arc::get_mut(&mut fixture.host.0).unwrap().helper = helper;
-    fixture.host.install("1.2.0").await.unwrap();
+    fixture.host.install(&next_version()).await.unwrap();
     assert!(*fixture.host.restart().borrow());
 }
 
@@ -363,8 +375,8 @@ async fn helper_launch_failure_leaves_the_running_installation_and_allows_retry(
 async fn unacknowledged_helper_never_requests_app_shutdown() {
     let mut fixture = fixture(false, false).await;
     Arc::get_mut(&mut fixture.host.0).unwrap().helper = |_| Ok(());
-    fixture.host.prepare("1.2.0").await.unwrap();
-    let error = fixture.host.install("1.2.0").await.unwrap_err();
+    fixture.host.prepare(&next_version()).await.unwrap();
+    let error = fixture.host.install(&next_version()).await.unwrap_err();
     assert!(error.to_string().contains("acknowledge"));
     assert!(!*fixture.host.restart().borrow());
     assert_eq!(
@@ -382,7 +394,7 @@ async fn unacknowledged_helper_never_requests_app_shutdown() {
 async fn restarted_process_observes_the_helpers_final_receipt() {
     for succeeded in [true, false] {
         let fixture = fixture(false, false).await;
-        fixture.host.prepare("1.2.0").await.unwrap();
+        fixture.host.prepare(&next_version()).await.unwrap();
         let mut prepared = fixture.host.0.prepared.lock().await.take().unwrap();
         let build = BuildInfo::current();
         prepared.plan.manifest.version = build.version.clone();

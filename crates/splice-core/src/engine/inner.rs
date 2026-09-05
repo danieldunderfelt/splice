@@ -2,6 +2,9 @@
 //! events, peer session events (net layer), discovery ticks and UI commands; drives
 //! capture/emulation and publishes UiState snapshots (debounced to <=10 Hz).
 
+mod crossing;
+mod raw;
+
 use crate::engine::Command;
 use crate::arrange::{self, Body, Rules};
 use crate::layout::{self, EdgeLink, MachineGeom};
@@ -41,6 +44,7 @@ enum Focus {
 
 #[derive(Default)]
 struct Peer {
+    raw_generation: u64,
     hostname: Option<String>,
     error: Option<String>,
     info: Option<MachineInfo>,
@@ -55,6 +59,8 @@ struct Peer {
 }
 
 pub struct Inner {
+    raw: raw::RawState,
+    crossing: Option<crossing::Crossing>,
     self_info: MachineInfo,
     initial_displays: Vec<DisplayRect>,
     capture: Arc<dyn splice_platform::Capture>,
@@ -132,12 +138,26 @@ impl Inner {
     ) -> anyhow::Result<Self> {
         let cfg = config::load(&data_dir)?;
         let layout_lamport = cfg.layout.as_ref().map(|d| d.stamp.lamport).unwrap_or(0);
-        let splice_platform::Platform { capture, emulate, clipboard, displays, events, backends } =
-            platform;
+        let splice_platform::Platform {
+            raw_capture,
+            raw_emulate,
+            capture,
+            emulate,
+            clipboard,
+            displays,
+            events,
+            backends,
+        } = platform;
         if let Some(backends) = &backends {
             let _ = backends.send(cfg.backends);
         }
         Ok(Inner {
+            crossing: None,
+            raw: raw::RawState::new(
+                raw_capture,
+                raw_emulate,
+                crate::input_settings::InputSettings::load(&data_dir, cfg.edge_dwell_ms)?,
+            ),
             self_info: MachineInfo {
                 build: splice_proto::BuildInfo::current(),
                 id: MachineId(String::new()),
@@ -218,11 +238,15 @@ impl Inner {
             self.poll_interval,
         );
         let mut platform_open = true;
+        let mut crossing_tick = tokio::time::interval(Duration::from_millis(16));
+        crossing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut diagnostic_tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             let ui_at = self.ui_deadline;
             let cfg_at = self.cfg_deadline;
             tokio::select! {
+                _ = crossing_tick.tick(), if self.crossing.is_some() => self.crossing_tick().await,
+                Some(event) = self.raw.events.recv() => self.on_raw_event(event).await,
                 _ = diagnostic_tick.tick() => {
                     if let Some(updates) = &mut self.updates {
                         updates.poll();
@@ -321,6 +345,7 @@ impl Inner {
             Focus::Driven(source) => self.end_driven(&source, Some(LeaveReason::Reconfigured)).await,
             Focus::Local => {}
         }
+        self.stop_raw().await;
         self.pending_fetches.clear();
         self.clipboard_jobs.abort_all();
         if self.cfg_deadline.is_some() {
@@ -476,6 +501,44 @@ impl Inner {
 
     async fn on_platform_event(&mut self, ev: PlatformEvent) {
         match ev {
+            PlatformEvent::Capture(CaptureEvent::EdgeMotion {
+                edge_id,
+                along,
+                dx,
+                dy,
+            }) => self.edge_motion(edge_id, along, dx, dy).await,
+            PlatformEvent::Capture(CaptureEvent::EdgeLeft) => {
+                if self
+                    .crossing
+                    .as_ref()
+                    .is_some_and(|c| c.local_edge.is_some())
+                {
+                    self.crossing = None;
+                    self.touch_ui();
+                }
+                if self.raw.preparing.is_some() && self.raw.edge.is_some() {
+                    if let Focus::Remote(target) = self.focus.clone() {
+                        self.end_remote(&target, LeaveReason::Crossed, None, true)
+                            .await;
+                    }
+                }
+            }
+            PlatformEvent::SwitchTarget => self.switch_target().await,
+            PlatformEvent::RawError(reason) => {
+                self.raw.error = Some(reason);
+                if self.raw.active || self.raw.preparing.is_some() {
+                    if let Focus::Remote(target) = self.focus.clone() {
+                        self.end_remote(
+                            &target,
+                            LeaveReason::CaptureLost,
+                            Some(self.last_local_pos),
+                            true,
+                        )
+                        .await;
+                    }
+                }
+                self.touch_ui();
+            }
             PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id, along }) => {
                 self.on_edge_hit(edge_id, along).await;
             }
@@ -534,6 +597,10 @@ impl Inner {
     // ----- focus FSM: source side -----
 
     async fn on_edge_hit(&mut self, edge_id: u32, along: f64) {
+        self.begin_edge(edge_id, along, false).await;
+    }
+
+    async fn begin_edge(&mut self, edge_id: u32, along: f64, committed: bool) {
         let Some(link) = self.armed.get(edge_id as usize).cloned() else {
             self.reject_edge_hit("unknown barrier id", None).await;
             return;
@@ -580,26 +647,62 @@ impl Inner {
             EdgeSide::Top | EdgeSide::Bottom => Vec2 { x: along, y: f64::from(link.at) },
         };
         self.last_local_pos = position_inside_from_edge(&link, local);
+        if !committed && self.contact_gesture(&link, edge_id, along).await {
+            return;
+        }
         let pos = layout::clamp_into_displays(
             &self.displays_of(&target),
             position_inside_to_edge(&link, local),
         );
+        if self.raw.settings.mode(&target) == splice_proto::raw::InputMode::Raw {
+            self.start_raw(target, pos, Some(edge_id)).await;
+            return;
+        }
+        self.start_desktop(target, pos).await;
+    }
+
+    async fn start_desktop(&mut self, target: MachineId, pos: Vec2) {
+        self.claim_source();
         self.session += 1;
         self.active_session = self.session;
-        let entered = self
-            .net
-            .as_ref()
-            .is_some_and(|net| net.send_to(&target, Frame::Enter {
-                session: self.active_session,
-                pos,
-            }));
+        let entered = self.net.as_ref().is_some_and(|net| {
+            net.send_to(
+                &target,
+                Frame::Enter {
+                    session: self.active_session,
+                    pos,
+                },
+            )
+        });
         if !entered {
-            let warp = position_inside_from_edge(&link, local);
-            self.reject_edge_hit("peer session disappeared before Enter", Some(warp)).await;
+            self.raw.error = Some("The destination disconnected before capture".into());
+            self.reject_edge_hit(
+                "peer session disappeared before Enter",
+                Some(self.last_local_pos),
+            )
+            .await;
+            self.touch_ui();
             return;
         }
         tracing::debug!(target = %target, session = self.active_session, ?pos, "entering remote machine");
-        let _ = self.capture.begin_capture().await;
+        if let Err(error) = self.capture.begin_capture().await {
+            if let Some(net) = &self.net {
+                net.send_to(
+                    &target,
+                    Frame::Leave {
+                        session: self.active_session,
+                        reason: LeaveReason::CaptureLost,
+                    },
+                );
+            }
+            self.raw.error = Some(format!("Cannot capture desktop input: {error}"));
+            self.capture
+                .end_capture(Some(self.last_local_pos))
+                .await
+                .ok();
+            self.touch_ui();
+            return;
+        }
         if let Some(net) = &self.net {
             net.set_active(&target, true);
         }
@@ -620,6 +723,9 @@ impl Inner {
     }
 
     async fn on_capture_input(&mut self, ev: InputEvent) {
+        if self.raw.active || self.raw.preparing.is_some() {
+            return;
+        }
         match ev {
             InputEvent::Motion { dx, dy } => self.on_remote_motion(dx, dy).await,
             other => {
@@ -635,18 +741,26 @@ impl Inner {
     }
 
     async fn on_remote_motion(&mut self, dx: f64, dy: f64) {
+        if self.remote_gesture_motion(dx, dy).await {
+            return;
+        }
         let dx = dx * self.active_sensitivity;
         let dy = dy * self.active_sensitivity;
         let next = Vec2 { x: self.virtual_pos.x + dx, y: self.virtual_pos.y + dy };
         let (inside, crossing) = match &self.focus {
             Focus::Remote(target) => {
                 let inside = layout::union_contains(self.display_slice_of(target), next);
-                let crossing = (!inside).then(|| self.find_crossing(target, next)).flatten();
+                let crossing = (!inside && !self.raw.settings.focus_lock)
+                    .then(|| self.find_crossing(target, next))
+                    .flatten();
                 (inside, crossing)
             }
             _ => return,
         };
         if let Some(link) = crossing {
+            if self.start_remote_gesture(link.clone(), next) {
+                return;
+            }
             self.cross_link(link, next).await;
             return;
         }
@@ -698,6 +812,19 @@ impl Inner {
     /// machine. The triggering motion is consumed by the transition, not forwarded.
     async fn cross_link(&mut self, link: EdgeLink, pos: Vec2) {
         let landing = position_inside_to_edge(&link, pos);
+        if link.to != self.self_info.id
+            && self.raw.settings.mode(&link.to) == splice_proto::raw::InputMode::Raw
+        {
+            self.end_remote(
+                &link.from,
+                LeaveReason::Crossed,
+                Some(self.last_local_pos),
+                true,
+            )
+            .await;
+            self.start_raw(link.to, landing, None).await;
+            return;
+        }
         if link.to == self.self_info.id {
             let warp = layout::clamp_into_displays(&self.self_info.displays, landing);
             tracing::debug!(from = %link.from, ?warp, "cursor crossed back home");
@@ -775,6 +902,8 @@ impl Inner {
         release_all: bool,
     ) {
         tracing::debug!(target = %target, ?reason, ?warp, "remote session ended");
+        self.crossing = None;
+        self.stop_raw().await;
         self.send_leave(target, reason, release_all);
         let _ = self.capture.end_capture(warp).await;
         self.focus = Focus::Local;
@@ -790,6 +919,7 @@ impl Inner {
     }
 
     async fn end_driven(&mut self, src: &MachineId, notify: Option<LeaveReason>) {
+        self.stop_raw().await;
         tracing::debug!(source = %src, ?notify, "driven session ended");
         self.release_target_side().await;
         let _ = self.emulate.leave().await;
@@ -807,8 +937,11 @@ impl Inner {
     }
 
     async fn panic(&mut self) {
+        self.crossing = None;
+        self.stop_raw().await;
         if let Focus::Remote(target) = self.focus.clone() {
-            self.end_remote(&target, LeaveReason::Panic, None, true).await;
+            self.end_remote(&target, LeaveReason::Panic, None, true)
+                .await;
         }
         if let Focus::Driven(src) = self.focus.clone() {
             self.end_driven(&src, Some(LeaveReason::Panic)).await;
@@ -844,6 +977,9 @@ impl Inner {
         if self.claim.as_ref().is_some_and(|c| stamp <= *c) {
             return;
         }
+        if self.raw.pending_target.as_ref().is_some_and(|(peer, _)| *peer != stamp.writer) {
+            self.stop_raw().await;
+        }
         self.claim = Some(stamp);
         if let Focus::Remote(target) = self.focus.clone() {
             self.end_remote(&target, LeaveReason::SourceChanged, Some(self.last_local_pos), false).await;
@@ -860,7 +996,30 @@ impl Inner {
 
     async fn on_peer_event(&mut self, ev: PeerEvent) {
         match ev {
-            PeerEvent::Connected { id, hello, caps, .. } => {
+            PeerEvent::Connected {
+                id, hello, caps, ..
+            } => {
+                if self.raw.active || self.raw.preparing.is_some() {
+                    if self.focus == Focus::Remote(id.clone()) {
+                        self.end_remote(
+                            &id,
+                            LeaveReason::Reconfigured,
+                            Some(self.last_local_pos),
+                            false,
+                        )
+                        .await;
+                    } else if self.focus == Focus::Driven(id.clone()) {
+                        self.end_driven(&id, None).await;
+                    }
+                }
+                if self
+                    .raw
+                    .pending_target
+                    .as_ref()
+                    .is_some_and(|(peer, _)| *peer == id)
+                {
+                    self.stop_raw().await;
+                }
                 tracing::info!(
                     peer = %id,
                     hostname = %hello.hostname,
@@ -873,6 +1032,7 @@ impl Inner {
                 peer.info = Some(hello);
                 peer.caps = caps;
                 peer.connected = true;
+                peer.raw_generation = 0;
                 peer.degraded = false;
                 if let (Some(net), Some(doc)) = (&self.net, &self.layout) {
                     net.send_to(&id, Frame::LayoutSync(doc.clone()));
@@ -889,6 +1049,14 @@ impl Inner {
             }
             PeerEvent::Frame(from, frame) => self.on_frame(from, frame).await,
             PeerEvent::Degraded(id) => {
+                if self
+                    .raw
+                    .pending_target
+                    .as_ref()
+                    .is_some_and(|(peer, _)| *peer == id)
+                {
+                    self.stop_raw().await;
+                }
                 self.peers.entry(id.clone()).or_default().degraded = true;
                 if self.focus == Focus::Remote(id.clone()) {
                     self.end_remote(&id, LeaveReason::Reconfigured, Some(self.last_local_pos), true)
@@ -905,6 +1073,14 @@ impl Inner {
                 self.touch_ui();
             }
             PeerEvent::Disconnected(id, reason) => {
+                if self
+                    .raw
+                    .pending_target
+                    .as_ref()
+                    .is_some_and(|(peer, _)| *peer == id)
+                {
+                    self.stop_raw().await;
+                }
                 self.pending_fetches.disconnect(&id);
                 tracing::debug!(peer = %id, reason, "peer disconnected");
                 let peer = self.peers.entry(id.clone()).or_default();
@@ -935,6 +1111,23 @@ impl Inner {
 
     async fn on_frame(&mut self, from: Arc<MachineId>, frame: Frame) {
         match frame {
+            Frame::RawPrepare { session, pos } => {
+                self.prepare_raw_target((*from).clone(), session, pos).await
+            }
+            Frame::RawReady {
+                session,
+                port,
+                ticket,
+            } => self.raw_ready((*from).clone(), session, port, ticket).await,
+            Frame::RawReject { session, reason } => {
+                self.on_raw_event(crate::raw_transport::Event::Ended {
+                    operation: self.raw.operation.clone(),
+                    peer: (*from).clone(),
+                    session,
+                    error: reason,
+                })
+                .await
+            }
             Frame::SourceClaim { stamp } => self.on_source_claim(stamp).await,
             Frame::LayoutSync(doc) => {
                 self.layout_lamport = self.layout_lamport.max(doc.stamp.lamport);
@@ -992,7 +1185,7 @@ impl Inner {
                     &self.focus,
                     Focus::Driven(src) if src == from.as_ref() && session == self.active_session
                 );
-                if current {
+                if current && !self.raw.active {
                     self.target_ledger.observe(&ev);
                     if let Err(err) = self.emulate.inject(ev).await {
                         tracing::warn!(source = %from, error = %err, "target input emulation failed");
@@ -1001,6 +1194,9 @@ impl Inner {
                 }
             }
             Frame::Leave { session, reason } => {
+                if self.raw.pending_target.as_ref() == Some(&(from.as_ref().clone(), session)) {
+                    self.stop_raw().await;
+                }
                 if matches!(
                     &self.focus,
                     Focus::Driven(source)
@@ -1019,13 +1215,20 @@ impl Inner {
             }
             Frame::ReleaseAll => {
                 if matches!(&self.focus, Focus::Driven(source) if source == from.as_ref()) {
-                    self.release_target_side().await;
+                    if self.raw.active {
+                        self.end_driven(from.as_ref(), Some(LeaveReason::Reconfigured)).await;
+                    } else {
+                        self.release_target_side().await;
+                    }
                 }
             }
-            Frame::Panic => match self.focus.clone() {
+            Frame::Panic => {
+                self.stop_raw().await;
+                match self.focus.clone() {
                 Focus::Remote(target) => self.end_remote(&target, LeaveReason::Panic, None, true).await,
                 Focus::Driven(source) => self.end_driven(&source, Some(LeaveReason::Panic)).await,
                 Focus::Local => self.release_target_side().await,
+                }
             },
             Frame::ClipOffer { id, stamp, mimes, inline_text } => {
                 self.on_clip_offer((*from).clone(), id, stamp, mimes, inline_text).await;
@@ -1059,7 +1262,9 @@ impl Inner {
             self.refuse_enter(&from, session);
             return;
         }
+        if self.raw.pending_target.is_some() { self.stop_raw().await; }
         if let Focus::Driven(old) = self.focus.clone() {
+            self.stop_raw().await;
             if old == from {
                 self.release_target_side().await;
             } else {
@@ -1214,8 +1419,40 @@ impl Inner {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
+            Command::SetInputSettings(settings) => {
+                self.crossing = None;
+                match settings.save(&self.data_dir) {
+                    Ok(()) => {
+                        if let Focus::Remote(target) = self.focus.clone() {
+                            self.end_remote(
+                                &target,
+                                LeaveReason::Reconfigured,
+                                Some(self.last_local_pos),
+                                true,
+                            )
+                            .await;
+                        }
+                        self.cfg.edge_dwell_ms = match settings.crossing {
+                            crate::input_settings::CrossingPolicy::Dwell { milliseconds } => {
+                                milliseconds
+                            }
+                            _ => 0,
+                        };
+                        self.mark_cfg_dirty();
+                        self.raw.settings = settings;
+                        self.raw.error = None;
+                    }
+                    Err(error) => {
+                        self.raw.error = Some(format!("Cannot save input settings: {error:#}"))
+                    }
+                }
+                self.touch_ui();
+            }
+            Command::SelectTarget(target) => self.select_target(target).await,
             Command::Update { machine, action } => {
-                if let Some(updates) = &mut self.updates { updates.request(machine, action); }
+                if let Some(updates) = &mut self.updates {
+                    updates.request(machine, action);
+                }
                 self.touch_ui();
             }
             Command::ExportDiagnostics => {
@@ -1236,6 +1473,8 @@ impl Inner {
                     self.send_master_state(id);
                 }
                 if !on {
+                    self.crossing = None;
+                    if self.raw.pending_target.is_some() { self.stop_raw().await; }
                     if let Focus::Remote(target) = self.focus.clone() {
                         self.end_remote(
                             &target,
@@ -1448,6 +1687,14 @@ impl Inner {
         }
         self.geo_links = layout::compute_links(&geo);
         self.links = layout::compute_links(&active);
+        if self
+            .crossing
+            .as_ref()
+            .is_some_and(|crossing| !self.links.contains(&crossing.link))
+        {
+            self.crossing = None;
+            self.touch_ui();
+        }
         self.reconcile_focus().await;
         self.armed = self
             .geo_links
@@ -1702,7 +1949,20 @@ impl Inner {
             diagnostics.peers = net.diagnostics();
         }
         UiState {
-            updates: self.updates.as_ref().map(|u| u.snapshot()).unwrap_or_default(),
+            crossing_progress: self.crossing.as_ref().map(|c| crate::ui_state::UiCrossing {
+                from: c.link.from.clone(),
+                to: c.link.to.clone(),
+                progress: c.progress,
+            }),
+            input_settings: self.raw.settings.clone(),
+            input_error: self.raw.error.clone(),
+            raw_active: self.raw.active,
+            preparing_input: self.raw.preparing.clone(),
+            updates: self
+                .updates
+                .as_ref()
+                .map(|u| u.snapshot())
+                .unwrap_or_default(),
             restart_requested: self.restart_requested,
             build: splice_proto::BuildInfo::current(),
             diagnostics,

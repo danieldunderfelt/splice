@@ -12,6 +12,7 @@
 
 pub mod keymap;
 pub mod mock;
+pub mod raw;
 pub mod scroll;
 
 #[cfg(target_os = "macos")]
@@ -60,6 +61,13 @@ pub struct EdgeSpec {
 /// Events flowing from the capture backend to the engine.
 #[derive(Clone, Debug)]
 pub enum CaptureEvent {
+    EdgeLeft,
+    EdgeMotion {
+        edge_id: u32,
+        along: f64,
+        dx: f64,
+        dy: f64,
+    },
     /// Cursor hit an armed edge. `along` is the position on the edge's from..to axis, in
     /// local logical coords. The engine responds by calling `begin_capture` (or ignoring).
     EdgeHit { edge_id: u32, along: f64 },
@@ -133,6 +141,8 @@ pub struct ClipboardOffer {
 /// Events flowing from platform monitors to the engine.
 #[derive(Clone, Debug)]
 pub enum PlatformEvent {
+    SwitchTarget,
+    RawError(String),
     Capture(CaptureEvent),
     /// Physical (non-injected) local input observed → engine may claim sourceness.
     /// Debounced ≥50 ms by the backend.
@@ -209,6 +219,8 @@ pub struct BackendStatus {
 
 /// Everything the engine needs from the OS, bundled.
 pub struct Platform {
+    pub raw_capture: Option<Arc<dyn raw::RawCapture>>,
+    pub raw_emulate: Option<Arc<dyn raw::RawEmulate>>,
     pub capture: Arc<dyn Capture>,
     pub emulate: Arc<dyn Emulate>,
     pub clipboard: Arc<dyn Clipboard>,

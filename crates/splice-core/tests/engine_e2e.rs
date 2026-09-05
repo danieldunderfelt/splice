@@ -134,7 +134,8 @@ async fn spawn_rig_configured(self_node: Node, peers: Vec<Node>, config: splice_
 }
 
 async fn spawn_trio() -> (Rig, Rig, Rig) {
-    let na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    na.os = "macos".into();
     let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
     let nc = node_at("ccc", Ipv4Addr::new(127, 0, 0, 3));
     let a = spawn_rig_with(na.clone(), vec![nb.clone(), nc.clone()]).await;
@@ -1124,6 +1125,484 @@ async fn diagnostics_report_build_heartbeat_and_traffic_without_clipboard_conten
     assert!(!bytes.contains(secret));
     assert!(!bytes.contains("held_keys") && !bytes.contains("tokens"));
     let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
-    assert_eq!(value["state"]["diagnostics"]["peers"]["bbb"]["build"]["protocol"], splice_proto::PROTO_VERSION);
-    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        value["state"]["diagnostics"]["peers"]["bbb"]["build"]["protocol"],
+        splice_proto::PROTO_VERSION
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+async fn enable_raw(a: &Rig, targets: &[&str]) {
+    let settings = splice_core::input_settings::InputSettings {
+        destinations: targets
+            .iter()
+            .map(|id| (mid(id), splice_proto::raw::InputMode::Raw))
+            .collect(),
+        focus_lock: true,
+        ..Default::default()
+    };
+    a.handle.send(Command::SetInputSettings(settings));
+    wait_until("raw settings applied", || {
+        a.handle.state().borrow().input_settings.focus_lock
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_reports_cross_three_machine_sessions_without_desktop_motion_conversion() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, c) = spawn_trio().await;
+    enable_raw(&a, &["bbb", "ccc"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw capture begins after target preparation", || {
+        a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: 1000,
+            events: vec![
+                RawEvent::Motion {
+                    x: -10001,
+                    y: 20003,
+                },
+                RawEvent::Key {
+                    code: 42,
+                    pressed: true,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    wait_until("raw report injected", || {
+        b.mock.state.lock().raw_reports.len() == 1
+    })
+    .await;
+    assert_eq!(
+        b.mock.state.lock().raw_events[0],
+        RawEvent::Motion {
+            x: -10001,
+            y: 20003
+        }
+    );
+    assert!(b.mock.state.lock().injected.is_empty());
+    a.handle.send(Command::SelectTarget(mid("ccc")));
+    wait_until("raw handoff reaches third computer", || {
+        c.mock.state.lock().raw_session.is_some() && a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    wait_until("old destination releases shift", || {
+        b.mock.state.lock().raw_events.contains(&RawEvent::Key {
+            code: 42,
+            pressed: false,
+        })
+    })
+    .await;
+    assert!(output
+        .send(RawReport {
+            device: 1,
+            sequence: 1,
+            captured_us: 2000,
+            events: vec![RawEvent::Motion { x: 999, y: 999 }]
+        })
+        .await
+        .is_err());
+    a.handle.send(Command::SelectTarget(mid("aaa")));
+    wait_until("raw shortcut returns home", || {
+        !a.mock.state.lock().capturing && c.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_target_failure_releases_source_and_every_held_key() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw capture", || a.mock.state.lock().raw_output.is_some()).await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: 0,
+            events: vec![RawEvent::Key {
+                code: 30,
+                pressed: true,
+            }],
+        })
+        .await
+        .unwrap();
+    wait_until("raw key pressed", || {
+        b.mock.state.lock().raw_reports.len() == 1
+    })
+    .await;
+    output
+        .send(RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: 1,
+            events: vec![RawEvent::Motion { x: 1, y: 2 }],
+        })
+        .await
+        .unwrap();
+    wait_until("duplicate report ends both sides", || {
+        !a.mock.state.lock().capturing && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert!(b.mock.state.lock().raw_events.contains(&RawEvent::Key {
+        code: 30,
+        pressed: false
+    }));
+    wait_until("failure visible", || {
+        a.handle.state().borrow().input_error.is_some()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_preparation_failure_never_swallows_source_input_or_enters_desktop_mode() {
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    b.mock.state.lock().raw_error = Some("uinput permission denied".into());
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw preparation error visible", || {
+        a.handle
+            .state()
+            .borrow()
+            .input_error
+            .as_ref()
+            .is_some_and(|e| e.contains("uinput permission denied"))
+    })
+    .await;
+    assert!(!a.mock.state.lock().capturing);
+    assert!(b.mock.state.lock().entered.is_empty());
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+}
+
+#[tokio::test]
+async fn membrane_keeps_local_input_until_commit_and_consumes_crossing_motion() {
+    use splice_core::input_settings::{CrossingPolicy, InputSettings};
+    let (a, b, c) = spawn_trio().await;
+    a.handle.send(Command::SetInputSettings(InputSettings {
+        crossing: CrossingPolicy::Resistance {
+            points: 100.0,
+            decay_per_second: 0.0,
+        },
+        ..Default::default()
+    }));
+    wait_until("resistance setting applied", || {
+        matches!(
+            a.handle.state().borrow().input_settings.crossing,
+            CrossingPolicy::Resistance { .. }
+        )
+    })
+    .await;
+    let edge = a
+        .mock
+        .state
+        .lock()
+        .edges
+        .iter()
+        .find(|e| e.side == EdgeSide::Right)
+        .unwrap()
+        .clone();
+    let along = 540.0;
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+            edge_id: edge.id,
+            along,
+        }))
+        .unwrap();
+    wait_until("edge gesture visible", || {
+        a.handle.state().borrow().crossing_progress.is_some()
+    })
+    .await;
+    assert!(!a.mock.state.lock().capturing);
+    assert!(b.mock.state.lock().entered.is_empty());
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeMotion {
+            edge_id: edge.id,
+            along,
+            dx: 0.0,
+            dy: 1000.0,
+        }))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!a.mock.state.lock().capturing);
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeMotion {
+            edge_id: edge.id,
+            along,
+            dx: 100.0,
+            dy: 0.0,
+        }))
+        .unwrap();
+    wait_until("membrane crossed", || {
+        a.mock.state.lock().capturing && !b.mock.state.lock().entered.is_empty()
+    })
+    .await;
+    assert!(b.mock.state.lock().injected.is_empty());
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::Input(
+            InputEvent::Key {
+                code: 42,
+                pressed: true,
+            },
+        )))
+        .unwrap();
+    push_motion(&a, 3000.0, 0.0);
+    wait_until("onward membrane visible", || {
+        a.handle
+            .state()
+            .borrow()
+            .crossing_progress
+            .as_ref()
+            .is_some_and(|p| p.to == mid("ccc"))
+    })
+    .await;
+    assert!(c.mock.state.lock().entered.is_empty());
+    push_motion(&a, 100.0, 0.0);
+    wait_until("onward crossing carries modifier", || {
+        c.mock.state.lock().injected.contains(&InputEvent::Key {
+            code: 42,
+            pressed: true,
+        })
+    })
+    .await;
+    assert!(!c
+        .mock
+        .state
+        .lock()
+        .injected
+        .iter()
+        .any(|ev| matches!(ev, InputEvent::Motion { .. })));
+}
+
+#[tokio::test]
+async fn leaving_a_local_edge_cancels_dwell_without_capturing_keys() {
+    use splice_core::input_settings::{CrossingPolicy, InputSettings};
+    let (a, b, _c) = spawn_trio().await;
+    a.handle.send(Command::SetInputSettings(InputSettings {
+        crossing: CrossingPolicy::Dwell { milliseconds: 400 },
+        ..Default::default()
+    }));
+    wait_until("dwell setting applied", || {
+        matches!(
+            a.handle.state().borrow().input_settings.crossing,
+            CrossingPolicy::Dwell { .. }
+        )
+    })
+    .await;
+    let edge = a.mock.state.lock().edges[0].clone();
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+            edge_id: edge.id,
+            along: 540.0,
+        }))
+        .unwrap();
+    wait_until("dwell active", || {
+        a.handle.state().borrow().crossing_progress.is_some()
+    })
+    .await;
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeLeft))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(!a.mock.state.lock().capturing);
+    assert!(b.mock.state.lock().entered.is_empty());
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+            edge_id: edge.id,
+            along: 540.0,
+        }))
+        .unwrap();
+    wait_until("second dwell completes", || {
+        a.mock.state.lock().capturing && !b.mock.state.lock().entered.is_empty()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_polling_rates_preserve_reports_while_clipboard_is_busy() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw capture under load", || {
+        a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    let bytes = vec![0x5a; 8 * 1024 * 1024];
+    a.mock
+        .state
+        .lock()
+        .local_clip
+        .insert("image/png".into(), bytes.clone());
+    a.mock
+        .events
+        .send(PlatformEvent::ClipboardChanged {
+            mimes: vec!["image/png".into()],
+            inline_text: None,
+        })
+        .unwrap();
+    wait_until("bulk offer", || b.mock.last_fetch.lock().is_some()).await;
+    let fetch = b.mock.last_fetch.lock().clone().unwrap();
+    let clipboard = tokio::spawn(async move { fetch.fetch("image/png").await });
+    let mut expected = Vec::new();
+    let mut sequence = 0;
+    let mut timestamp = 0;
+    for hz in [125, 500, 1000] {
+        let mut interval = tokio::time::interval(Duration::from_micros(1_000_000 / hz));
+        for index in 0..hz / 4 {
+            interval.tick().await;
+            timestamp += 1_000_000 / hz;
+            let report = RawReport {
+                device: 1,
+                sequence,
+                captured_us: timestamp,
+                events: vec![RawEvent::Motion {
+                    x: -(index as i32) - 1,
+                    y: index as i32 * 2 + 1,
+                }],
+            };
+            output.try_send(report.clone()).unwrap();
+            expected.push(report);
+            sequence += 1;
+        }
+    }
+    wait_until("all input reports delivered under load", || {
+        b.mock.state.lock().raw_reports.len() == expected.len()
+    })
+    .await;
+    assert_eq!(b.mock.state.lock().raw_reports, expected);
+    assert!(b.mock.state.lock().injected.is_empty());
+    assert_eq!(clipboard.await.unwrap(), Some(bytes));
+}
+
+#[tokio::test]
+async fn raw_source_restart_reuses_wire_generation_without_retaining_keys_or_old_streams() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw session before restart", || {
+        a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    let old = a.mock.state.lock().raw_output.clone().unwrap();
+    old.send(RawReport {
+        device: 1,
+        sequence: 0,
+        captured_us: 0,
+        events: vec![RawEvent::Key {
+            code: 42,
+            pressed: true,
+        }],
+    })
+    .await
+    .unwrap();
+    wait_until("key held before restart", || {
+        b.mock.state.lock().raw_reports.len() == 1
+    })
+    .await;
+    let previous_session = b.mock.state.lock().raw_session.unwrap();
+    let data_dir = a.data_dir.clone();
+    drop(a);
+    wait_until("raw source gone", || {
+        !connected_to(&b, "aaa") && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert!(b.mock.state.lock().raw_events.contains(&RawEvent::Key {
+        code: 42,
+        pressed: false
+    }));
+    let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    na.os = "macos".into();
+    let a = spawn_rig_configured(
+        na,
+        vec![
+            node_at("bbb", Ipv4Addr::new(127, 0, 0, 2)),
+            node_at("ccc", Ipv4Addr::new(127, 0, 0, 3)),
+        ],
+        splice_core::config::load(&data_dir).unwrap(),
+    )
+    .await;
+    for (rig, peers) in [
+        (&a, [("bbb", &b), ("ccc", &c)]),
+        (&b, [("aaa", &a), ("ccc", &c)]),
+        (&c, [("aaa", &a), ("bbb", &b)]),
+    ] {
+        for (id, peer) in peers {
+            rig.dial_ports
+                .write()
+                .unwrap()
+                .insert(mid(id), peer.addr.port());
+        }
+    }
+    wait_until("source reconnects", || {
+        connected_to(&a, "bbb") && connected_to(&b, "aaa")
+    })
+    .await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("new raw session", || {
+        a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    assert_eq!(b.mock.state.lock().raw_session, Some(previous_session));
+    assert!(old.is_closed());
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: 0,
+            events: vec![RawEvent::Motion { x: 7, y: -9 }],
+        })
+        .await
+        .unwrap();
+    wait_until("new stream injects after session reuse", || {
+        b.mock.state.lock().raw_reports.len() == 2
+    })
+    .await;
+    wait_until("new raw session is published", || {
+        a.handle.state().borrow().raw_active
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn manual_desktop_selection_can_skip_the_middle_computer() {
+    let (a, b, c) = spawn_trio().await;
+    a.handle.send(Command::SelectTarget(mid("ccc")));
+    wait_until("manual desktop reaches nonadjacent peer", || {
+        !c.mock.state.lock().entered.is_empty()
+    })
+    .await;
+    assert!(b.mock.state.lock().entered.is_empty());
+    push_motion(&a, 5.0, -2.0);
+    wait_until("desktop motion arrives", || {
+        !c.mock.state.lock().injected.is_empty()
+    })
+    .await;
+    wait_until("manual target published", || {
+        focus_of(&a) == UiFocus::Remote(mid("ccc"))
+    })
+    .await;
 }

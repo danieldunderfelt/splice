@@ -5,6 +5,7 @@
 //! the callback does only four things: check the injected magic, keep the held-key ledger
 //! for the panic chord, test edges when idle, and swallow+enqueue when capturing.
 
+use crate::raw::shortcut::{Stream, SwitchShortcut};
 use super::ffi::{self, SPLICE_MAGIC};
 use super::{cursor, MacShared};
 use crate::keymap;
@@ -57,6 +58,9 @@ const TAPPED_EVENTS: &[CGEventType] = &[
 ];
 
 pub struct TapState {
+    pub raw_enabled: AtomicBool,
+    pub raw_switching: AtomicBool,
+    switch: Mutex<SwitchShortcut>,
     shared: Arc<MacShared>,
     edges: RwLock<Vec<EdgeSpec>>,
     corners: RwLock<Vec<(f64, f64)>>,
@@ -85,6 +89,9 @@ impl TapState {
     pub fn new(shared: Arc<MacShared>, panic_chord: Vec<u32>) -> Arc<Self> {
         let corners = super::displays::corners(&shared.displays.read());
         Arc::new(Self {
+            raw_enabled: AtomicBool::new(false),
+            raw_switching: AtomicBool::new(false),
+            switch: Mutex::new(SwitchShortcut::default()),
             shared,
             edges: RwLock::new(Vec::new()),
             corners: RwLock::new(corners),
@@ -116,21 +123,64 @@ impl TapState {
 
     pub fn begin(&self) {
         let _guard = self.capture_lock.lock();
+        self.raw_switching.store(false, Ordering::SeqCst);
         if self.capturing.swap(true, Ordering::SeqCst) {
             return;
         }
         *self.contact.lock() = None;
         cursor::begin();
+        for event in crate::keymap::held_key_presses(
+            self.keys
+                .lock()
+                .held
+                .iter()
+                .copied()
+                .filter(|code| !self.switch.lock().suppressed(Stream::Desktop, *code as u16)),
+        ) {
+            self.emit(CaptureEvent::Input(event));
+        }
     }
 
     pub fn end(&self, warp_to: Option<CGPoint>) {
+        self.finish(warp_to, false);
+    }
+
+    fn finish(&self, warp_to: Option<CGPoint>, switching: bool) {
         let _guard = self.capture_lock.lock();
+        self.raw_switching.store(switching, Ordering::SeqCst);
+        self.raw_enabled.store(false, Ordering::SeqCst);
         if !self.capturing.swap(false, Ordering::SeqCst) {
             return;
         }
         cursor::end(warp_to);
         self.last_end_ms.store(cursor::now_ms(), Ordering::SeqCst);
         *self.contact.lock() = None;
+    }
+
+    pub fn switch_target(&self, stream: Stream) -> bool {
+        if !self.switch.lock().press(stream, cursor::now_ms()) {
+            return false;
+        }
+        self.finish(None, true);
+        self.shared.emit(PlatformEvent::SwitchTarget);
+        true
+    }
+
+    pub fn shortcut_suppressed(&self, code: u16) -> bool {
+        self.switch.lock().suppressed(Stream::Hid, code)
+    }
+
+    pub fn release_shortcut_key(&self, code: u16) {
+        self.switch.lock().release(Stream::Hid, code);
+    }
+
+    pub fn touches_edge(&self, id: u32) -> bool {
+        *self.contact.lock() == Some(id)
+    }
+
+    pub fn available(&self) -> bool {
+        let port = self.port.load(Ordering::SeqCst);
+        !port.is_null() && unsafe { ffi::CGEventTapIsEnabled(port as _) }
     }
 
     fn is_capturing(&self) -> bool {
@@ -288,6 +338,12 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         // Our callback exceeded the system budget (or the machine hitched). Re-enabling is
         // enough and capture state stays valid.
         CGEventType::TapDisabledByTimeout => {
+            if st.raw_enabled.load(Ordering::SeqCst) {
+                st.end(None);
+                st.emit(CaptureEvent::Broken {
+                    reason: "Raw input stopped because local suppression timed out".into(),
+                });
+            }
             let port = st.port.load(Ordering::SeqCst) as CFMachPortRef;
             if !port.is_null() {
                 unsafe { ffi::CGEventTapEnable(port, true) };
@@ -321,10 +377,23 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
 
     let key_edge = key_edge_of(st, etype, event);
     if let Some((code, pressed)) = key_edge {
+        if !pressed {
+            st.switch.lock().release(Stream::Desktop, code as u16);
+        }
         if st.track_key(code, pressed) {
             // Panic must work with the network wedged: restore locally first, report after.
             st.end(None);
             st.emit(CaptureEvent::Panic);
+            return CallbackResult::Drop;
+        }
+    }
+
+    if key_edge == Some((88, true)) {
+        let keys = st.keys.lock();
+        let switch = keys.held.contains(&29) && keys.held.contains(&56);
+        drop(keys);
+        if switch {
+            st.switch_target(Stream::Desktop);
             return CallbackResult::Drop;
         }
     }
@@ -347,9 +416,21 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
                         *contact = Some(edge_id);
                         drop(contact);
                         st.emit(CaptureEvent::EdgeHit { edge_id, along });
+                    } else {
+                        drop(contact);
+                        st.emit(CaptureEvent::EdgeMotion {
+                            edge_id,
+                            along,
+                            dx: event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X),
+                            dy: event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y),
+                        });
                     }
                 }
-                None => *st.contact.lock() = None,
+                None => {
+                    if st.contact.lock().take().is_some() {
+                        st.emit(CaptureEvent::EdgeLeft);
+                    }
+                }
             }
         }
         return CallbackResult::Keep;
@@ -362,7 +443,9 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
     {
         cursor::reassert(event.location());
     }
-    translate(etype, event, key_edge).emit(st);
+    if !st.raw_enabled.load(Ordering::SeqCst) {
+        translate(etype, event, key_edge).emit(st);
+    }
     CallbackResult::Drop
 }
 

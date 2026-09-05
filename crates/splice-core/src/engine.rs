@@ -15,7 +15,12 @@ use tokio::sync::{mpsc, watch};
 /// Commands from UI / tray / daemon control.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
-    Update { machine: MachineId, action: splice_update::control::Action },
+    SetInputSettings(crate::input_settings::InputSettings),
+    SelectTarget(MachineId),
+    Update {
+        machine: MachineId,
+        action: splice_update::control::Action,
+    },
     ExportDiagnostics,
     SetMasterEnabled(bool),
     SetMachineEnabled(MachineId, bool),

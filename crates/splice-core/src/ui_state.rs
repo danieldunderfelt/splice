@@ -51,7 +51,19 @@ pub enum UiFocus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UiCrossing {
+    pub from: MachineId,
+    pub to: MachineId,
+    pub progress: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
+    pub crossing_progress: Option<UiCrossing>,
+    pub input_settings: crate::input_settings::InputSettings,
+    pub input_error: Option<String>,
+    pub raw_active: bool,
+    pub preparing_input: Option<MachineId>,
     pub updates: std::collections::BTreeMap<MachineId, crate::updates::UiUpdate>,
     pub restart_requested: bool,
     pub build: splice_proto::BuildInfo,
@@ -80,6 +92,11 @@ pub struct UiState {
 impl UiState {
     pub fn initial(self_id: MachineId) -> Self {
         UiState {
+            crossing_progress: None,
+            input_settings: Default::default(),
+            input_error: None,
+            raw_active: false,
+            preparing_input: None,
             updates: Default::default(),
             restart_requested: false,
             build: splice_proto::BuildInfo::current(),

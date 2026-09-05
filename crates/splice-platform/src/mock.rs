@@ -14,6 +14,12 @@ use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct MockState {
+    pub raw_output: Option<mpsc::Sender<splice_proto::raw::RawReport>>,
+    pub raw_session: Option<u64>,
+    pub raw_reports: Vec<splice_proto::raw::RawReport>,
+    pub raw_events: Vec<splice_proto::raw::RawEvent>,
+    pub raw_error: Option<String>,
+    pub raw_ledger: splice_proto::raw::RawLedger,
     pub edges: Vec<EdgeSpec>,
     pub capturing: bool,
     pub capture_ends: Vec<Option<Vec2>>,
@@ -113,6 +119,8 @@ pub fn create(displays: Vec<DisplayRect>) -> (Platform, MockHandle) {
         last_fetch: Arc::new(Mutex::new(None)),
     };
     let platform = Platform {
+        raw_capture: Some(Arc::new(MockRaw(handle.clone()))),
+        raw_emulate: Some(Arc::new(MockRaw(handle.clone()))),
         capture: Arc::new(MockCapture(handle.clone())),
         emulate: Arc::new(MockEmulate(handle.clone())),
         clipboard: Arc::new(MockClipboard(handle.clone())),
@@ -125,5 +133,88 @@ pub fn create(displays: Vec<DisplayRect>) -> (Platform, MockHandle) {
 
 /// Convenience: a 1920x1080 single display at origin.
 pub fn one_display() -> Vec<DisplayRect> {
-    vec![DisplayRect { id: "d0".into(), x: 0, y: 0, w: 1920, h: 1080, scale: 1.0 }]
+    vec![DisplayRect {
+        id: "d0".into(),
+        x: 0,
+        y: 0,
+        w: 1920,
+        h: 1080,
+        scale: 1.0,
+    }]
+}
+
+struct MockRaw(MockHandle);
+
+impl crate::raw::RawCapture for MockRaw {
+    fn readiness(&self) -> Result<()> {
+        if let Some(error) = &self.0.state.lock().raw_error {
+            return Err(crate::PlatformError::Unavailable(error.clone()));
+        }
+        Ok(())
+    }
+    fn begin(
+        &self,
+        output: mpsc::Sender<splice_proto::raw::RawReport>,
+        _edge: Option<u32>,
+    ) -> Result<()> {
+        self.readiness()?;
+        let mut state = self.0.state.lock();
+        state.capturing = true;
+        state.raw_output = Some(output);
+        Ok(())
+    }
+    fn end(&self) {
+        let mut state = self.0.state.lock();
+        if state.raw_output.take().is_some() {
+            state.capturing = false;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::raw::RawEmulate for MockRaw {
+    async fn prepare(&self) -> Result<()> {
+        if let Some(error) = &self.0.state.lock().raw_error {
+            return Err(crate::PlatformError::Unavailable(error.clone()));
+        }
+        Ok(())
+    }
+    fn begin(&self, session: u64) -> Result<()> {
+        let mut state = self.0.state.lock();
+        if state.raw_session.is_some() {
+            return Err(crate::PlatformError::Unavailable(
+                "raw mock has an owner".into(),
+            ));
+        }
+        state.raw_session = Some(session);
+        state.raw_ledger = Default::default();
+        Ok(())
+    }
+    fn inject(&self, session: u64, report: &splice_proto::raw::RawReport) -> Result<()> {
+        let mut state = self.0.state.lock();
+        if state.raw_session != Some(session) {
+            return Err(crate::PlatformError::Unavailable(
+                "stale raw mock session".into(),
+            ));
+        }
+        if let Some(error) = &state.raw_error {
+            return Err(crate::PlatformError::Unavailable(error.clone()));
+        }
+        let events = state
+            .raw_ledger
+            .apply(report)
+            .map_err(|e| crate::PlatformError::Other(anyhow::anyhow!(e)))?;
+        state.raw_events.extend(events);
+        state.raw_reports.push(report.clone());
+        Ok(())
+    }
+    fn end(&self, session: u64) -> Result<()> {
+        let mut state = self.0.state.lock();
+        if state.raw_session == Some(session) {
+            let events = state.raw_ledger.release();
+            state.raw_events.extend(events);
+            state.raw_session = None;
+        }
+        Ok(())
+    }
 }

@@ -378,6 +378,11 @@ pub mod preview {
         this.is_source = true;
 
         let mut state = UiState {
+            crossing_progress: None,
+            input_settings: Default::default(),
+            input_error: None,
+            raw_active: false,
+            preparing_input: None,
             build: splice_proto::BuildInfo::current(),
             diagnostics: Default::default(),
             updates: Default::default(),
@@ -445,6 +450,14 @@ pub mod preview {
     /// Apply a UI command to the canned state, mirroring what the engine would do.
     pub fn apply(state: &mut UiState, cmd: &Command) {
         match cmd {
+            Command::SetInputSettings(settings) => state.input_settings = settings.clone(),
+            Command::SelectTarget(id) => {
+                state.focus = if *id == state.self_id {
+                    UiFocus::Local
+                } else {
+                    UiFocus::Remote(id.clone())
+                }
+            }
             Command::SetMasterEnabled(on) => {
                 state.master_enabled = *on;
                 recompute_edges(state);

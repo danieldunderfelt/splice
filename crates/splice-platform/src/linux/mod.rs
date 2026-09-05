@@ -30,6 +30,8 @@ mod screensaver;
 mod tokens;
 mod uinput;
 
+mod raw;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -184,7 +186,21 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         prefs_rx,
     )
     .await;
-    activity::spawn(shared.clone(), handles.panic.clone(), opts.panic_chord, handles.driven.clone());
+    let raw_input = Arc::new(raw::RelativeInput::new(shared.clone()));
+    let raw_panic = PanicRelease::new({
+        let raw_input = raw_input.clone();
+        let panic = handles.panic.clone();
+        move || {
+            raw_input.force_release();
+            panic.trigger();
+        }
+    });
+    activity::spawn(
+        shared.clone(),
+        raw_panic,
+        opts.panic_chord,
+        handles.driven.clone(),
+    );
 
     if handles.capture_unavailable && handles.inject_unavailable {
         return Err(PlatformError::Unavailable(
@@ -193,6 +209,8 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     }
 
     Ok(Platform {
+        raw_capture: None,
+        raw_emulate: Some(raw_input),
         capture: handles.capture,
         emulate: handles.emulate,
         clipboard: handles.clipboard,

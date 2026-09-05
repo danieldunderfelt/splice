@@ -195,6 +195,10 @@ impl SpliceApp {
                             ui.add_space(10.0);
                         }
 
+                        crate::input::panel(ui, state, &self.ctrl);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
                         self.sensitivity_section(ui, state);
                         ui.add_space(14.0);
                         ui.separator();
@@ -222,7 +226,11 @@ impl SpliceApp {
 
     fn sensitivity_section(&mut self, ui: &mut egui::Ui, state: &UiState) {
         ui.label(RichText::new("Link sensitivity").size(15.5).strong());
-        ui.label(RichText::new("Pointer speed when crossing onto each machine.").small().weak());
+        ui.label(
+            RichText::new("Desktop mode pointer speed. Raw input preserves device counts.")
+                .small()
+                .weak(),
+        );
         ui.add_space(6.0);
 
         let live = self.ctrl.is_live();
