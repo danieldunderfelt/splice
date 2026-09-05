@@ -14,11 +14,14 @@
 //! the service if needed; `splice quit` stops everything.
 
 mod app;
+#[cfg(target_os = "macos")]
+mod edge_indicator;
 #[cfg(target_os = "linux")]
 mod autostart;
 mod drag;
 mod diagnostics;
 mod updates;
+mod input;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
@@ -100,6 +103,18 @@ fn dispatch(preview: bool) {
 
 fn main() -> eframe::Result<()> {
     match std::env::args().nth(1).as_deref() {
+        #[cfg(target_os = "macos")]
+        Some("--raw-probe") => {
+            let result = std::env::args().nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: splice --raw-probe SECONDS"))
+                .and_then(|s| Ok(s.parse::<u64>()?))
+                .and_then(|seconds| splice_platform::macos::probe::inspect(std::time::Duration::from_secs(seconds)));
+            match result {
+                Ok(report) => println!("{}", serde_json::to_string_pretty(&report).expect("HID probe serializes")),
+                Err(error) => { eprintln!("{error:#}"); std::process::exit(1); }
+            }
+            return Ok(());
+        }
         Some("--version-json") => { println!("{}", serde_json::to_string(&splice_proto::BuildInfo::current()).expect("build information serializes")); return Ok(()); }
         Some("--version") => { let b = splice_proto::BuildInfo::current(); println!("Splice {} · {} · protocol {}", b.version, b.commit, b.protocol); return Ok(()); }
         Some("--apply-update") => {

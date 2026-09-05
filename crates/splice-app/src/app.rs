@@ -36,6 +36,8 @@ const COMPACT_H: f32 = 72.0;
 const VIEW_TAU: f32 = 0.12;
 
 pub struct SpliceApp {
+    #[cfg(target_os = "macos")]
+    edge_indicator: crate::edge_indicator::EdgeIndicator,
     ctrl: Controller,
     tray: Tray,
     actions: mpsc::Receiver<AppAction>,
@@ -62,6 +64,8 @@ impl SpliceApp {
         exit_after: Option<f64>,
     ) -> Self {
         SpliceApp {
+            #[cfg(target_os = "macos")]
+            edge_indicator: crate::edge_indicator::EdgeIndicator::new(),
             ctrl,
             tray,
             actions,
@@ -195,6 +199,10 @@ impl SpliceApp {
                             ui.add_space(10.0);
                         }
 
+                        crate::input::panel(ui, state, &self.ctrl);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
                         self.sensitivity_section(ui, state);
                         ui.add_space(14.0);
                         ui.separator();
@@ -222,7 +230,11 @@ impl SpliceApp {
 
     fn sensitivity_section(&mut self, ui: &mut egui::Ui, state: &UiState) {
         ui.label(RichText::new("Link sensitivity").size(15.5).strong());
-        ui.label(RichText::new("Pointer speed when crossing onto each machine.").small().weak());
+        ui.label(
+            RichText::new("Desktop mode pointer speed. Raw input preserves device counts.")
+                .small()
+                .weak(),
+        );
         ui.add_space(6.0);
 
         let live = self.ctrl.is_live();
@@ -651,6 +663,8 @@ impl eframe::App for SpliceApp {
     /// Non-drawing work: smoke-run deadline, close→hide, tray event pump. Also runs
     /// while the window is hidden, so the tray keeps working then too.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        self.edge_indicator.sync(&self.ctrl.state());
 
         // SPLICE_UI_EXIT_AFTER (preview smoke runs): close cleanly after N seconds.
         if let Some(deadline) = self.exit_at {

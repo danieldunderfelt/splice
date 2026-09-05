@@ -1,0 +1,279 @@
+# Raw input and deliberate edge crossing
+
+Status: Splice 1.2.0, protocol 4 supports raw capture from Linux and macOS, with relative injection
+on Linux. Automated Linux checks pass. Native Mac workspace tests, Clippy, release engine tests,
+and Developer ID signing have passed. The Mac screen-edge indicator was exercised on all four edges
+without taking focus, and captured Mac device descriptors have portable regression tests.
+See the [Mac evidence](raw-input-macos-validation.md) for device limits and exact results.
+Physical forwarding, local suppression, and gaming acceptance remain unverified. Complete the
+[Linux acceptance checks](raw-input-linux.md#complete-native-acceptance) and the
+[Mac handoff](raw-input-macos-handoff.md) before releasing raw mode.
+
+The current implementation requires explicitly selected focus lock for raw input. Destination
+edge observations are not implemented. Dwell and resistance work with a Mac source, including
+its desktop sessions across Linux destinations. Linux source edges retain Immediate crossing;
+selecting a delayed policy there produces an error. Progress appears in the Splice window and in
+a Mac panel beside the physical screen edge, including while the Splice window is hidden.
+
+## Agreed scope
+
+Keep the current desktop mode fully supported, including all existing directions, clipboard sharing,
+layout, held modifiers, reconnection, and emergency release. Add a selectable raw input mode alongside it.
+Raw mode supports a mouse and keyboard connected to a Linux or Mac source controlling Linux.
+Both Fedora GNOME and KDE are target desktops. Linux-to-Mac raw input is outside the first version.
+
+Support standard HID mouse and keyboard input without model-specific implementations or a vendor
+allowlist. USB cables and wireless USB receivers are the first validation targets. Bluetooth uses
+the same input model and is part of the compatibility target. It must not require a second protocol.
+Actual Bluetooth behavior, including reconnect and wake, needs separate validation.
+
+A deliberate edge crossing delay is acceptable. Continuous input after crossing must have no added
+smoothing, artificial delay, or conversion through desktop pointer acceleration.
+
+## Why raw input can improve gaming
+
+The current mode captures source-accelerated logical pixels. The core applies link sensitivity and
+tracks a virtual cursor. The destination applies those pixels through desktop injection APIs or the
+Linux absolute uinput pointer. This preserves desktop cursor speed and coordinated edge crossings.
+
+The Linux pointer is already a virtual device, but its axes are absolute. A gaming mode needs the
+relative movement that a physical mouse supplies. Both capture and injection must change together:
+feeding accelerated desktop deltas into a relative mouse would apply destination processing again.
+
+The implemented path is:
+
+```text
+Physical USB or Bluetooth mouse and keyboard
+    -> Linux evdev or macOS HID capture, before desktop pointer acceleration
+    -> ordered input connection over the tailnet
+    -> Linux virtual relative mouse and keyboard
+    -> Linux desktop or game
+```
+
+Linux supports relative virtual mice and keyboards through
+[uinput](https://docs.kernel.org/input/uinput.html). Apple's HID interfaces expose physical device
+input, including [Bluetooth keyboard input and reports](https://developer.apple.com/documentation/corehid/communicatingwithhiddevices).
+This supports a transport-independent design. Exact device behavior still requires measurement.
+
+This forwards standard input into virtual devices. It does not need to export a Bluetooth radio,
+clone a particular mouse's USB bus connection, or transfer device ownership between USB drivers.
+USB-specific vendor software, firmware updates, RGB controls, and arbitrary peripheral passthrough
+are separate features and are outside this mode.
+
+VirtualHere is a useful benchmark because the user has already achieved acceptable FPS behavior
+with it on the local network. Its [client](https://www.virtualhere.com/usb_client_software) imports USB
+devices, and its [control API](https://www.virtualhere.com/client_api) supports acquisition and release.
+Splice's implementation is native and does not depend on a VirtualHere installation or license.
+
+## Settings and compatibility
+
+The controls are independent:
+
+| Setting | Choices | Initial behavior |
+|---|---|---|
+| Input mode for a destination | Desktop, Raw input | Desktop remains the default |
+| Edge crossing | Immediate, Dwell, Resistance | Existing immediate behavior remains the default |
+| Focus lock | Off, Locked to selected computer | Explicit user selection; switch shortcut and emergency release remain available |
+
+Raw input can be selected for Linux-to-Linux and Mac-to-Linux routes. Device permissions, target readiness,
+and mode capabilities must be checked before raw forwarding begins. Linux edge capture is already
+active during preparation, so any failure explicitly restores local control. An unsupported
+selection reports the missing capability. Splice never silently substitutes desktop mode.
+
+Desktop link sensitivity continues to apply only to desktop mode. Raw mode preserves device counts.
+The receiving desktop or game applies its own settings, as with a locally attached relative device.
+The standard keyboard path preserves physical key positions, simultaneous keys, modifiers, and
+press/release ordering. The destination owns keyboard layout and repeat behavior.
+
+The transport change requires all peers to run the same new Splice release. Keeping desktop mode is
+a product guarantee, not an old-wire-protocol compatibility mode.
+
+## Capture on the Mac
+
+Use macOS HID device discovery and input callbacks to identify standard mouse, keyboard, and consumer
+control usages. Interpret capabilities and HID elements or descriptors rather than special-casing
+particular models. Keep device identity separate from its USB or Bluetooth transport.
+
+The implementation uses IOHIDManager input report callbacks and descriptor-driven decoding.
+It monitors devices without seizing them. The existing active session event tap suppresses local
+mouse and keyboard events; a second active tap suppresses media events of type 14. Native tests
+must prove these two paths neither lose physical reports nor leak local input.
+Timestamps currently record callback enqueue time on a monotonic clock, not hardware report time.
+
+Capture must preserve signed relative motion, buttons, wheel resolution, physical key state, and
+standard media keys. Handle composite receivers, multiple HID collections, different report IDs,
+multiple simultaneous devices, hotplug, and Bluetooth reconnect. Resolve input permission failures
+explicitly and reject unreadable descriptors before activation. Unused control declarations must not
+block a device. Validate key and button mappings when a report asserts them; an unrepresentable input
+ends capture and releases held state.
+
+Keep the existing cursor and emergency-release machinery. Verify how HID capture and local event
+suppression interact before release. Input must reach exactly one active destination;
+it must not also move the Mac pointer or type into Mac apps. Selected devices' state transitions must
+remain ordered at capture activation and release. A read-only HID monitor alone is insufficient.
+
+The Mac is only the source in this version. Creating virtual input devices on macOS, obtaining
+virtual-HID or DriverKit distribution entitlements, and bundling a Mac driver are not prerequisites.
+Any future raw input into macOS needs its own platform and signing validation.
+
+## Capture on Linux
+
+The source reads physical evdev devices before libinput acceleration. `RawDevice` preserves kernel
+`SYN_REPORT` groups and exposes `SYN_DROPPED`. A dropped report ends capture because lost motion
+cannot be reconstructed. High-resolution wheel events replace their accompanying legacy detents.
+Key repeat comes from the destination. Device identifiers, report sequence, and monotonic enqueue
+timestamps belong to one source aggregator.
+
+Wayland still suppresses local input. The source starts through an existing portal barrier or overlay
+edge. A Linux source cannot start through a button or shortcut while local, because portal capture
+has no forced-activation request. Once captured, shortcut and manual selection can switch remote
+computers while retaining the Wayland session. Returning home or failing releases that session.
+Raw-to-Desktop handoffs hold compositor delivery closed until a snapshot is queued under the same
+emission lock. Keyboard state comes from the kernel sample. Held buttons come from the compositor,
+which preserves its button mappings. If only one stream reports any held buttons, the handoff keeps
+delivery closed and waits up to 500 ms for compositor callbacks, resampling after each notification.
+Persistent presence disagreement rejects the handoff and restores local control. This check does not
+establish a one-to-one correspondence between simultaneously held buttons. The source ledger rejects
+duplicate key and button transitions.
+
+The reader never uses exclusive device grabs. Even a brief `EVIOCGRAB` probe can hide a physical key
+release from the compositor. Instead, stream checks correlate compositor keyboard, button, and
+motion activity with raw reports. Either callback order is accepted. Missing keyboard or button
+activity expires after 500 ms. Repeated unmatched motion also ends the session. Scroll events are
+excluded from this check because a compositor can produce both smooth and discrete representations
+of one wheel event. These checks detect intercepted activity at runtime; idle devices cannot prove
+that another service has no exclusive grab.
+
+Discovery checks input capabilities before opening devices, excludes software virtual inputs, and
+includes Bluetooth UHID paths. Device replacement at the same event path gets a fresh identity.
+Relevant hotplug, revoked access, unsupported reports, and queue overflow stop raw capture visibly.
+Errors retain their operation identity, so delayed errors cannot stop a newer session. A failure
+records its reason on that operation and closes the raw stream before notifying the engine. The
+transport worker can report the precise cause even if its close notification arrives first.
+Desktop mode is never substituted. See [Linux setup and native checks](raw-input-linux.md).
+
+## Injection on Linux
+
+Create a relative uinput mouse and virtual keyboard when raw mode is enabled and keep them alive
+across handoffs. This avoids device enumeration on every crossing. Advertise accurate input
+capabilities and exclude Splice's own virtual devices from local capture and source-claim logic.
+
+Emit relative axes and input synchronization groups. Do not send raw movement through the absolute
+pointer's position accumulator or the core's desktop sensitivity multiplier. Device removal and
+session loss must release all held keys and buttons, including input held by a device that vanished.
+If several physical devices hold the same key, one device releasing it must not release the other.
+
+Validate native Linux input, Wayland games, XWayland, and games through Proton. Generic virtual HID
+input does not promise compatibility with every game or duplicate every vendor-specific feature.
+The existing desktop backends remain available and independently tested.
+
+## Transport and module ownership
+
+Use a dedicated ordered input connection per peer so clipboard bytes cannot block behind or ahead of
+raw reports on that socket. Reuse tailnet authentication and bind the connection to the authenticated
+peer, negotiated input mode, and control-session generation. Creating a raw socket alone does not
+grant ownership or permission to inject input.
+
+The stream uses TCP port 41719 and `TCP_NODELAY`, preserving report order. VirtualHere's successful local-network
+behavior makes an ordered transport a reasonable first candidate. TCP still stalls on packet loss;
+measure this explicitly. A datagram transport is a separate decision only if measurements justify
+its loss-recovery and ordering complexity.
+
+Each report carries device identity, session generation, sequence, source timestamp, and its input
+data. Keep timestamps for timing diagnostics without comparing unsynchronized clocks as if they were
+one-way latency measurements. Preserve reports at supported polling rates without a frame timer or
+lossy event queue. Overload ends the session with a visible error and releases held state.
+
+Use distinct types for desktop pixel movement and raw device movement. The module ownership
+keeps these contracts separate:
+
+| Module | Responsibility |
+|---|---|
+| `splice-platform` Mac raw capture | HID discovery, physical input, local suppression, and permission health |
+| `splice-platform` Linux raw capture | Read-only evdev reports, Wayland suppression, device discovery, and held-state handoffs |
+| `splice-platform` Linux raw injection | Persistent relative mouse and keyboard, device state, and forced release |
+| `splice-proto` | Distinct raw reports, capabilities, and session-bound messages |
+| `splice-core` input session | One active owner, readiness, handoff, ordering, and failure recovery |
+| `splice-core` edge policy | Dwell and resistance state independent of input transport |
+| `splice-app` | Mode selection, focus lock, readiness, and visible errors |
+
+The desktop implementation retains its current contract. Raw movement bypasses the desktop
+`on_remote_motion` path, which multiplies sensitivity and predicts crossings in pixel coordinates.
+Avoid duplicating clipboard, discovery, peer authorization, layout replication, or update control.
+
+## Handoff and the membrane
+
+Model handoff explicitly as local control, edge contact, target preparation, remote control, and
+release or recovery. A generation identifies the active session so a late acknowledgement or input
+report from an old target cannot activate a stale handoff.
+
+Prepare the target before transferring ownership. During the edge gesture, the pointer meets a
+boundary and outward movement increases progress. Only after the crossing policy and target readiness
+are satisfied does Splice commit the handoff, synchronize held state, and forward subsequent input.
+The movement used to push through the membrane is consumed by that gesture and must not become a
+burst of movement or a camera jump on the target. Preparation time is separate from steady input latency.
+
+Resistance measures continued outward movement, not physical force. Tangential motion adds nothing.
+Pulling away cancels the attempt. Pausing lets resistance progress decay. Use elapsed time and movement
+distance so changing polling rate does not change the gesture. Normalize the gesture's configurable
+feel separately from game movement, and test it across display scales and mouse DPI settings.
+The Splice panel shows resistance progress, preparation, and failed crossings. The Mac screen-edge
+indicator shows the destination and current gesture progress without accepting input or taking focus.
+For remote Desktop crossings it maps the source display's edge position onto the physical Mac display
+holding the frozen pointer. Gesture updates publish every 16 ms; other UI changes retain their existing
+debounce. Indicator geometry uses logical points and converts to AppKit coordinates at the panel boundary.
+
+Dwell is a separate timed policy for users who prefer waiting at an edge. `input.json` stores
+mode selection, focus lock, and crossing policy. On first use, an existing nonzero
+`edge_dwell_ms` initializes Dwell. Subsequent changes keep that configuration field synchronized.
+Malformed settings are preserved and reported, never replaced with defaults.
+
+Apply the policy consistently to local-to-remote, remote-to-local, and remote-to-remote transitions.
+When a Linux or Mac source controls a Linux computer, switching destinations retains the physical
+input source. Linux keeps its existing Wayland capture session across remote handoffs.
+
+## Edge observations and gaming lock
+
+Raw counts cannot predict the Linux cursor position because Linux acceleration, application grabs,
+and game camera movement determine their meaning. Use destination edge observations for return and
+onward crossings. Validate those observations separately with GNOME's portal path and KDE's supported
+capture path. Injection must not make the destination incorrectly claim physical input ownership.
+
+This is a concrete feasibility checkpoint. Raw forwarding into a game can work before automatic raw
+return crossings do. If a desktop cannot provide the needed edge observations, advertise that
+limitation explicitly and offer an explicitly selected shortcut-only focus lock. Do not pretend
+predicted cursor coordinates are reliable or silently alter the user's crossing setting.
+
+Gaming lock disables automatic edge switching for that session. Turning a camera cannot take the
+mouse to another computer. A dedicated switch shortcut chooses another destination or returns to
+the source computer; the existing emergency chord must restore local control even if the network is unavailable.
+No automatic fullscreen or game detection is required for the first version.
+
+## Implementation sequence and acceptance
+
+1. Establish a reproducible comparison between direct attachment, VirtualHere, and current Splice.
+   Use the same mouse, polling rate, DPI, network, destination settings, and test application.
+   Record counts and cadence separately from input-to-display latency.
+2. Prove Mac raw capture and Linux relative injection with a manually selected, focus-locked target.
+   Confirm original motion counts, simultaneous keyboard input, local suppression, and emergency release.
+3. Add the authenticated input connection and session handoff. Test target preparation, failed handoff,
+   clipboard saturation, sleep, crashes, unplugging, permissions loss, and reconnect.
+4. Add mode selection, destination edge observations, dwell, resistance, and visible progress.
+   Cover all three-computer transitions without replacing existing desktop behavior.
+5. Validate USB cables and receivers, then Bluetooth, using the same protocol and device model.
+   Complete native GNOME and KDE game testing before calling the mode suitable for gaming.
+
+Automated tests must cover exact signed motion counts, report ordering, different HID report layouts,
+standard extra buttons and media keys, wheel resolution, simultaneous keys beyond six-key rollover,
+multiple devices holding the same key, stale sessions, duplicate injection, and release on failure.
+Exercise supported report rates under load, including 125, 500, and 1000 Hz, with higher rates measured
+on suitable hardware rather than assumed supported.
+
+Membrane tests cover tangential movement, retreat, pause, diagonal approaches, changed topology,
+handshake failure, polling-rate independence, and modifier state across the transition. Existing
+mesh, clipboard, scroll, reconnection, and desktop-motion regressions remain release requirements.
+
+For performance acceptance, compare the new mode with direct attachment and VirtualHere on the same
+local network. Check high-percentile latency, event cadence, count preservation, and actual FPS aiming.
+The existing loopback test is useful but cannot establish hardware-to-game feel. No zero-latency or
+universal game-compatibility claim is part of this plan.

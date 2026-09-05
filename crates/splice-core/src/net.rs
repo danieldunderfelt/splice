@@ -230,6 +230,14 @@ impl NetControlInner {
 }
 
 impl NetControl {
+    pub(crate) fn bind_ip(&self) -> IpAddr {
+        self.inner.bind_ip
+    }
+
+    pub(crate) fn peer_ip(&self, id: &MachineId) -> Option<IpAddr> {
+        self.inner.targets.read().get(id).copied()
+    }
+
     pub fn diagnostics(&self) -> std::collections::BTreeMap<MachineId, PeerDiagnostics> {
         let mut result = self.inner.diagnostics.read().clone();
         for (id, slot) in self.inner.peers.read().iter() {

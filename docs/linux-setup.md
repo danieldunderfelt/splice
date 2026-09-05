@@ -198,3 +198,24 @@ retain the consent, and its persistent `Input Capture` notification is expected.
 
 If peers do not appear, run `tailscale status` and confirm that Tailscale is running and that the
 peer is online. Splice does not use MagicDNS for peer connections.
+
+## Send and receive raw input
+
+Use the same protocol 4 build on every computer. Raw input requires `/dev/uinput` access even if
+the Desktop injection backend uses the Remote Desktop portal. Install the udev rule above; a
+missing permission produces a preparation error and restores local control.
+
+Allow TCP 41719 on the Tailscale interface alongside KVM port 41717 and updater port 41718.
+The receiver creates `Splice Virtual Raw Mouse` and `Splice Virtual Raw Keyboard`, then keeps
+them alive across handoffs. The devices use relative mouse axes and preserve physical key codes.
+The destination desktop or game applies its own acceleration, keyboard layout, and repeat settings.
+
+To send raw input from Linux, choose **Raw input** for a Linux destination and enable
+**Stay on selected computer**. Cross a screen edge to begin, then press **Ctrl+Alt+F12** to
+switch computers or return here. Source device access uses the same udev rule. USB cables, USB
+receivers, and Bluetooth devices that expose relative evdev mouse reports use the same capture path.
+Touchpads, tablets, and exclusive device grabs by remappers are unsupported in Raw mode.
+See [Linux raw input validation](raw-input-linux.md) for setup and acceptance checks.
+
+Linux source edges currently support Immediate crossing. Dwell and Resistance require passive
+edge observations and are available with a Mac source. See the [native validation handoff](raw-input-macos-handoff.md).

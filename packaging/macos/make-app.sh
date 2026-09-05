@@ -81,4 +81,5 @@ Next steps:
 1. Drag Splice.app to /Applications.
 2. Open Splice.
 3. In System Settings > Privacy & Security > Accessibility, enable Splice.
+4. For raw input, also enable Splice under Input Monitoring and restart the app.
 EOF

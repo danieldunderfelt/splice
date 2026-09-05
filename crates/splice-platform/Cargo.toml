@@ -17,6 +17,7 @@ futures = { workspace = true }
 keycode = { workspace = true }
 parking_lot = { workspace = true }
 libc = "0.2"
+hidparser = "1.0.3"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

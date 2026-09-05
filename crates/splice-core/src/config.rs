@@ -14,7 +14,6 @@ pub struct Config {
     pub panic_chord: Vec<u32>,
     /// Last adopted layout (rejoin the cluster with prior arrangement).
     pub layout: Option<LayoutDoc>,
-    /// Edge-crossing dwell in ms (0 = effortless; the knob exists for accident-prone edges).
     pub edge_dwell_ms: u32,
     /// Corner dead-zone size in logical px.
     pub corner_dead_zone: u32,

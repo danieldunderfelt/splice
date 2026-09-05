@@ -89,7 +89,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
     avoid hot-corner fights (default 16 px).
-12. **One current protocol.** Every client runs protocol 3 and advertises all required capabilities.
+12. **One current protocol.** Every client runs protocol 4 and advertises all required capabilities.
     A mismatch rejects the connection with an upgrade message. There is no compatibility mode.
 13. **Keep the target awake**: injection declares user activity; while a session is entered the
     target takes a display-sleep inhibition (macOS IOPMAssertion; Linux D-Bus
@@ -342,3 +342,18 @@ tokens), atomic writes (tmp + rename). Machine-local; layout replicates via Layo
 - `splice-core` must be fully testable without platform backends (trait objects + a `MockPlatform`).
 - Integration tests: two-, three-, and five-machine full meshes over loopback TCP with mock platforms,
   asserting an end-to-end enter → input → leave → clipboard flow.
+
+## Raw input and crossing policy
+
+See [Raw input and deliberate edge crossing](raw-input-design.md) for scope and native validation status.
+Raw input has distinct report types, a separate authenticated TCP connection on port 41719, and a
+Linux relative uinput backend. Desktop sensitivity and cursor prediction do not process raw reports.
+
+A target prepares persistent virtual devices before source capture begins. Each stream requires
+the control owner's Tailscale identity, address, session number, and a random single-use ticket.
+Local operation identities distinguish async completions even when a peer restarts and reuses a
+wire session number. Disconnect, timeout, bad reports, and capture errors release held state.
+
+Raw mode requires explicit focus lock until destination edge observations are implemented.
+The source chooses input mode per destination. Crossing policy and focus lock are separate local
+settings in input.json. The shared gesture state consumes the outward movement used for crossing.

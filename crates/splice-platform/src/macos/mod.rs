@@ -26,6 +26,9 @@ pub mod inject;
 pub mod pasteboard;
 pub mod tap;
 
+mod raw;
+pub use raw::probe;
+
 use crate::{
     Capture, EdgeSpec, HealthReport, Platform, PlatformEvent, PlatformOpts, Result,
 };
@@ -179,6 +182,8 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     let clipboard = Arc::new(pasteboard::PasteboardClip::new(shared.clone()));
 
     Ok(Platform {
+        raw_capture: Some(raw::HidCapture::spawn(shared.clone(), tap_state.clone())),
+        raw_emulate: None,
         capture: Arc::new(MacCapture { state: tap_state }),
         emulate,
         clipboard,

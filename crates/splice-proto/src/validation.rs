@@ -65,14 +65,28 @@ impl LayoutDoc {
 impl Frame {
     pub fn validate(&self) -> Result<(), ProtoError> {
         let valid = match self {
-            Frame::Hello(hello) => machine(&hello.machine) && hello.machine.build.protocol == hello.proto_max,
-            Frame::Welcome(welcome) => machine(&welcome.machine) && welcome.machine.build.protocol == welcome.proto,
-            Frame::MachineUpdate(info) => machine(info) && info.build.protocol == crate::PROTO_VERSION,
+            Frame::RawReady {
+                session,
+                port,
+                ticket,
+            } => *session > 0 && *port > 0 && ticket.iter().any(|b| *b != 0),
+            Frame::RawReject { reason, .. } => !reason.is_empty() && reason.len() <= 4096,
+            Frame::Hello(hello) => {
+                machine(&hello.machine) && hello.machine.build.protocol == hello.proto_max
+            }
+            Frame::Welcome(welcome) => {
+                machine(&welcome.machine) && welcome.machine.build.protocol == welcome.proto
+            }
+            Frame::MachineUpdate(info) => {
+                machine(info) && info.build.protocol == crate::PROTO_VERSION
+            }
             Frame::LayoutSync(doc) => return doc.validate(),
             Frame::SourceClaim { stamp: value } | Frame::ClipOffer { stamp: value, .. } => {
                 stamp(value)
             }
-            Frame::Enter { pos, .. } => pos.x.is_finite() && pos.y.is_finite(),
+            Frame::RawPrepare { pos, .. } | Frame::Enter { pos, .. } => {
+                pos.x.is_finite() && pos.y.is_finite()
+            }
             Frame::Input {
                 ev: InputEvent::Motion { dx, dy } | InputEvent::ScrollPixels { dx, dy },
                 ..

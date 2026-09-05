@@ -2,7 +2,7 @@
 
 Splice shares one mouse, keyboard, and clipboard across macOS and Linux computers on the same Tailscale network. It discovers peers automatically. Move the pointer across an arranged screen edge to control another computer.
 
-The workspace version is Splice 1.1.0.
+The workspace version is Splice 1.2.0.
 
 Splice is under active development. Linux support targets Wayland sessions: GNOME and KDE through the desktop portals, and KDE, Hyprland, sway, niri, COSMIC and other layer-shell compositors through a native overlay and uinput backend.
 
@@ -98,7 +98,7 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
-1. Install the same current build and start Splice on every computer. Protocol 3 rejects older clients.
+1. Install the same current build and start Splice on every computer. Protocol 4 rejects older clients.
 2. Approve the operating system permission prompts.
 3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
@@ -141,3 +141,16 @@ cargo test -p splice-platform live_overlay_arms_both_edges_after_startup -- --ig
 For implementation details, see [the design document](docs/DESIGN.md).
 The [September 2026 investigation](docs/multi-machine-investigation.md) records the reproduced
 failures, fixes, and remaining live verification.
+
+## Raw mouse and keyboard input
+
+Splice supports selectable raw input from Linux and Mac sources to Linux destinations through a
+relative virtual mouse and keyboard. Desktop mode remains the default in every existing direction.
+Raw mode requires **Stay on selected computer**. Use **Ctrl+Alt+F12** to cycle through computers,
+or use the **Control** buttons during capture. On Linux, start capture by crossing a screen edge.
+Mac sources also have Immediate, Dwell, and Resistance crossing.
+
+See [Linux raw input setup and validation](docs/raw-input-linux.md) for device requirements and checks.
+Native Mac capture and gaming validation are pending. See the [implementation status](docs/raw-input-design.md)
+and [Mac build and validation handoff](docs/raw-input-macos-handoff.md) before releasing raw mode.
+Raw input uses TCP 41719 on the Tailscale interface, in addition to KVM port 41717 and updater port 41718.

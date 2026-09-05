@@ -5,13 +5,14 @@
 //! authentication — there is no crypto at this layer.
 //!
 pub mod framing;
+pub mod raw;
 pub mod validation;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTO_VERSION: u16 = 3;
+pub const PROTO_VERSION: u16 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
@@ -216,6 +217,19 @@ impl LayoutDoc {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Frame {
+    RawPrepare {
+        session: u64,
+        pos: Vec2,
+    },
+    RawReady {
+        session: u64,
+        port: u16,
+        ticket: [u8; 32],
+    },
+    RawReject {
+        session: u64,
+        reason: String,
+    },
     Hello(Hello),
     Welcome(Welcome),
     /// Liveness + RTT. Echo `nonce` and `t_us` back in `Pong` untouched.

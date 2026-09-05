@@ -38,6 +38,8 @@ requirements in [Notarizing macOS software before distribution](https://develope
 
 ## Publish a version
 
+Complete the [native raw-input acceptance checks](raw-input-macos-handoff.md) before publishing 1.2.0.
+
 1. Update `workspace.package.version` in `Cargo.toml` and refresh `Cargo.lock`.
 2. Run the checks:
 
@@ -49,7 +51,7 @@ python3 -m unittest discover -s packaging/tests -v
 ```
 
 3. Commit the release changes and push them.
-4. Tag that commit with the exact stable workspace version, such as `v1.1.0`, and push the tag.
+4. Tag that commit with the exact stable workspace version, such as `v1.2.0`, and push the tag.
 5. Check the **Release** workflow. All three native test jobs and all package jobs must pass before publication.
 
 The release contains three `splice-TARGET.tar.gz` archives, `splice-update.json`, and its detached
@@ -64,7 +66,7 @@ prerelease tags. An already published release is not overwritten.
 ## Bootstrap existing computers
 
 Protocol 2 clients do not include the updater. Install this version manually on every computer once.
-Splice 1.1.0 uses KVM protocol 3 and refuses older KVM protocols.
+Splice 1.2.0 uses KVM protocol 4 and refuses older KVM protocols.
 
 On Linux, build and use the per-user installer:
 
@@ -79,7 +81,7 @@ If replacing a bundle signed with `Splice Dev`, grant Accessibility permission t
 signed app. Keep the same Developer ID team and bundle identifier for later releases.
 
 After this bootstrap, use the [Updates panel](updates.md) for newer published versions.
-A local development build with version `1.1.0` cannot install another `1.1.0` build through OTA.
+A local development build with version `1.2.0` cannot install another `1.2.0` build through OTA.
 
 ## Build from a source archive
 

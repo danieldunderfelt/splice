@@ -967,6 +967,8 @@ mod tests {
     async fn live_overlay_arms_both_edges_after_startup() {
         let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
+            capture_control: Default::default(),
+            emission: parking_lot::Mutex::new(()),
             tx,
             health: parking_lot::Mutex::new(crate::HealthReport::default()),
             displays: parking_lot::RwLock::new(Vec::new()),

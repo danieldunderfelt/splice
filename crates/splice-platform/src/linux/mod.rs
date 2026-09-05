@@ -30,6 +30,9 @@ mod screensaver;
 mod tokens;
 mod uinput;
 
+mod raw;
+mod raw_capture;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +52,8 @@ pub const VIRTUAL_DEVICE_PREFIX: &str = "Splice Virtual";
 /// State every Linux submodule needs: the event sink, the health report (published on
 /// transitions only) and the current display geometry.
 pub struct Shared {
+    capture_control: raw_capture::control::Control,
+    emission: Mutex<()>,
     tx: UnboundedSender<PlatformEvent>,
     health: Mutex<HealthReport>,
     displays: RwLock<Vec<DisplayRect>>,
@@ -94,10 +99,35 @@ impl Shared {
         if last == 0 {
             return None;
         }
-        Some(self.epoch.elapsed().saturating_sub(std::time::Duration::from_micros(last)))
+        Some(
+            self.epoch
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_micros(last)),
+        )
     }
 
     pub fn emit(&self, ev: PlatformEvent) {
+        let _emission = self.emission.lock();
+        match &ev {
+            PlatformEvent::Capture(crate::CaptureEvent::EdgeHit { .. }) => {
+                self.capture_control.activate()
+            }
+            PlatformEvent::Capture(
+                crate::CaptureEvent::Broken { .. } | crate::CaptureEvent::Panic,
+            ) => self.capture_control.release(),
+            PlatformEvent::Capture(crate::CaptureEvent::Input(event)) => {
+                let (switched, suppressed) = self
+                    .capture_control
+                    .desktop_event(event, self.epoch.elapsed().as_millis() as u64);
+                if switched {
+                    let _ = self.tx.send(PlatformEvent::SwitchTarget);
+                }
+                if suppressed || self.capture_control.raw_hold.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+            _ => {}
+        }
         let _ = self.tx.send(ev);
     }
 
@@ -164,12 +194,16 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
 
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
+        capture_control: Default::default(),
+        emission: Mutex::new(()),
         tx,
         health: Mutex::new(HealthReport::default()),
         displays: RwLock::new(Vec::new()),
         epoch: Instant::now(),
         last_injection: AtomicU64::new(0),
-        injected_keys: Mutex::new(std::collections::VecDeque::with_capacity(INJECTED_KEYS_KEPT)),
+        injected_keys: Mutex::new(std::collections::VecDeque::with_capacity(
+            INJECTED_KEYS_KEPT,
+        )),
     });
 
     let displays = displays::spawn(shared.clone())?;
@@ -184,7 +218,22 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         prefs_rx,
     )
     .await;
-    activity::spawn(shared.clone(), handles.panic.clone(), opts.panic_chord, handles.driven.clone());
+    let raw_input = Arc::new(raw::RelativeInput::new(shared.clone()));
+    let raw_capture = raw_capture::DeviceCapture::spawn(shared.clone(), handles.capture.clone())?;
+    let raw_panic = PanicRelease::new({
+        let raw_input = raw_input.clone();
+        let panic = handles.panic.clone();
+        move || {
+            raw_input.force_release();
+            panic.trigger();
+        }
+    });
+    activity::spawn(
+        shared.clone(),
+        raw_panic,
+        opts.panic_chord,
+        handles.driven.clone(),
+    );
 
     if handles.capture_unavailable && handles.inject_unavailable {
         return Err(PlatformError::Unavailable(
@@ -193,7 +242,9 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     }
 
     Ok(Platform {
-        capture: handles.capture,
+        raw_capture: Some(raw_capture.clone()),
+        raw_emulate: Some(raw_input),
+        capture: raw_capture,
         emulate: handles.emulate,
         clipboard: handles.clipboard,
         displays,

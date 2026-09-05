@@ -19,6 +19,8 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 directories = { workspace = true }
+postcard = { workspace = true }
+getrandom = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
