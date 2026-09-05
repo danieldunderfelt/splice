@@ -1832,8 +1832,10 @@ impl Inner {
     // ----- UiState & config -----
 
     fn touch_ui(&mut self) {
-        if self.ui_deadline.is_none() {
-            self.ui_deadline = Some(Instant::now() + UI_DEBOUNCE);
+        let delay = if self.crossing.is_some() { Duration::from_millis(16) } else { UI_DEBOUNCE };
+        let deadline = Instant::now() + delay;
+        if self.ui_deadline.is_none_or(|current| deadline < current) {
+            self.ui_deadline = Some(deadline);
         }
     }
 
@@ -1953,6 +1955,8 @@ impl Inner {
                 from: c.link.from.clone(),
                 to: c.link.to.clone(),
                 progress: c.progress,
+                side: c.link.side,
+                position: c.pos,
             }),
             input_settings: self.raw.settings.clone(),
             input_error: self.raw.error.clone(),

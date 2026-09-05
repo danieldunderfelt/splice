@@ -36,7 +36,7 @@ pub enum PlatformError {
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
 /// Which side of the machine's display-union boundary an edge segment lies on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum EdgeSide {
     Left,
     Right,

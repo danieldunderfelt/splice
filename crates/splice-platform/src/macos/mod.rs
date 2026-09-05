@@ -27,6 +27,7 @@ pub mod pasteboard;
 pub mod tap;
 
 mod raw;
+pub use raw::probe;
 
 use crate::{
     Capture, EdgeSpec, HealthReport, Platform, PlatformEvent, PlatformOpts, Result,

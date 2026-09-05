@@ -60,6 +60,11 @@ fn control(page: u16, usage: u16) -> Result<Option<Control>> {
 }
 
 impl Decoder {
+    pub fn reset(&mut self) {
+        self.held.clear();
+        self.wheel_remainders.clear();
+    }
+
     pub fn new(descriptor: &[u8]) -> Result<Self> {
         ensure!(
             !descriptor.is_empty() && descriptor.len() <= 4096,
@@ -83,13 +88,13 @@ impl Decoder {
             for field in &report.fields {
                 match field {
                     ReportField::Variable(f) => {
+                        if f.attributes.constant || !matches!(f.usage.page(), 1 | 7 | 9 | 12) {
+                            continue;
+                        }
                         ensure!(
                             (1..=32).contains(&f.bits.len()),
                             "unsupported HID field width"
                         );
-                        if f.attributes.constant {
-                            continue;
-                        }
                         if f.usage.page() == 1 && matches!(f.usage.id(), 0x30 | 0x31) {
                             ensure!(
                                 f.attributes.relative,
@@ -100,13 +105,11 @@ impl Decoder {
                         if f.usage.page() == 7 {
                             keyboard = true;
                         }
-                        if matches!(f.usage.page(), 7 | 9 | 12)
-                            && !(f.usage.page() == 12 && f.usage.id() == 0x238)
-                        {
-                            control(f.usage.page(), f.usage.id())?;
-                        }
                     }
                     ReportField::Array(f) => {
+                        if f.attributes.constant || !f.usage_list.iter().any(|r| matches!(r.start() >> 16, 7 | 9 | 12)) {
+                            continue;
+                        }
                         ensure!(
                             (1..=32).contains(&f.bits.len()),
                             "unsupported HID array width"
@@ -406,7 +409,7 @@ fn preflight(bytes: &[u8]) -> Result<Vec<i32>> {
             count = value;
         }
         if tag & 0xfc == 0x74 {
-            ensure!(value <= 32, "HID field width too large");
+            ensure!(value <= 32768, "HID field width too large");
         }
         match tag & 0xfc {
             0xa0 => {

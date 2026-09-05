@@ -36,6 +36,8 @@ const COMPACT_H: f32 = 72.0;
 const VIEW_TAU: f32 = 0.12;
 
 pub struct SpliceApp {
+    #[cfg(target_os = "macos")]
+    edge_indicator: crate::edge_indicator::EdgeIndicator,
     ctrl: Controller,
     tray: Tray,
     actions: mpsc::Receiver<AppAction>,
@@ -62,6 +64,8 @@ impl SpliceApp {
         exit_after: Option<f64>,
     ) -> Self {
         SpliceApp {
+            #[cfg(target_os = "macos")]
+            edge_indicator: crate::edge_indicator::EdgeIndicator::new(),
             ctrl,
             tray,
             actions,
@@ -659,6 +663,8 @@ impl eframe::App for SpliceApp {
     /// Non-drawing work: smoke-run deadline, close→hide, tray event pump. Also runs
     /// while the window is hidden, so the tray keeps working then too.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        self.edge_indicator.sync(&self.ctrl.state());
 
         // SPLICE_UI_EXIT_AFTER (preview smoke runs): close cleanly after N seconds.
         if let Some(deadline) = self.exit_at {

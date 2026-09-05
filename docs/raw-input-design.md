@@ -1,15 +1,17 @@
 # Raw input and deliberate edge crossing
 
-Status: shared implementation and automated Linux checks are in the working tree for Splice 1.2.0,
-protocol 4. The native Linux device capability check passed; native desktop and game validation remain. Mac HID capture code passes Apple target compilation checks. Native Mac capture,
-local suppression, and gaming acceptance remain unverified. Continue with the
+Status: Splice 1.2.0, protocol 4 passes native Mac workspace tests, Clippy, release engine tests,
+and Developer ID signing. A native screen-edge indicator has been implemented and exercised on
+all four edges without taking focus. Captured Mac device descriptors have portable regression tests.
+See the [Mac evidence](raw-input-macos-validation.md) for device limits and exact results.
+Physical Mac capture, local suppression, and gaming acceptance remain unverified. Continue with the
 [Mac handoff](raw-input-macos-handoff.md) before releasing raw mode.
 
 The current implementation requires explicitly selected focus lock for raw input. Destination
 edge observations are not implemented. Dwell and resistance work with a Mac source, including
 its desktop sessions across Linux destinations. Linux source edges retain Immediate crossing;
-selecting a delayed policy there produces an error. Progress appears in the Splice window.
-A native indicator at the physical screen edge remains Mac follow-up work.
+selecting a delayed policy there produces an error. Progress appears in the Splice window and in
+a Mac panel beside the physical screen edge, including while the Splice window is hidden.
 
 ## Agreed scope
 
@@ -98,7 +100,9 @@ Timestamps currently record callback enqueue time on a monotonic clock, not hard
 Capture must preserve signed relative motion, buttons, wheel resolution, physical key state, and
 standard media keys. Handle composite receivers, multiple HID collections, different report IDs,
 multiple simultaneous devices, hotplug, and Bluetooth reconnect. Resolve input permission failures
-explicitly and identify unsupported input capabilities before activation.
+explicitly and reject unreadable descriptors before activation. Unused control declarations must not
+block a device. Validate key and button mappings when a report asserts them; an unrepresentable input
+ends capture and releases held state.
 
 Keep the existing cursor and emergency-release machinery. Verify how HID capture and local event
 suppression interact before release. Input must reach exactly one active destination;
@@ -173,8 +177,11 @@ Resistance measures continued outward movement, not physical force. Tangential m
 Pulling away cancels the attempt. Pausing lets resistance progress decay. Use elapsed time and movement
 distance so changing polling rate does not change the gesture. Normalize the gesture's configurable
 feel separately from game movement, and test it across display scales and mouse DPI settings.
-The Splice panel shows resistance progress, preparation, and failed crossings. A native screen-edge
-indicator is still required to complete the planned gesture UI.
+The Splice panel shows resistance progress, preparation, and failed crossings. The Mac screen-edge
+indicator shows the destination and current gesture progress without accepting input or taking focus.
+For remote Desktop crossings it maps the source display's edge position onto the physical Mac display
+holding the frozen pointer. Gesture updates publish every 16 ms; other UI changes retain their existing
+debounce. Indicator geometry uses logical points and converts to AppKit coordinates at the panel boundary.
 
 Dwell is a separate timed policy for users who prefer waiting at an edge. `input.json` stores
 mode selection, focus lock, and crossing policy. On first use, an existing nonzero

@@ -36,6 +36,7 @@ pub struct Controller {
     status: Arc<Mutex<BootStatus>>,
     mode: Mode,
     /// Why there is no tray icon, if so (Linux: reported by the service).
+    #[cfg(target_os = "linux")]
     tray_hint: Arc<Mutex<Option<String>>>,
     focus_request: Arc<AtomicBool>,
     quit_request: Arc<AtomicBool>,
@@ -113,6 +114,7 @@ impl Controller {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn tray_hint(&self) -> Option<String> {
         self.tray_hint.lock().clone()
     }
@@ -135,6 +137,7 @@ pub fn start(preview: bool, ctx: egui::Context) -> Controller {
     };
     let state = Arc::new(RwLock::new(state));
     let status = Arc::new(Mutex::new(status));
+    #[cfg(target_os = "linux")]
     let tray_hint = Arc::new(Mutex::new(None));
     let focus_request = Arc::new(AtomicBool::new(false));
     let quit_request = Arc::new(AtomicBool::new(false));
@@ -163,6 +166,7 @@ pub fn start(preview: bool, ctx: egui::Context) -> Controller {
         state,
         status,
         mode,
+        #[cfg(target_os = "linux")]
         tray_hint,
         focus_request,
         quit_request,

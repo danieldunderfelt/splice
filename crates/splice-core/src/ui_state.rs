@@ -55,6 +55,8 @@ pub struct UiCrossing {
     pub from: MachineId,
     pub to: MachineId,
     pub progress: f32,
+    pub side: splice_platform::EdgeSide,
+    pub position: splice_proto::Vec2,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

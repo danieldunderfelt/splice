@@ -1,9 +1,10 @@
 # Build and validate raw input on macOS
 
-Continue the raw input implementation in this working tree. The user asked for the shared and
-Linux work to proceed without SSH access to the Mac, and will assign native Mac work to another agent.
-The workspace is Splice 1.2.0, KVM protocol 4. Do not call raw mode ready for gaming until the
-physical-device and game checks below pass. No release was published or installed during this work.
+Continue physical acceptance testing of Splice 1.2.0, KVM protocol 4. The native Mac implementation,
+builds, signing, descriptor fixtures, and screen-edge indicator checks are recorded in
+[Mac validation](raw-input-macos-validation.md). A Developer ID signed test app has been installed at
+`/Applications/Splice.app`; no release was published. Do not call raw mode ready for gaming until the
+physical-device and game checks below pass.
 
 Keep Desktop mode fully supported. Do not substitute Desktop input when Raw fails. The repository
 also prohibits adding code comments. Read [the design](raw-input-design.md),
@@ -24,14 +25,15 @@ also prohibits adding code comments. Read [the design](raw-input-design.md),
 
 Raw mode requires the user to select **Stay on selected computer**. There is no destination
 edge observer in this implementation. Raw counts never predict Linux pointer coordinates.
-Linux source edges continue using Immediate crossing. The Splice panel shows gesture progress;
-a native indicator beside the physical screen edge remains to be implemented on Mac.
+Linux source edges continue using Immediate crossing. The Splice panel and a native Mac panel beside
+the physical screen edge show gesture progress. The native panel works without the app window open.
 
-The HID decoder rejects unsupported standard controls and ambiguous wheel scaling explicitly.
-It ignores vendor-defined usages because vendor commands, firmware, RGB, and arbitrary USB
-passthrough are outside the standard-input contract. An attached unsupported input device prevents
-raw activation until it is removed or its descriptor is supported. Transient report errors end
-the session; a later valid report clears the affected device error so the user can retry.
+The HID decoder accepts unused standard-control slots in descriptors. It checks the mapping when
+a report asserts a control, so unused NKRO keys or extra receiver buttons do not prevent activation.
+An asserted control without a supported mapping ends the session with an error; a later valid report
+clears the affected device error so the user can retry. Invalid descriptors and ambiguous wheel
+scaling still prevent activation. Vendor-defined usages are ignored because vendor commands,
+firmware, RGB, and arbitrary USB passthrough are outside the standard-input contract.
 
 Source timestamps are monotonic callback enqueue times. They are not hardware timestamps or
 one-way latency. The existing peer traffic counters describe the control/Desktop connection;
@@ -40,6 +42,9 @@ they do not measure the raw socket. Do not use those counters to claim raw repor
 ## Locate the code
 
 - `crates/splice-platform/src/macos/raw.rs`: IOKit FFI, discovery, feature reports, capture health, local media suppression, report stream.
+- `crates/splice-platform/src/macos/raw/probe.rs`: bounded read-only HID report-format probe, exposed as `splice --raw-probe SECONDS`.
+- `crates/splice-platform/tests/hid_devices.rs`: captured Apple, Logitech, and NuPhy descriptor regressions and explicit unsupported cases.
+- `crates/splice-app/src/edge_indicator.rs`: native AppKit progress panel and display-coordinate tests.
 - `crates/splice-platform/src/macos/tap.rs`: cursor capture, passive edge contact, Desktop translation, shared switching shortcut.
 - `crates/splice-platform/src/raw/hid.rs`: portable descriptor decoder and report fixtures.
 - `crates/splice-platform/src/raw/shortcut.rs`: callback-order-independent switch state and suppression tests.
@@ -140,7 +145,7 @@ when needed; do not log keystrokes or clipboard contents in ordinary diagnostics
   held state. Test the Linux physical emergency chord as well.
 - Revoke Input Monitoring and Accessibility, enable Secure Input, lock/unlock, and sleep/wake during
   capture and preparation. Show the cause and release input. Check the media tap is still alive
-  after wake; its failure currently requires an explicit restart.
+  after wake. Media tap failure now ends capture and recreates the tap; retry requires a fresh session.
 - Disconnect Tailscale, close the raw socket, kill the destination, and restart the source with the
   same identity. Check stale input and callbacks cannot take ownership of the new session.
 - Exercise a source process crash, including SIGKILL, with an independent recovery method available.
@@ -148,7 +153,7 @@ when needed; do not log keystrokes or clipboard contents in ordinary diagnostics
   prove cursor recovery for that case; verify OS behavior and add external recovery if necessary.
 - Test queue overload and delayed acknowledgements. The nominal raw write/read timeout is 750 ms,
   with 200 ms heartbeats. Scheduling and preparation add time; measure actual release latency.
-- Implement the native screen-edge indicator, then test Dwell/Resistance with the app window hidden.
+- Test the native screen-edge indicator with Dwell/Resistance and the app window hidden.
   Cover retreat, tangential motion, pause/decay, display scaling, layout changes, and every Desktop
   transition. Input used to push through the edge must not become a target camera jump.
 
@@ -171,3 +176,26 @@ Provide native build/test results, captured descriptor regression fixtures, a de
 pass/fail outcomes, local suppression and emergency-release evidence, and the direct/VirtualHere
 comparison. Link any remaining unsupported devices or game cases. Update the design status and
 these instructions to reflect what was actually proven.
+
+For a read-only native report check, quit the running instance and launch the installed signed app
+through Launch Services. Executing its binary directly from a terminal can use the terminal's
+Input Monitoring permission instead of the app's grant.
+
+```sh
+open -n -g -W -a /Applications/Splice.app \
+  --stdout /tmp/splice-hid-probe.json --stderr /tmp/splice-hid-probe-error.txt \
+  --args --raw-probe 10
+```
+
+Move the intended mouse and press and release test keys during that interval. The probe records
+descriptor bytes, connection metadata, callback counts, lengths, and errors. It does not store input
+payloads, key sequences, clipboard data, serial numbers, or Bluetooth addresses. It does not suppress
+input, and therefore cannot prove suppression or game behavior. Restart the app after probing.
+`ReportInterval` is a device property, not a measured polling rate. Reports from a rejected descriptor
+have framing checks only, because there is no supported decoder for them.
+
+The native indicator can also be checked independently of input permissions and the engine:
+
+```sh
+cargo run -p splice-app --example macos_edge_indicator --locked
+```
