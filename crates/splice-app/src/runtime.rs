@@ -281,7 +281,7 @@ fn wait_for_retry(
 
 pub async fn bootstrap() -> anyhow::Result<EngineHandle> {
     let data_dir = splice_core::config::config_dir().context("resolving config dir")?;
-    let cfg = splice_core::config::load(&data_dir);
+    let cfg = splice_core::config::load(&data_dir)?;
     let platform = splice_platform::create(splice_platform::PlatformOpts {
         data_dir: data_dir.clone(),
         panic_chord: cfg.panic_chord.clone(),
@@ -431,6 +431,8 @@ pub mod preview {
             }),
             sensitivity: BTreeMap::new(),
             tailscale_error: None,
+            config_error: None,
+            connection_errors: Vec::new(),
         };
         recompute_edges(&mut state);
         state

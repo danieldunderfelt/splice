@@ -4,8 +4,7 @@ Splice is a Tailscale-native software KVM for macOS and Linux (Fedora, Wayland: 
 One mouse and keyboard shared across up to N machines by moving the cursor across screen edges.
 Reliability is the #1 requirement; every design decision below exists to kill a known failure mode
 of prior tools (lan-mouse, Deskflow/Synergy, Barrier). See `docs/research/` for the verified
-platform research backing these decisions. **Do not deviate from the decisions in this document
-without an explicit note in code explaining why.**
+platform research backing these decisions. Update this document when the implementation changes.
 
 ## Product requirements (from the user)
 
@@ -60,9 +59,10 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
    (Kills: lan-mouse's 2 s hard-window disconnects.)
 5. **Held-input safety, both sides independently.** Both source and target track held keys/buttons.
    Release everything on: Leave, disconnect, degrade, capture loss, Secure Input start/end, panic
-   chord. `Frame::ReleaseAll` exists as a belt-and-braces remote trigger.
+   chord. `Frame::ReleaseAll` applies only to the current driving source. Held keys and buttons
+   are released on the old target and pressed on the new target during onward crossings.
 6. **Local panic chord** (default `Left Shift+Right Shift+Escape`, configurable): unconditionally ends
-   capture, re-associates the mouse, shows the cursor, sends Leave+ReleaseAll to all peers.
+   capture, re-associates the mouse, shows the cursor, and broadcasts `Panic` to the workspace.
    Handled entirely locally in the capture backend — must work even if networking is wedged.
 7. **Tailscale is discovery + identity + transport.** Host tailscaled (never embedded tsnet).
    Enumerate peers via LocalAPI, probe TCP port 41717 on online peers, authenticate inbound
@@ -89,8 +89,8 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
     avoid hot-corner fights (default 16 px).
-12. **Capability negotiation, never version gating.** `Hello` carries proto range + capability
-    strings; peers agree on the intersection; nobody is turned away. (Synergy's 25-year lesson.)
+12. **One current protocol.** Every client runs protocol 2 and advertises all required capabilities.
+    A mismatch rejects the connection with an upgrade message. There is no compatibility mode.
 13. **Keep the target awake**: injection declares user activity; while a session is entered the
     target takes a display-sleep inhibition (macOS IOPMAssertion; Linux D-Bus
     `org.freedesktop.ScreenSaver.Inhibit`).
@@ -133,7 +133,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
   the larger only listens (both listen, but the larger side drops its own outbound dials to the
   smaller). Accept either side's connection if the rule's connection isn't up yet.
 - Inbound accept: `WhoIs(remote ip:port)` must resolve to a tailnet node of the same user and a
-  `StableID != self`. Otherwise close silently.
+  `StableID != self`. Otherwise log the rejection and close.
 - Reconnect with exponential backoff 1 s→30 s while the peer is online per LocalAPI.
 
 ## Layout model and edge math (splice-core)
@@ -143,7 +143,10 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
 - The arrangement places each machine's coordinate space into a shared abstract canvas with an
   integer offset (`MachineLayout { offset, enabled }`). The UI drags whole machine cards.
 - `LayoutDoc` is replicated state, last-writer-wins by `(lamport, writer MachineId)`. Any machine
-  may edit; every edit bumps the lamport and broadcasts `LayoutSync`. On receive: adopt iff newer.
+  may edit; every edit bumps the lamport and broadcasts `LayoutSync`. Newer documents win
+  conflicting placements. Membership is the union of both documents, so an older two-machine
+  workspace cannot remove a third machine. A merge that adds members gets a new stamp and
+  broadcasts again. Disabling a machine preserves its membership.
 - The arrangement invariant (one connected, overlap-free cluster; seams of at least
   `arrange::MIN_SEAM`) is enforced by the UI while dragging and repaired by the engine with
   `arrange::normalize` (smallest moves, largest cluster stays) whenever it could break: on
@@ -214,11 +217,24 @@ Every rule below closes a verified way for the cursor to end up captured with no
 
 ## Wire protocol (splice-proto)
 
-Length-prefixed (u32 BE, max 1 MiB) postcard-encoded `Frame`. First frame each direction must be
-`Hello`/`Welcome`. Protocol version 1. See `crates/splice-proto/src/lib.rs` for the authoritative
-types — that file is the contract; extend by *adding* enum variants/fields (postcard is not
-self-describing: never reorder or remove existing variants/fields; unknown-variant tolerance is
-handled by the version/caps negotiation, so gate new frames on negotiated caps).
+Length-prefixed `u32` big-endian, max 1 MiB, postcard-encoded `Frame`. Protocol version 2.
+The dialer sends `Hello`, the listener returns `Welcome`, and the dialer confirms with `Ready`.
+The listener publishes a connected peer only after receiving `Ready`. The dialer already has
+bidirectional application traffic when it receives `Welcome`. Handshakes expire after five seconds.
+All clients must implement the current protocol and its required capabilities. The authoritative
+types are in `crates/splice-proto/src/lib.rs`.
+
+Outgoing input queues hold at most 128 frames. Overflow closes the session explicitly so held
+input can be released. Socket writes expire after two seconds. Clipboard producers wait for
+queue capacity without blocking the input engine. Clipboard responses identify a unique request
+and its originating peer. Reads expire after five seconds. Limits are 16 MiB per representation,
+64 MiB buffered across incoming transfers, 64 pending fetches, and eight concurrent local reads.
+Disabling sync cancels outstanding work. Disconnect invalidates that peer's old fetch callbacks.
+
+The codec rejects nonfinite input, invalid key codes, invalid display dimensions, and malformed
+workspace data. Display and placement coordinates are limited to one million logical pixels in
+either direction. Configuration loading uses the same workspace validation and preserves invalid
+files for diagnosis. Writes sync the temporary file before rename and sync the containing directory.
 
 ## Platform backends (splice-platform)
 
@@ -323,5 +339,5 @@ tokens), atomic writes (tmp + rename). Machine-local; layout replicates via Layo
 - Unit tests: proto roundtrips, layout/edge math (property-ish cases incl. non-rectangular
   arrangements), FSM transitions (source claims, stale seq, degrade → release), held-key ledger.
 - `splice-core` must be fully testable without platform backends (trait objects + a `MockPlatform`).
-- Integration smoke: two in-process engines wired over localhost TCP with mock platforms,
+- Integration tests: two-, three-, and five-machine full meshes over loopback TCP with mock platforms,
   asserting an end-to-end enter → input → leave → clipboard flow.

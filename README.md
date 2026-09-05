@@ -98,7 +98,7 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
-1. Start Splice on every computer.
+1. Install the same current build and start Splice on every computer. Protocol 2 rejects older clients.
 2. Approve the operating system permission prompts.
 3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
@@ -117,4 +117,14 @@ Run the workspace test suite:
 cargo test --workspace
 ```
 
+The suite checks full meshes of three and five machines, restart convergence, multi-hop input,
+clipboard isolation, and network failure handling. The KDE compositor check runs separately
+inside a Wayland desktop with layer-shell support:
+
+```sh
+cargo test -p splice-platform live_overlay_arms_both_edges_after_startup -- --ignored --nocapture
+```
+
 For implementation details, see [the design document](docs/DESIGN.md).
+The [September 2026 investigation](docs/multi-machine-investigation.md) records the reproduced
+failures, fixes, and remaining live verification.

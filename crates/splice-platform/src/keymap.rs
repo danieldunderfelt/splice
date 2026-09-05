@@ -39,6 +39,12 @@ pub fn is_modifier(code: u32) -> bool {
     )
 }
 
+pub fn held_key_presses(keys: impl IntoIterator<Item = u32>) -> Vec<splice_proto::InputEvent> {
+    let mut keys: Vec<_> = keys.into_iter().collect();
+    keys.sort_unstable_by_key(|code| (!is_modifier(*code), *code));
+    keys.into_iter().map(|code| splice_proto::InputEvent::Key { code, pressed: true }).collect()
+}
+
 /// Arrow/nav keys that need NumericPad|SecondaryFn flags when injected on macOS.
 pub fn is_nav_key(code: u32) -> bool {
     matches!(code, ev::KEY_UP | ev::KEY_DOWN | ev::KEY_LEFT | ev::KEY_RIGHT)

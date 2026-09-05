@@ -78,6 +78,8 @@ enum Command {
     EndCapture(Option<Vec2>),
     Panic,
     Shutdown,
+    #[cfg(test)]
+    Inspect(oneshot::Sender<(usize, usize)>),
 }
 
 pub struct OverlayCapture {
@@ -87,8 +89,9 @@ pub struct OverlayCapture {
 #[async_trait::async_trait]
 impl Capture for OverlayCapture {
     async fn set_edges(&self, edges: Vec<EdgeSpec>) -> Result<()> {
-        let _ = self.cmd.send(Command::SetEdges(edges));
-        Ok(())
+        self.cmd
+            .send(Command::SetEdges(edges))
+            .map_err(|_| PlatformError::Unavailable("overlay capture thread stopped".into()))
     }
 
     async fn begin_capture(&self) -> Result<()> {
@@ -96,8 +99,9 @@ impl Capture for OverlayCapture {
     }
 
     async fn end_capture(&self, warp_to: Option<Vec2>) -> Result<()> {
-        let _ = self.cmd.send(Command::EndCapture(warp_to));
-        Ok(())
+        self.cmd
+            .send(Command::EndCapture(warp_to))
+            .map_err(|_| PlatformError::Unavailable("overlay capture thread stopped".into()))
     }
 }
 
@@ -141,6 +145,7 @@ struct StripGeom {
 struct Strip {
     geom: StripGeom,
     layer: LayerSurface,
+    mapped: bool,
 }
 
 impl StripGeom {
@@ -194,6 +199,8 @@ struct Locked {
     inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
     requested: Instant,
     active: bool,
+    edge_id: u32,
+    along: f64,
     /// Surface-local along-edge coordinate where the crossing happened.
     along_local: f64,
 }
@@ -230,11 +237,9 @@ struct State {
 /// Geometry of a strip covering `edge` on a display with logical `position` and
 /// `size`, or None if the edge is not on this display's boundary: surface origin in
 /// global coords, surface size, anchor, and (top, right, bottom, left) margins.
-fn strip_geometry(
-    edge: &EdgeSpec,
-    position: (i32, i32),
-    size: (i32, i32),
-) -> Option<((i32, i32), (u32, u32), Anchor, (i32, i32, i32, i32))> {
+type StripGeometry = ((i32, i32), (u32, u32), Anchor, (i32, i32, i32, i32));
+
+fn strip_geometry(edge: &EdgeSpec, position: (i32, i32), size: (i32, i32)) -> Option<StripGeometry> {
     let (lx, ly) = position;
     let (lw, lh) = size;
     let span = (edge.to - edge.from).max(1) as u32;
@@ -339,8 +344,21 @@ impl State {
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
             layer.commit();
             tracing::debug!(?edge, output = ?info.name, ?origin, ?size, "edge strip created");
-            self.strips.push(Strip { geom: StripGeom { edge, origin, size }, layer });
+            self.strips.push(Strip { geom: StripGeom { edge, origin, size }, layer, mapped: false });
         }
+        self.update_edge_health();
+    }
+
+    fn update_edge_health(&self) {
+        let armed = self.strips.iter().filter(|strip| strip.mapped).count();
+        let expected = self.edges.len();
+        self.shared.set_health(|h| {
+            h.capture = (armed < expected).then(|| {
+                format!(
+                    "only {armed} of {expected} screen edges are armed; check display geometry and compositor support"
+                )
+            });
+        });
     }
 
     fn paint(&mut self, index: usize) {
@@ -350,6 +368,7 @@ impl State {
             self.pool.create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
         else {
             tracing::warn!("cannot allocate strip buffer");
+            self.shared.set_health(|h| h.capture = Some("cannot allocate edge strip buffer".into()));
             return;
         };
         canvas.fill(0);
@@ -357,10 +376,13 @@ impl State {
         let surface = strip.layer.wl_surface();
         if buffer.attach_to(surface).is_err() {
             tracing::warn!("cannot attach strip buffer");
+            self.shared.set_health(|h| h.capture = Some("cannot attach edge strip buffer".into()));
             return;
         }
         surface.damage_buffer(0, 0, w as i32, h as i32);
         strip.layer.commit();
+        self.strips[index].mapped = true;
+        self.update_edge_health();
     }
 
     /// Whether outward motion over the focused strip may lock right now.
@@ -395,6 +417,7 @@ impl State {
             Ok(lock) => lock,
             Err(err) => {
                 tracing::warn!(error = %err, "pointer lock request failed");
+                self.shared.set_health(|h| h.capture = Some(format!("pointer lock request failed: {err}")));
                 layer.set_keyboard_interactivity(KeyboardInteractivity::None);
                 layer.commit();
                 self.restore_cursor();
@@ -418,10 +441,11 @@ impl State {
             inhibitor,
             requested: Instant::now(),
             active: false,
+            edge_id: geom.edge.id,
+            along,
             along_local,
         });
         tracing::debug!(edge_id = geom.edge.id, along, "edge strip crossed");
-        self.shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: geom.edge.id, along }));
     }
 
     fn restore_cursor(&self) {
@@ -481,12 +505,7 @@ impl State {
             .is_some_and(|l| !l.active && l.requested.elapsed() > LOCK_ACTIVATION_TIMEOUT);
         if stale {
             self.shared.set_health(|h| {
-                h.capture = Some(
-                    "the compositor did not activate the pointer lock on the edge strip \
-                     (known Hyprland regression after v0.50); use a Hyprland release that \
-                     enforces layer-surface pointer locks"
-                        .into(),
-                )
+                h.capture = Some("the compositor did not activate the pointer lock on the edge strip".into())
             });
             self.broken(qh, "pointer lock never activated");
         }
@@ -499,6 +518,11 @@ impl State {
 
     fn handle_command(&mut self, qh: &QueueHandle<Self>, cmd: Command) {
         match cmd {
+            #[cfg(test)]
+            Command::Inspect(reply) => {
+                let _ = reply
+                    .send((self.outputs.outputs().count(), self.strips.iter().filter(|strip| strip.mapped).count()));
+            }
             Command::SetEdges(edges) => {
                 if self.locked.is_some() {
                     self.pending_edges = Some(edges);
@@ -818,9 +842,18 @@ impl PointerHandler for State {
 }
 
 impl RelativePointerHandler for State {
-    fn relative_pointer_motion(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &ZwpRelativePointerV1, _: &wl_pointer::WlPointer, event: RelativeMotionEvent) {
-        if self.locked.is_some() {
-            self.forward(InputEvent::Motion { dx: event.delta.0, dy: event.delta.1 });
+    fn relative_pointer_motion(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        _: &ZwpRelativePointerV1,
+        _: &wl_pointer::WlPointer,
+        event: RelativeMotionEvent,
+    ) {
+        if let Some(locked) = &self.locked {
+            if locked.active {
+                self.forward(InputEvent::Motion { dx: event.delta.0, dy: event.delta.1 });
+            }
             return;
         }
         if let Some((geom, layer, local)) = self.armed_strip() {
@@ -836,10 +869,15 @@ impl PointerConstraintsHandler for State {
     fn unconfined(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpConfinedPointerV1, _: &wl_surface::WlSurface, _: &wl_pointer::WlPointer) {}
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, locked: &ZwpLockedPointerV1, _: &wl_surface::WlSurface, _: &wl_pointer::WlPointer) {
         if let Some(l) = &mut self.locked {
-            if &l.lock == locked {
+            if &l.lock == locked && !l.active {
                 l.active = true;
+                self.shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: l.edge_id, along: l.along }));
+                for event in crate::keymap::held_key_presses(self.pressed.iter().copied()) {
+                    self.forward(event);
+                }
             }
         }
+        self.update_edge_health();
     }
     fn unlocked(&mut self, _: &Connection, qh: &QueueHandle<Self>, locked: &ZwpLockedPointerV1, _: &wl_surface::WlSurface, _: &wl_pointer::WlPointer) {
         if self.locked.as_ref().is_some_and(|l| &l.lock == locked) {
@@ -884,8 +922,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::Enter { keys, .. } => {
                 state.pressed.clear();
-                for chunk in keys.chunks_exact(4) {
-                    state.pressed.insert(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                for chunk in keys.as_chunks::<4>().0 {
+                    state.pressed.insert(u32::from_ne_bytes(*chunk));
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
@@ -923,6 +961,53 @@ delegate_registry!(State);
 mod tests {
     use super::*;
     use smithay_client_toolkit::seat::pointer::AxisScroll;
+
+    #[tokio::test]
+    #[ignore = "requires a running Wayland compositor with layer-shell"]
+    async fn live_overlay_arms_both_edges_after_startup() {
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            tx,
+            health: parking_lot::Mutex::new(crate::HealthReport::default()),
+            displays: parking_lot::RwLock::new(Vec::new()),
+            epoch: Instant::now(),
+            last_injection: std::sync::atomic::AtomicU64::new(0),
+            injected_keys: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let displays = super::super::displays::spawn(shared.clone()).unwrap();
+        let display = &displays[0];
+        let edges = vec![
+            EdgeSpec { id: 0, side: EdgeSide::Left, at: display.x, from: display.y, to: display.y + display.h as i32 },
+            EdgeSpec {
+                id: 1,
+                side: EdgeSide::Right,
+                at: display.x + display.w as i32,
+                from: display.y,
+                to: display.y + display.h as i32,
+            },
+        ];
+        let (capture, _, stop) = create(shared.clone(), vec![42, 54, 1], Arc::new(Driven::default())).await.unwrap();
+        capture.set_edges(edges).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let (tx, rx) = oneshot::channel();
+        capture.cmd.send(Command::Inspect(tx)).unwrap();
+        let (_, strips) = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+        assert_eq!(strips, 2, "both KDE edges must have an input surface");
+        capture
+            .set_edges(vec![EdgeSpec {
+                id: 2,
+                side: EdgeSide::Right,
+                at: display.x + display.w as i32 + 20,
+                from: display.y,
+                to: display.y + display.h as i32,
+            }])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reported = shared.health.lock().capture.is_some();
+        stop.stop();
+        assert!(reported, "an unarmed edge must be visible in capture health");
+    }
 
     #[test]
     fn strip_along_outward_and_hint_follow_the_edge_side() {

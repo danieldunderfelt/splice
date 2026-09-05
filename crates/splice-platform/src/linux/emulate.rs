@@ -406,7 +406,7 @@ async fn run(
         let inner = shared.shared.clone();
         let injects = shared.injects.clone();
         let screensaver = screensaver.clone();
-        let _ = tokio::spawn(async move { screensaver.monitor(inner, injects).await });
+        tokio::spawn(async move { screensaver.monitor(inner, injects).await });
     }
 
     // Survives session death: a session that was entered is re-entered after recreation.
@@ -764,7 +764,7 @@ fn do_enter(
     send_pending_position(session, devices, active);
 
     let screensaver = screensaver.clone();
-    let _ = tokio::spawn(async move { screensaver.inhibit().await });
+    tokio::spawn(async move { screensaver.inhibit().await });
 }
 
 fn do_leave(
@@ -775,7 +775,7 @@ fn do_leave(
 ) {
     do_leave_inner(session, devices, active);
     let screensaver = screensaver.clone();
-    let _ = tokio::spawn(async move { screensaver.uninhibit().await });
+    tokio::spawn(async move { screensaver.uninhibit().await });
 }
 
 fn do_leave_inner(session: &Session, devices: &mut Devices, active: &mut Active) {

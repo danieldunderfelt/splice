@@ -34,7 +34,9 @@ pub async fn read_frame_buffered<R: AsyncRead + Unpin>(
     }
     buf.resize(len as usize, 0);
     r.read_exact(buf).await?;
-    Ok(postcard::from_bytes(buf)?)
+    let frame: Frame = postcard::from_bytes(buf)?;
+    frame.validate()?;
+    Ok(frame)
 }
 
 /// Write one frame and flush.
@@ -48,6 +50,7 @@ pub async fn write_frame_buffered<W: AsyncWrite + Unpin>(
     frame: &Frame,
     buf: &mut Vec<u8>,
 ) -> Result<(), ProtoError> {
+    frame.validate()?;
     buf.clear();
     buf.resize(4, 0);
     postcard::to_extend(frame, ReuseBuffer(buf))?;
@@ -64,7 +67,7 @@ pub async fn write_frame_buffered<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{InputEvent, PROTO_VERSION};
+    use crate::InputEvent;
 
     #[tokio::test]
     async fn roundtrip_over_duplex() {
@@ -76,7 +79,6 @@ mod tests {
         write_frame(&mut a, &f).await.unwrap();
         let got = read_frame(&mut b).await.unwrap();
         assert_eq!(f, got);
-        assert_eq!(PROTO_VERSION, 1);
     }
 
     #[tokio::test]

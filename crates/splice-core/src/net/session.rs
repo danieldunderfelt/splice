@@ -5,23 +5,85 @@
 //! heartbeat timer without cancel-safety hazards (framing::read_frame is only
 //! cancel-safe at the length-prefix boundary).
 
-use crate::net::{NetControlInner, PeerCmd, PeerEvent};
-use splice_proto::framing::{read_frame, read_frame_buffered, write_frame, write_frame_buffered};
+use crate::net::{NetControlInner, PeerEvent};
+use splice_proto::framing::{read_frame, read_frame_buffered, write_frame_buffered};
 use splice_proto::{caps, Frame, Hello, MachineId, ProtoError, Welcome};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Notify};
 
-/// Capabilities every Splice peer advertises; the negotiated set is the intersection.
+#[derive(Default)]
+pub(crate) struct Liveness {
+    pub enabled: AtomicBool,
+    pub changed: Notify,
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(
+    inner: &NetControlInner,
+    writer: &mut W,
+    frame: &Frame,
+) -> Result<(), ProtoError> {
+    write_with_timeout(inner.opts.write_timeout, writer, frame, &mut Vec::new()).await
+}
+
+async fn write_with_timeout<W: AsyncWrite + Unpin>(
+    timeout: Duration,
+    writer: &mut W,
+    frame: &Frame,
+    buffer: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    tokio::time::timeout(timeout, write_frame_buffered(writer, frame, buffer))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "peer write timed out"))?
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionControl {
+    frames: mpsc::Sender<Frame>,
+    shutdown: watch::Sender<Option<String>>,
+}
+
+impl SessionControl {
+    pub async fn send_wait(&self, frame: Frame, timeout: Duration) -> bool {
+        matches!(tokio::time::timeout(timeout, self.frames.send(frame)).await, Ok(Ok(())))
+    }
+
+    pub fn send(&self, frame: Frame) -> bool {
+        match self.frames.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.close("outgoing queue exceeded its limit");
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    pub fn close(&self, reason: &str) {
+        self.shutdown.send_replace(Some(reason.into()));
+    }
+}
+
+struct SessionCommands {
+    frames: mpsc::Receiver<Frame>,
+    shutdown: watch::Receiver<Option<String>>,
+}
+
 fn our_caps() -> Vec<String> {
-    [caps::INPUT_V1, caps::CLIPBOARD_V1, caps::LAYOUT_V1, caps::MASTER_V1]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].iter().map(|s| s.to_string()).collect()
+}
+
+fn reject(inner: &NetControlInner, peer: &MachineId, reason: String) {
+    tracing::warn!(%peer, %reason, "peer connection rejected");
+    let _ = inner.events.send(PeerEvent::Rejected { id: peer.clone(), reason });
+}
+
+fn supports_required_capabilities(caps: &[String]) -> bool {
+    our_caps().iter().all(|required| caps.contains(required))
 }
 
 /// A Ping is missed when no Pong arrives within this multiple of the current cadence.
@@ -38,17 +100,17 @@ pub(crate) enum Role {
 /// Registered per-peer state shared with NetControl.
 pub(crate) struct PeerSlot {
     pub seq: u64,
-    pub cmd: mpsc::UnboundedSender<PeerCmd>,
+    pub control: SessionControl,
     /// True when this connection follows the smaller-id-dials rule from our side.
     pub rule_following: bool,
     /// Heartbeat cadence hint flipped by NetControl::set_active.
-    pub active: Arc<AtomicBool>,
+    pub active: Arc<Liveness>,
 }
 
 enum Registration {
     Fresh,
     /// We displaced a non-rule-following (or stale same-direction) connection.
-    Replaced(mpsc::UnboundedSender<PeerCmd>),
+    Replaced(SessionControl),
     /// A rule-following connection is already up; this one must go away.
     Lose,
 }
@@ -69,7 +131,7 @@ fn try_register(inner: &NetControlInner, id: &MachineId, slot: PeerSlot) -> Regi
                 true
             };
             if keep_new {
-                Registration::Replaced(e.insert(slot).cmd)
+                Registration::Replaced(e.insert(slot).control)
             } else {
                 Registration::Lose
             }
@@ -95,13 +157,15 @@ fn register(
     self_id: &MachineId,
     peer: &MachineId,
     role: Role,
-) -> (Registration, u64, mpsc::UnboundedReceiver<PeerCmd>, Arc<AtomicBool>) {
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let active = Arc::new(AtomicBool::new(false));
+) -> (Registration, u64, SessionCommands, Arc<Liveness>) {
+    let (frames, frame_rx) = mpsc::channel(128);
+    let (shutdown, shutdown_rx) = watch::channel(None);
+    let cmd_rx = SessionCommands { frames: frame_rx, shutdown: shutdown_rx };
+    let active = Arc::new(Liveness::default());
     let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
     let slot = PeerSlot {
         seq,
-        cmd: cmd_tx,
+        control: SessionControl { frames, shutdown },
         rule_following: matches!(role, Role::Dialer) == (self_id < peer),
         active: active.clone(),
     };
@@ -122,7 +186,7 @@ pub(crate) async fn run(
         .peer_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     let self_info = inner.self_info.read().clone();
-    let hs_timeout = inner.opts.handshake_timeout;
+    let deadline = tokio::time::Instant::now() + inner.opts.handshake_timeout;
 
     match role {
         Role::Dialer => {
@@ -132,19 +196,29 @@ pub(crate) async fn run(
                 machine: self_info.clone(),
                 caps: our_caps(),
             });
-            if write_frame(&mut sock, &hello).await.is_err() {
+            if write_frame(&inner, &mut sock, &hello).await.is_err() {
                 return false;
             }
-            let frame = match tokio::time::timeout(hs_timeout, read_frame(&mut sock)).await {
+            let frame = match tokio::time::timeout_at(deadline, read_frame(&mut sock)).await {
                 Ok(Ok(f)) => f,
                 _ => return false,
             };
-            // A Bye here is a refusal (dup / incompatible protocol); leave quietly.
             let welcome = match frame {
                 Frame::Welcome(w) => w,
+                Frame::Bye { reason } => {
+                    if let Some(peer) = &expected {
+                        reject(&inner, peer, reason);
+                    }
+                    return false;
+                }
                 _ => return false,
             };
-            if welcome.proto < inner.opts.proto_min || welcome.proto > inner.opts.proto_max {
+            if welcome.proto != inner.opts.proto_max || !supports_required_capabilities(&welcome.caps) {
+                reject(
+                    &inner,
+                    &welcome.machine.id,
+                    "peer does not implement the current Splice protocol; update every client".into(),
+                );
                 return false;
             }
             if welcome.machine.id == self_info.id {
@@ -156,15 +230,19 @@ pub(crate) async fn run(
                 }
             }
             let peer = welcome.machine.id.clone();
+            if write_frame(&inner, &mut sock, &Frame::Ready).await.is_err() {
+                reject(&inner, &peer, "cannot confirm the peer handshake".into());
+                return false;
+            }
             let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role);
             match reg {
                 Registration::Lose => {
-                    let _ = write_frame(&mut sock, &Frame::Bye { reason: "dup".into() }).await;
+                    let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason: "dup".into() }).await;
                     return false;
                 }
                 Registration::Fresh => {}
                 Registration::Replaced(old) => {
-                    let _ = old.send(PeerCmd::Shutdown("dup".into()));
+                    old.close("duplicate connection replaced");
                 }
             }
             let _ = inner.events.send(PeerEvent::Connected {
@@ -176,7 +254,7 @@ pub(crate) async fn run(
             session_loop(inner, sock, peer, cmd_rx, active, seq).await
         }
         Role::Listener => {
-            let frame = match tokio::time::timeout(hs_timeout, read_frame(&mut sock)).await {
+            let frame = match tokio::time::timeout_at(deadline, read_frame(&mut sock)).await {
                 Ok(Ok(f)) => f,
                 _ => return false,
             };
@@ -193,49 +271,35 @@ pub(crate) async fn run(
                     return false;
                 }
             }
-            // proto = min(theirs_max, ours_max); refuse only on disjoint ranges.
-            let proto = hello.proto_max.min(inner.opts.proto_max);
-            if proto < hello.proto_min.max(inner.opts.proto_min) {
-                let _ = write_frame(
-                    &mut sock,
-                    &Frame::Bye {
-                        reason: format!(
-                            "incompatible protocol ({}..={} vs {}..={})",
-                            hello.proto_min,
-                            hello.proto_max,
-                            inner.opts.proto_min,
-                            inner.opts.proto_max
-                        ),
-                    },
-                )
-                .await;
+            let proto = inner.opts.proto_max;
+            if hello.proto_min != proto || hello.proto_max != proto || !supports_required_capabilities(&hello.caps) {
+                let reason =
+                    format!("Splice protocol {proto} and all current capabilities are required; update every client");
+                reject(&inner, &hello.machine.id, reason.clone());
+                let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason }).await;
                 return false;
             }
-            let caps: Vec<String> = our_caps()
-                .into_iter()
-                .filter(|c| hello.caps.iter().any(|c2| c2 == c))
-                .collect();
+            let caps = our_caps();
             let peer = hello.machine.id.clone();
-            // Dedupe BEFORE sending Welcome so a rejected duplicate never looks Connected.
+            let welcome = Frame::Welcome(Welcome { proto, machine: self_info.clone(), caps: caps.clone() });
+            if write_frame(&inner, &mut sock, &welcome).await.is_err() {
+                reject(&inner, &peer, "cannot send handshake response".into());
+                return false;
+            }
+            if !matches!(tokio::time::timeout_at(deadline, read_frame(&mut sock)).await, Ok(Ok(Frame::Ready))) {
+                reject(&inner, &peer, "peer did not confirm the handshake; check Tailnet connectivity".into());
+                return false;
+            }
             let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role);
             match reg {
                 Registration::Lose => {
-                    let _ = write_frame(&mut sock, &Frame::Bye { reason: "dup".into() }).await;
+                    let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason: "dup".into() }).await;
                     return false;
                 }
                 Registration::Fresh => {}
                 Registration::Replaced(old) => {
-                    let _ = old.send(PeerCmd::Shutdown("dup".into()));
+                    old.close("duplicate connection replaced");
                 }
-            }
-            let welcome = Frame::Welcome(Welcome {
-                proto,
-                machine: self_info.clone(),
-                caps: caps.clone(),
-            });
-            if write_frame(&mut sock, &welcome).await.is_err() {
-                unregister_if_ours(&inner, &peer, seq);
-                return false;
             }
             let _ = inner.events.send(PeerEvent::Connected {
                 id: peer.clone(),
@@ -248,8 +312,8 @@ pub(crate) async fn run(
     }
 }
 
-fn cadence(inner: &NetControlInner, active: &AtomicBool) -> Duration {
-    if active.load(Ordering::Relaxed) {
+fn cadence(inner: &NetControlInner, active: &Liveness) -> Duration {
+    if active.enabled.load(Ordering::Relaxed) {
         inner.opts.active_hb
     } else {
         inner.opts.idle_hb
@@ -263,8 +327,8 @@ async fn session_loop(
     inner: Arc<NetControlInner>,
     sock: TcpStream,
     peer: MachineId,
-    mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
-    active: Arc<AtomicBool>,
+    mut cmd_rx: SessionCommands,
+    active: Arc<Liveness>,
     seq: u64,
 ) -> bool {
     let (rd, mut wr) = sock.into_split();
@@ -273,7 +337,11 @@ async fn session_loop(
     let reader = tokio::spawn(async move {
         let mut read_buf = Vec::with_capacity(256);
         loop {
-            match read_frame_buffered(&mut rd, &mut read_buf).await {
+            let result = tokio::select! {
+                _ = frame_tx.closed() => return,
+                result = read_frame_buffered(&mut rd, &mut read_buf) => result,
+            };
+            match result {
                 Ok(f) => {
                     if frame_tx.send(Ok(f)).await.is_err() {
                         return;
@@ -301,20 +369,25 @@ async fn session_loop(
 
     let reason: String = loop {
         tokio::select! {
-            cmd = cmd_rx.recv() => match cmd {
-                Some(PeerCmd::Send(f)) => {
-                    if let Err(e) = write_frame_buffered(&mut wr, &f, &mut write_buf).await {
-                        break format!("write: {e}");
-                    }
+            _ = inner.events.closed() => break "engine stopped".to_string(),
+            _ = active.changed.notified() => {
+                next_ping = Instant::now() + cadence(&inner, &active);
+            }
+            changed = cmd_rx.shutdown.changed() => {
+                let reason = cmd_rx.shutdown.borrow().clone();
+                if let Some(reason) = reason {
+                    let _ = write_with_timeout(inner.opts.write_timeout, &mut wr, &Frame::Bye { reason: reason.clone() }, &mut write_buf).await;
+                    break reason;
                 }
-                Some(PeerCmd::Shutdown(r)) => {
-                    let _ = write_frame_buffered(
-                        &mut wr,
-                        &Frame::Bye { reason: r.clone() },
-                        &mut write_buf,
-                    )
-                    .await;
-                    break r;
+                if changed.is_err() {
+                    break "session control closed".to_string();
+                }
+            }
+            frame = cmd_rx.frames.recv() => match frame {
+                Some(frame) => {
+                    if let Err(error) = write_with_timeout(inner.opts.write_timeout, &mut wr, &frame, &mut write_buf).await {
+                        break format!("write: {error}");
+                    }
                 }
                 None => break "control channel closed".to_string(),
             },
@@ -323,7 +396,7 @@ async fn session_loop(
                     if inner.opts.answer_pings.load(Ordering::Relaxed) {
                         let pong = Frame::Pong { nonce: n, t_us };
                         if let Err(e) =
-                            write_frame_buffered(&mut wr, &pong, &mut write_buf).await
+                            write_with_timeout(inner.opts.write_timeout, &mut wr, &pong, &mut write_buf).await
                         {
                             break format!("write: {e}");
                         }
@@ -331,35 +404,30 @@ async fn session_loop(
                 }
                 Some(Ok(Frame::Pong { nonce: n, t_us })) => {
                     let rtt = match outstanding {
-                        Some((on, _, _)) if on == n => {
+                        Some((on, sent_us, sent)) if on == n && sent_us == t_us => {
                             outstanding = None;
-                            let now_us = epoch.elapsed().as_micros() as u64;
-                            Some(now_us.saturating_sub(t_us) as f64 / 1000.0)
+                            sent.elapsed().as_secs_f64() * 1000.0
                         }
-                        _ => None,
+                        _ => continue,
                     };
-                    // Any Pong is liveness, even one for a stale nonce.
                     misses = 0;
                     degraded_since = None;
                     if degraded {
                         degraded = false;
                         let _ = inner
                             .events
-                            .send(PeerEvent::Healthy(peer.clone(), rtt.unwrap_or(0.0)));
+                            .send(PeerEvent::Healthy(peer.clone(), rtt));
                     }
-                    if let Some(rtt) = rtt {
-                        let due = last_rtt_emit
-                            .map(|t| t.elapsed() >= RTT_EMIT_MIN)
-                            .unwrap_or(true);
-                        if due {
-                            last_rtt_emit = Some(Instant::now());
-                            let _ = inner.events.send(PeerEvent::Rtt(peer.clone(), rtt));
-                        }
+                    let due = last_rtt_emit
+                        .map(|t| t.elapsed() >= RTT_EMIT_MIN)
+                        .unwrap_or(true);
+                    if due {
+                        last_rtt_emit = Some(Instant::now());
+                        let _ = inner.events.send(PeerEvent::Rtt(peer.clone(), rtt));
                     }
                 }
                 Some(Ok(Frame::Bye { reason })) => break reason,
-                // Hello/Welcome outside the handshake are protocol noise; drop them.
-                Some(Ok(Frame::Hello(_) | Frame::Welcome(_))) => {}
+                Some(Ok(Frame::Hello(_) | Frame::Welcome(_) | Frame::Ready)) => break "unexpected handshake frame".into(),
                 Some(Ok(f)) => {
                     let _ = inner.events.send(PeerEvent::Frame(event_peer.clone(), f));
                 }
@@ -370,7 +438,6 @@ async fn session_loop(
                 let cad = cadence(&inner, &active);
                 if let Some((_, _, sent)) = &outstanding {
                     if sent.elapsed() > cad.mul_f64(MISS_WINDOW) {
-                        // Heartbeat loss never closes the socket: mark, keep pinging.
                         misses += 1;
                         outstanding = None;
                         if misses >= inner.opts.max_misses && !degraded {
@@ -390,7 +457,7 @@ async fn session_loop(
                     let t_us = epoch.elapsed().as_micros() as u64;
                     let ping = Frame::Ping { nonce, t_us };
                     if let Err(e) =
-                        write_frame_buffered(&mut wr, &ping, &mut write_buf).await
+                        write_with_timeout(inner.opts.write_timeout, &mut wr, &ping, &mut write_buf).await
                     {
                         break format!("write: {e}");
                     }
@@ -406,4 +473,33 @@ async fn session_loop(
         let _ = inner.events.send(PeerEvent::Disconnected(peer, reason));
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_blocked_writer_has_a_deadline() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let result = write_with_timeout(
+            Duration::from_millis(20),
+            &mut writer,
+            &Frame::Ping { nonce: 1, t_us: 1 },
+            &mut Vec::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(ProtoError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn input_queue_overflow_closes_the_session_explicitly() {
+        let (frames, _receiver) = mpsc::channel(2);
+        let (shutdown, reason) = watch::channel(None);
+        let control = SessionControl { frames, shutdown };
+        assert!(control.send(Frame::Panic));
+        assert!(control.send(Frame::Panic));
+        assert!(!control.send(Frame::Panic));
+        assert_eq!(reason.borrow().as_deref(), Some("outgoing queue exceeded its limit"));
+    }
 }

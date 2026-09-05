@@ -36,7 +36,7 @@ pub enum ServerMessage {
         status: BootStatus,
         /// True when a status notifier host accepted the tray icon.
         tray: bool,
-        state: UiState,
+        state: Box<UiState>,
     },
     Focus,
     Quit,

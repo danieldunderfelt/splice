@@ -275,7 +275,7 @@ async fn serve_transfers(
                 }
                 let fetch = offer.lock().as_ref().map(|o| o.fetch.clone());
                 let conn = conn.clone();
-                let _ = tokio::spawn(async move {
+                tokio::spawn(async move {
                     serve_transfer(&conn, &session.path, &mime, serial, fetch).await;
                 });
             }
@@ -317,7 +317,10 @@ async fn serve_transfer(
     let data = match fetch {
         Some(fetch) => match tokio::time::timeout(FETCH_TIMEOUT, fetch.fetch(mime)).await {
             Ok(data) => data,
-            Err(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "clipboard fetch timed out");
+                None
+            },
         },
         None => None,
     };

@@ -404,7 +404,7 @@ impl Emulate for UinputEmulate {
             place(devices, ledger, &displays, pos)?;
         }
         let screensaver = self.screensaver.clone();
-        let _ = tokio::spawn(async move { screensaver.inhibit().await });
+        tokio::spawn(async move { screensaver.inhibit().await });
         Ok(())
     }
 
@@ -467,7 +467,7 @@ impl Emulate for UinputEmulate {
             ledger.entered = false;
         }
         let screensaver = self.screensaver.clone();
-        let _ = tokio::spawn(async move { screensaver.uninhibit().await });
+        tokio::spawn(async move { screensaver.uninhibit().await });
         Ok(())
     }
 
@@ -493,8 +493,8 @@ mod tests {
         let (x, y) = abs_coords(&displays, Vec2 { x: 0.0, y: 0.0 }).unwrap();
         assert!(x < 20 && y < 30);
         let (x, y) = abs_coords(&displays, Vec2 { x: 4479.0, y: 1439.0 }).unwrap();
-        assert!(x >= ABS_MAX - 10 && x <= ABS_MAX);
-        assert!(y >= ABS_MAX - 30 && y <= ABS_MAX);
+        assert!((ABS_MAX - 10..=ABS_MAX).contains(&x));
+        assert!((ABS_MAX - 30..=ABS_MAX).contains(&y));
         let (x, _) = abs_coords(&displays, Vec2 { x: 2240.0, y: 0.0 }).unwrap();
         assert!((x - ABS_MAX / 2).abs() <= 20);
     }

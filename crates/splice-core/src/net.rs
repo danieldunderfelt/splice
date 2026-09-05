@@ -6,8 +6,6 @@
 //! - Dial dedupe: the machine with the LEXICOGRAPHICALLY SMALLER MachineId dials; the
 //!   larger side only accepts (but accepts either if its own preferred connection is
 //!   not yet up; on conflict keep the smaller-dialer's connection, drop the other).
-//! - Handshake: dialer sends Hello first; listener replies Welcome. Version = clamp,
-//!   caps = intersection. Disjoint version ranges → Bye + close.
 //! - Heartbeat: Ping every 1 s while a session with that peer is active, 5 s idle;
 //!   3 consecutive missed → mark peer Degraded (engine releases input) but KEEP the
 //!   socket and keep pinging; recover on next Pong. Reconnect (if socket dies) with
@@ -27,16 +25,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::{mpsc, Notify};
-
-/// Engine → session commands.
-#[derive(Debug)]
-pub enum PeerCmd {
-    Send(Frame),
-    /// Close gracefully (Bye) and stop the task.
-    Shutdown(String),
-}
 
 /// Session → engine notifications.
 #[derive(Debug)]
@@ -57,13 +47,10 @@ pub enum PeerEvent {
     Disconnected(MachineId, String),
     /// Measured RTT update (ms).
     Rtt(MachineId, f64),
-}
-
-/// Handle owned by the engine for one connected peer.
-#[derive(Debug)]
-pub struct PeerHandle {
-    pub id: MachineId,
-    pub cmd: mpsc::UnboundedSender<PeerCmd>,
+    Rejected {
+        id: MachineId,
+        reason: String,
+    },
 }
 
 /// Tailscale LocalAPI surface the net layer needs. `splice_tailscale::Client` implements
@@ -112,6 +99,7 @@ pub struct NetOpts {
     pub backoff_max: Duration,
     pub dial_timeout: Duration,
     pub handshake_timeout: Duration,
+    pub write_timeout: Duration,
     /// How long a fetched tailscale status may be reused for inbound auth.
     pub status_ttl: Duration,
     /// Test hook: when false, sessions ignore Ping (simulates a silent peer).
@@ -123,7 +111,7 @@ pub struct NetOpts {
 impl Default for NetOpts {
     fn default() -> Self {
         Self {
-            proto_min: 1,
+            proto_min: splice_proto::PROTO_VERSION,
             proto_max: splice_proto::PROTO_VERSION,
             dial_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
             active_hb: Duration::from_secs(1),
@@ -134,6 +122,7 @@ impl Default for NetOpts {
             backoff_max: Duration::from_secs(30),
             dial_timeout: Duration::from_secs(2),
             handshake_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(2),
             status_ttl: Duration::from_secs(5),
             answer_pings: Arc::new(AtomicBool::new(true)),
             force_dial: false,
@@ -179,6 +168,7 @@ impl NetManager {
         let local_addr = listener.local_addr()?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(NetControlInner {
+            bind_ip: local_addr.ip(),
             self_info: RwLock::new(self_info),
             targets: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
@@ -204,6 +194,7 @@ pub struct NetControl {
 }
 
 pub(crate) struct NetControlInner {
+    bind_ip: IpAddr,
     self_info: RwLock<splice_proto::MachineInfo>,
     targets: RwLock<HashMap<MachineId, IpAddr>>,
     peers: RwLock<HashMap<MachineId, session::PeerSlot>>,
@@ -239,7 +230,7 @@ impl NetControl {
         }
         for id in &removed {
             if let Some(slot) = inner.peers.read().get(id) {
-                let _ = slot.cmd.send(PeerCmd::Shutdown("unlisted".into()));
+                slot.control.close("peer no longer listed");
             }
         }
         for (id, _) in &targets {
@@ -265,23 +256,32 @@ impl NetControl {
     pub fn send_to(&self, id: &MachineId, frame: Frame) -> bool {
         let peers = self.inner.peers.read();
         match peers.get(id) {
-            Some(slot) => slot.cmd.send(PeerCmd::Send(frame)).is_ok(),
+            Some(slot) => slot.control.send(frame),
             None => false,
         }
     }
 
-    /// Send to every connected peer.
+    pub(crate) async fn send_to_wait(&self, id: &MachineId, frame: Frame) -> bool {
+        let control = self.inner.peers.read().get(id).map(|slot| slot.control.clone());
+        match control {
+            Some(control) => control.send_wait(frame, self.inner.opts.write_timeout).await,
+            None => false,
+        }
+    }
+
     pub fn broadcast(&self, frame: Frame) {
         let peers = self.inner.peers.read();
         for slot in peers.values() {
-            let _ = slot.cmd.send(PeerCmd::Send(frame.clone()));
+            slot.control.send(frame.clone());
         }
     }
 
     /// Heartbeat cadence hint: active session with this peer → 1 s pings; idle → 5 s.
     pub fn set_active(&self, id: &MachineId, active: bool) {
         if let Some(slot) = self.inner.peers.read().get(id) {
-            slot.active.store(active, Ordering::Relaxed);
+            if slot.active.enabled.swap(active, Ordering::Relaxed) != active {
+                slot.active.changed.notify_one();
+            }
         }
     }
 }
@@ -289,15 +289,28 @@ impl NetControl {
 /// Accept inbound connections; each authorized socket becomes a listener-role session.
 async fn accept_loop(inner: Arc<NetControlInner>, listener: TcpListener) {
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            _ = inner.events.closed() => break,
+            accepted = listener.accept() => accepted,
+        };
+        match accepted {
             Ok((sock, remote)) => {
                 let inner = inner.clone();
                 tokio::spawn(async move {
-                    if let Some(peer_id) = authorize_inbound(&inner, remote).await {
+                    let authorized = tokio::select! {
+                        _ = inner.events.closed() => return,
+                        result = tokio::time::timeout(inner.opts.handshake_timeout, authorize_inbound(&inner, remote)) => result,
+                    };
+                    if let Ok(Some(peer_id)) = authorized {
                         // Bind the transport identity (WhoIs) to the claimed identity
                         // (Hello.machine.id): a same-user machine cannot impersonate
                         // another node.
-                        session::run(inner, sock, session::Role::Listener, Some(peer_id)).await;
+                        tokio::select! {
+                            _ = inner.events.closed() => {}
+                            _ = session::run(inner.clone(), sock, session::Role::Listener, Some(peer_id)) => {}
+                        }
+                    } else {
+                        tracing::warn!(%remote, "peer authorization failed or timed out");
                     }
                     // Unauthorized: close silently (drop).
                 });
@@ -338,6 +351,9 @@ async fn cached_status(inner: &Arc<NetControlInner>) -> Option<splice_tailscale:
 async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
     let mut backoff = inner.opts.backoff_min;
     loop {
+        if inner.events.is_closed() {
+            break;
+        }
         let ip = match inner.targets.read().get(&id) {
             Some(ip) => *ip,
             None => break,
@@ -350,13 +366,18 @@ async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
             .get(&id)
             .copied()
             .unwrap_or(splice_proto::SPLICE_PORT);
-        let attempt =
-            tokio::time::timeout(inner.opts.dial_timeout, TcpStream::connect((ip, port))).await;
+        let attempt = tokio::time::timeout(inner.opts.dial_timeout, async {
+            let socket = if ip.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+            socket.bind(SocketAddr::new(inner.bind_ip, 0))?;
+            socket.connect(SocketAddr::new(ip, port)).await
+        })
+        .await;
         match attempt {
             Ok(Ok(sock)) => {
-                let connected =
-                    session::run(inner.clone(), sock, session::Role::Dialer, Some(id.clone()))
-                        .await;
+                let connected = tokio::select! {
+                    _ = inner.events.closed() => break,
+                    connected = session::run(inner.clone(), sock, session::Role::Dialer, Some(id.clone())) => connected,
+                };
                 if connected {
                     backoff = inner.opts.backoff_min;
                 }
@@ -368,6 +389,7 @@ async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
             break;
         }
         tokio::select! {
+            _ = inner.events.closed() => break,
             _ = tokio::time::sleep(jittered(backoff)) => {}
             _ = inner.targets_changed.notified() => {}
         }

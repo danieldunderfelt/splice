@@ -191,6 +191,59 @@ async fn connect_with_dedupe() {
 }
 
 #[tokio::test]
+async fn dropping_the_manager_closes_sessions_and_releases_the_listener() {
+    let ((a, _ca), (mut b, _cb)) = pair(test_opts(), test_opts()).await;
+    wait_for(&mut b, Duration::from_secs(2), connected("aaa")).await;
+    let address = a.local_addr;
+    drop(a);
+    wait_for(&mut b, Duration::from_secs(2), disconnected("aaa")).await;
+    assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+}
+
+#[tokio::test]
+async fn entering_a_session_starts_active_heartbeats_immediately() {
+    let a_opts = NetOpts {
+        idle_hb: Duration::from_secs(10),
+        active_hb: Duration::from_millis(20),
+        max_misses: 2,
+        ..test_opts()
+    };
+    let b_opts = test_opts();
+    b_opts.answer_pings.store(false, Ordering::Relaxed);
+    let ((mut a, ca), (_b, _cb)) = pair(a_opts, b_opts).await;
+    wait_for(&mut a, Duration::from_secs(2), connected("bbb")).await;
+    ca.set_active(&MachineId("bbb".into()), true);
+    wait_for(&mut a, Duration::from_millis(300), |event| matches!(event, PeerEvent::Degraded(_))).await;
+}
+
+#[tokio::test]
+async fn sending_welcome_does_not_mark_an_unconfirmed_peer_connected() {
+    use splice_proto::framing::{read_frame, write_frame};
+    let opts = NetOpts { handshake_timeout: Duration::from_millis(150), ..test_opts() };
+    let (mut b, _control) = spawn_node("bbb", "aaa", opts).await;
+    let mut socket = tokio::net::TcpStream::connect(b.local_addr).await.unwrap();
+    write_frame(
+        &mut socket,
+        &Frame::Hello(splice_proto::Hello {
+            proto_min: splice_proto::PROTO_VERSION,
+            proto_max: splice_proto::PROTO_VERSION,
+            machine: MachineInfo {
+                id: MachineId("aaa".into()),
+                hostname: "aaa".into(),
+                os: Os::Linux,
+                displays: vec![],
+            },
+            caps: [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].map(str::to_string).to_vec(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(read_frame(&mut socket).await.unwrap(), Frame::Welcome(_)));
+    let event = tokio::time::timeout(Duration::from_millis(400), b.events.recv()).await.unwrap().unwrap();
+    assert!(matches!(event, PeerEvent::Rejected { .. }), "unconfirmed connection was published: {event:?}");
+}
+
+#[tokio::test]
 async fn disjoint_proto_ranges_refused() {
     let a_opts = NetOpts { proto_min: 1, proto_max: 1, ..test_opts() };
     let b_opts = NetOpts { proto_min: 2, proto_max: 2, ..test_opts() };
@@ -298,7 +351,7 @@ async fn removing_dial_target_disconnects() {
     let eb = wait_for(&mut b, Duration::from_secs(3), disconnected("aaa")).await;
     for ev in [&ea, &eb] {
         match ev {
-            PeerEvent::Disconnected(_, reason) => assert_eq!(reason, "unlisted"),
+            PeerEvent::Disconnected(_, reason) => assert_eq!(reason, "peer no longer listed"),
             _ => unreachable!(),
         }
     }
@@ -329,4 +382,26 @@ async fn prolonged_silence_drops_the_socket_and_redials() {
     b_gate.store(true, Ordering::SeqCst);
     wait_for(&mut a, Duration::from_secs(3), connected("bbb")).await;
     wait_for(&mut b, Duration::from_secs(3), connected("aaa")).await;
+}
+
+#[tokio::test]
+async fn an_unmatched_pong_cannot_recover_a_degraded_peer() {
+    let a_opts = NetOpts {
+        idle_hb: Duration::from_millis(20),
+        max_misses: 2,
+        degraded_timeout: Duration::from_millis(150),
+        ..test_opts()
+    };
+    let b_opts = test_opts();
+    b_opts.answer_pings.store(false, Ordering::Relaxed);
+    let ((mut a, _ca), (mut b, cb)) = pair(a_opts, b_opts).await;
+    wait_for(&mut a, Duration::from_secs(2), connected("bbb")).await;
+    wait_for(&mut b, Duration::from_secs(2), connected("aaa")).await;
+    wait_for(&mut a, Duration::from_secs(2), |event| matches!(event, PeerEvent::Degraded(_))).await;
+    cb.send_to(&MachineId("aaa".into()), Frame::Pong { nonce: u64::MAX, t_us: 0 });
+    let event = wait_for(&mut a, Duration::from_secs(1), |event| {
+        matches!(event, PeerEvent::Healthy(..) | PeerEvent::Disconnected(..))
+    })
+    .await;
+    assert!(matches!(event, PeerEvent::Disconnected(..)), "unmatched pong falsely restored health: {event:?}");
 }

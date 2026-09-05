@@ -67,6 +67,8 @@ pub struct UiState {
     pub sensitivity: std::collections::BTreeMap<String, f64>,
     /// True while Tailscale/LocalAPI is unreachable.
     pub tailscale_error: Option<String>,
+    pub config_error: Option<String>,
+    pub connection_errors: Vec<String>,
     /// Linux: which capture/injection/clipboard implementations are active.
     pub backends: Option<BackendStatus>,
 }
@@ -85,6 +87,8 @@ impl UiState {
             panic_chord: "Left Shift+Right Shift+Esc".into(),
             sensitivity: Default::default(),
             tailscale_error: None,
+            config_error: None,
+            connection_errors: Vec::new(),
             backends: None,
         }
     }

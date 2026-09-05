@@ -169,6 +169,14 @@ impl SpliceApp {
                             banner(ui, theme::ERR, &format!("Tailscale: {err}"));
                             ui.add_space(8.0);
                         }
+                        for error in &state.connection_errors {
+                            banner(ui, theme::ERR, error);
+                            ui.add_space(8.0);
+                        }
+                        if let Some(error) = &state.config_error {
+                            banner(ui, theme::ERR, error);
+                            ui.add_space(8.0);
+                        }
                         if let Some(hint) = self.tray.hint() {
                             banner(ui, theme::WARN, &hint);
                             ui.add_space(8.0);

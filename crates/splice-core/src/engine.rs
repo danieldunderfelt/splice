@@ -105,7 +105,7 @@ impl Engine {
             cmd_rx,
             ui_tx,
             ready_tx,
-        );
+        )?;
         tokio::spawn(inner.run());
         Ok(EngineHandle { cmd: cmd_tx, state: ui_rx, ready: ready_rx })
     }

@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let data_dir = splice_core::config::config_dir().context("resolving config dir")?;
-    let cfg = splice_core::config::load(&data_dir);
+    let cfg = splice_core::config::load(&data_dir)?;
     let platform = splice_platform::create(splice_platform::PlatformOpts {
         data_dir: data_dir.clone(),
         panic_chord: cfg.panic_chord.clone(),

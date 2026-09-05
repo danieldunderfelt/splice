@@ -888,12 +888,10 @@ async fn handle_ei_event(
                 })));
             }
         }
-        EiEvent::ScrollCancel(_) => {
-            if forwarding {
-                shared.emit(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::ScrollStop {
-                    cancel: true,
-                })));
-            }
+        EiEvent::ScrollCancel(_) if forwarding => {
+            shared.emit(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::ScrollStop {
+                cancel: true,
+            })));
         }
         _ => {}
     }

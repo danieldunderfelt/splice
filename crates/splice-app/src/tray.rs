@@ -365,7 +365,7 @@ pub mod linux {
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
             let rgba = icon_rgba(24);
             let mut data = Vec::with_capacity(rgba.len());
-            for px in rgba.chunks_exact(4) {
+            for px in rgba.as_chunks::<4>().0 {
                 // ARGB32, network byte order.
                 data.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
             }

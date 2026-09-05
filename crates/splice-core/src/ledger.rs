@@ -12,7 +12,7 @@ pub struct HeldLedger {
 
 /// PointerButton isn't Ord (Other(u8)); wrap for the set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PointerButtonKey(u8);
+struct PointerButtonKey(u16);
 
 fn button_key(b: PointerButton) -> PointerButtonKey {
     PointerButtonKey(match b {
@@ -21,7 +21,7 @@ fn button_key(b: PointerButton) -> PointerButtonKey {
         PointerButton::Middle => 2,
         PointerButton::Back => 3,
         PointerButton::Forward => 4,
-        PointerButton::Other(n) => 8u8.saturating_add(n),
+        PointerButton::Other(n) => 8 + u16::from(n),
     })
 }
 
@@ -32,7 +32,7 @@ fn key_button(k: PointerButtonKey) -> PointerButton {
         2 => PointerButton::Middle,
         3 => PointerButton::Back,
         4 => PointerButton::Forward,
-        n => PointerButton::Other(n - 8),
+        n => PointerButton::Other((n - 8) as u8),
     }
 }
 
@@ -60,6 +60,13 @@ impl HeldLedger {
         self.keys.is_empty() && self.buttons.is_empty()
     }
 
+    pub fn presses(&self) -> Vec<InputEvent> {
+        splice_platform::keymap::held_key_presses(self.keys.iter().copied())
+            .into_iter()
+            .chain(self.buttons.iter().map(|button| InputEvent::Button { button: key_button(*button), pressed: true }))
+            .collect()
+    }
+
     /// Drain into the release events that undo everything held (keys then buttons).
     pub fn drain_releases(&mut self) -> Vec<InputEvent> {
         let mut out = Vec::with_capacity(self.keys.len() + self.buttons.len());
@@ -76,6 +83,32 @@ impl HeldLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_extended_button_has_a_distinct_release() {
+        let mut ledger = HeldLedger::default();
+        for button in 0..=255 {
+            ledger.observe(&InputEvent::Button { button: PointerButton::Other(button), pressed: true });
+        }
+        assert_eq!(ledger.presses().len(), 256);
+        let releases = ledger.drain_releases();
+        assert_eq!(releases.len(), 256);
+        for button in 0..=255 {
+            assert!(releases.contains(&InputEvent::Button { button: PointerButton::Other(button), pressed: false }));
+        }
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn modifiers_are_pressed_before_ordinary_keys_when_crossing() {
+        let mut ledger = HeldLedger::default();
+        ledger.observe(&InputEvent::Key { code: 30, pressed: true });
+        ledger.observe(&InputEvent::Key { code: 42, pressed: true });
+        assert_eq!(
+            ledger.presses(),
+            vec![InputEvent::Key { code: 42, pressed: true }, InputEvent::Key { code: 30, pressed: true }]
+        );
+    }
 
     #[test]
     fn tracks_and_drains() {

@@ -40,7 +40,7 @@ fn init_tracing(log_name: &str) {
     }
     let file = splice_core::config::config_dir()
         .ok()
-        .and_then(|dir| std::fs::File::create(dir.join(log_name)).ok());
+        .and_then(|dir| std::fs::OpenOptions::new().create(true).append(true).open(dir.join(log_name)).ok());
     match file {
         Some(file) => tracing_subscriber::fmt()
             .with_env_filter(filter)

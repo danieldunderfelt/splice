@@ -7,11 +7,11 @@
 //!   - per-peer session tasks (frames in/out over TCP)
 //!   - discovery ticks (tailscale status)
 //!   - UI commands ([`Command`])
-//! and publishing [`UiState`] snapshots through a `tokio::sync::watch`.
 //!
 //! See docs/DESIGN.md — the FSM, arbitration, and safety rules are specified there.
 
 pub mod config;
+mod clipboard;
 pub mod engine;
 pub mod arrange;
 pub mod layout;

@@ -43,7 +43,7 @@ impl Shared {
         ServerMessage::Snapshot {
             status: self.status.lock().clone(),
             tray: self.tray.load(Ordering::Acquire),
-            state: self.state.read().clone(),
+            state: Box::new(self.state.read().clone()),
         }
     }
 }
@@ -51,12 +51,16 @@ impl Shared {
 type WindowRegistry = Arc<Mutex<Vec<mpsc::UnboundedSender<ServerMessage>>>>;
 
 pub fn run() -> anyhow::Result<()> {
-    if ipc::connect().is_ok() {
+    let path = ipc::socket_path()?;
+    let Some(_lock) = acquire_service_lock(&path.with_extension("lock"))? else {
         tracing::info!("splice service already running");
         return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("removing stale service socket"),
     }
-    let path = ipc::socket_path()?;
-    let _ = std::fs::remove_file(&path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("splice-tokio")
@@ -66,6 +70,17 @@ pub fn run() -> anyhow::Result<()> {
     let result = runtime.block_on(serve(&path));
     let _ = std::fs::remove_file(&path);
     result
+}
+
+fn acquire_service_lock(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file =
+        std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 async fn serve(path: &PathBuf) -> anyhow::Result<()> {
@@ -126,7 +141,8 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
     for window in windows.lock().iter() {
         let _ = window.send(ServerMessage::Quit);
     }
-    if let Some(engine) = shared.engine.lock().clone() {
+    let engine = shared.engine.lock().clone();
+    if let Some(engine) = engine {
         engine.send(Command::Panic);
         tokio::time::sleep(RELEASE_GRACE).await;
     }
@@ -303,4 +319,20 @@ async fn write(writer: &mut tokio::net::unix::OwnedWriteHalf, message: &ServerMe
     let mut line = serde_json::to_vec(message).map_err(std::io::Error::other)?;
     line.push(b'\n');
     writer.write_all(&line).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_one_service_can_own_the_socket_at_a_time() {
+        let path = std::env::temp_dir().join(format!("splice-service-lock-{}", std::process::id()));
+        let first = acquire_service_lock(&path).unwrap().unwrap();
+        assert!(acquire_service_lock(&path).unwrap().is_none());
+        drop(first);
+        let next = acquire_service_lock(&path).unwrap().unwrap();
+        drop(next);
+        std::fs::remove_file(path).unwrap();
+    }
 }

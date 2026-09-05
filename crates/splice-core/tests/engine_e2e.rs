@@ -100,6 +100,7 @@ struct Rig {
     mock: MockHandle,
     dial_ports: Arc<std::sync::RwLock<HashMap<MachineId, u16>>>,
     addr: SocketAddr,
+    data_dir: PathBuf,
 }
 
 async fn spawn_rig(id: &str, peer: &Node) -> Rig {
@@ -107,6 +108,10 @@ async fn spawn_rig(id: &str, peer: &Node) -> Rig {
 }
 
 async fn spawn_rig_with(self_node: Node, peers: Vec<Node>) -> Rig {
+    spawn_rig_configured(self_node, peers, splice_core::config::Config::default()).await
+}
+
+async fn spawn_rig_configured(self_node: Node, peers: Vec<Node>, config: splice_core::config::Config) -> Rig {
     let (platform, mock) = mock::create(mock::one_display());
     let whois = peers
         .iter()
@@ -120,17 +125,12 @@ async fn spawn_rig_with(self_node: Node, peers: Vec<Node>) -> Rig {
     let opts = test_opts();
     let dial_ports = opts.dial_ports.clone();
     let dir = temp_dir(&self_node.stable_id);
-    let handle = Engine::spawn_with(
-        platform,
-        Arc::new(ts),
-        dir.clone(),
-        opts,
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("spawn engine");
+    splice_core::config::save(&dir, &config).unwrap();
+    let handle = Engine::spawn_with(platform, Arc::new(ts), dir.clone(), opts, Duration::from_millis(50))
+        .await
+        .expect("spawn engine");
     let addr = handle.bound_addr().await.expect("bootstrap binds a listener");
-    Rig { handle, mock, dial_ports, addr }
+    Rig { handle, mock, dial_ports, addr, data_dir: dir }
 }
 
 async fn spawn_trio() -> (Rig, Rig, Rig) {
@@ -150,14 +150,13 @@ async fn spawn_trio() -> (Rig, Rig, Rig) {
             ports.insert(id.clone(), peer.addr.port());
         }
     }
-    // aaa is lexicographically first and establishes the two hub links needed
-    // for replication. (Loopback cannot model three distinct Tailscale WhoIs
-    // source identities for the optional bbb<->ccc connection.)
-    wait_until("trio hub sessions connect", || {
+    wait_until("all three machines connect to each other", || {
         connected_to(&a, "bbb")
             && connected_to(&a, "ccc")
             && connected_to(&b, "aaa")
+            && connected_to(&b, "ccc")
             && connected_to(&c, "aaa")
+            && connected_to(&c, "bbb")
     })
     .await;
     a.handle.send(Command::SetArrangement(vec![
@@ -166,16 +165,185 @@ async fn spawn_trio() -> (Rig, Rig, Rig) {
         (mid("ccc"), Vec2I { x: 3840, y: 0 }),
     ]));
     wait_until("trio layout converges", || {
-        let state = a.handle.state();
-        let state = state.borrow();
-        state.machines.iter().find(|m| m.id == mid("bbb")).is_some_and(|m| {
-            m.offset == Vec2I { x: 1920, y: 0 }
-        }) && state.machines.iter().find(|m| m.id == mid("ccc")).is_some_and(|m| {
-            m.offset == Vec2I { x: 3840, y: 0 }
+        [&a, &b, &c].iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 2
+                && state.edges.iter().all(|edge| edge.crossable)
+                && ["aaa", "bbb", "ccc"].iter().enumerate().all(|(index, id)| {
+                    state.machines.iter().any(|m| m.id == mid(id) && m.offset == Vec2I { x: index as i32 * 1920, y: 0 })
+                })
         })
     })
     .await;
     (a, b, c)
+}
+
+#[tokio::test]
+async fn three_machines_share_a_workspace_and_keep_every_connection() {
+    let (a, b, c) = spawn_trio().await;
+    wait_until("every machine sees the same three-machine row", || {
+        [&a, &b, &c].iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            ["aaa", "bbb", "ccc"].iter().enumerate().all(|(index, id)| {
+                state.machines.iter().any(|m| m.id == mid(id) && m.offset == Vec2I { x: index as i32 * 1920, y: 0 })
+            })
+        })
+    })
+    .await;
+    let until = Instant::now() + Duration::from_millis(6250);
+    while Instant::now() < until {
+        assert!([(&a, ["bbb", "ccc"]), (&b, ["aaa", "ccc"]), (&c, ["aaa", "bbb"])]
+            .iter()
+            .all(|(rig, peers)| peers.iter().all(|id| connected_to(rig, id))));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_clipboard_fetches_from_two_peers_do_not_collide() {
+    let (a, b, c) = spawn_trio().await;
+    let mime = "image/png";
+    a.mock.state.lock().local_clip.insert(mime.into(), b"first computer".to_vec());
+    c.mock.state.lock().local_clip.insert(mime.into(), b"third computer".to_vec());
+    a.mock.events.send(PlatformEvent::ClipboardChanged { mimes: vec![mime.into()], inline_text: None }).unwrap();
+    wait_until("first clipboard offer", || b.mock.last_fetch.lock().is_some()).await;
+    let first = b.mock.last_fetch.lock().clone().unwrap();
+    wait_until("third computer observes first offer", || c.mock.last_fetch.lock().is_some()).await;
+    c.mock.events.send(PlatformEvent::ClipboardChanged { mimes: vec![mime.into()], inline_text: None }).unwrap();
+    wait_until("second clipboard offer", || b.mock.state.lock().remote_offers.len() == 2).await;
+    let second = b.mock.last_fetch.lock().clone().unwrap();
+    let (one, two) = tokio::join!(first.fetch(mime), second.fetch(mime));
+    assert_eq!(one, Some(b"first computer".to_vec()));
+    assert_eq!(two, Some(b"third computer".to_vec()));
+}
+
+#[tokio::test]
+async fn panic_on_the_third_machine_releases_the_active_pair() {
+    let (a, b, c) = spawn_trio().await;
+    drive_a_to_b(&a, &b).await;
+    c.handle.send(Command::Panic);
+    wait_until("third-machine panic releases both source and target", || {
+        matches!(focus_of(&a), UiFocus::Local)
+            && matches!(focus_of(&b), UiFocus::Local)
+            && !a.mock.state.lock().capturing
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_disabled_third_machine_does_not_steal_control() {
+    let (a, b, c) = spawn_trio().await;
+    c.handle.send(Command::SetMasterEnabled(false));
+    wait_until("third machine disabled", || !c.handle.state().borrow().master_enabled).await;
+    drive_a_to_b(&a, &b).await;
+    c.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(matches!(focus_of(&a), UiFocus::Remote(id) if id == mid("bbb")));
+    assert!(matches!(focus_of(&b), UiFocus::Driven(id) if id == mid("aaa")));
+}
+
+#[tokio::test]
+async fn held_modifiers_follow_the_pointer_across_three_machines() {
+    let (a, b, c) = spawn_trio().await;
+    drive_a_to_b(&a, &b).await;
+    let press = InputEvent::Key { code: 42, pressed: true };
+    a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(press))).unwrap();
+    wait_until("second machine receives Shift", || b.mock.state.lock().injected.contains(&press)).await;
+    push_motion(&a, 2200.0, 0.0);
+    wait_until("pointer enters third machine with Shift held", || {
+        matches!(focus_of(&c), UiFocus::Driven(id) if id == mid("aaa")) && c.mock.state.lock().injected.contains(&press)
+    })
+    .await;
+    let release = InputEvent::Key { code: 42, pressed: false };
+    assert!(b.mock.state.lock().injected.contains(&release));
+    a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(release))).unwrap();
+    wait_until("third machine receives Shift release", || c.mock.state.lock().injected.contains(&release)).await;
+    push_motion(&a, -2200.0, 0.0);
+    wait_until("pointer returns to the middle", || matches!(focus_of(&b), UiFocus::Driven(id) if id == mid("aaa")))
+        .await;
+    push_motion(&a, -2200.0, 0.0);
+    wait_until("pointer returns home", || matches!(focus_of(&a), UiFocus::Local) && !a.mock.state.lock().capturing)
+        .await;
+}
+
+#[tokio::test]
+async fn joining_an_established_workspace_preserves_the_new_machine() {
+    use splice_proto::{MachinePlacement, Stamp};
+    let a_node = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    let b_node = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let cfg = splice_core::config::Config {
+        layout: Some(LayoutDoc {
+            stamp: Stamp { lamport: 100, writer: mid("aaa") },
+            machines: [(mid("aaa"), MachinePlacement { offset: Vec2I::default(), enabled: true })].into(),
+            sensitivity: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let a = spawn_rig_configured(a_node.clone(), vec![b_node.clone()], cfg).await;
+    let b = spawn_rig_with(b_node, vec![a_node]).await;
+    a.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
+    b.dial_ports.write().unwrap().insert(mid("aaa"), a.addr.port());
+    wait_until("both machines have a shared crossable edge", || {
+        [&a, &b].iter().all(|rig| rig.handle.state().borrow().edges.iter().any(|edge| edge.crossable))
+    })
+    .await;
+    drive_a_to_b(&a, &b).await;
+}
+
+#[tokio::test]
+async fn newer_two_machine_layout_cannot_erase_connected_middle_machine() {
+    use splice_core::net::{NetManager, PeerEvent};
+    use splice_proto::{Frame, MachineInfo, MachinePlacement, Os, Stamp};
+    let a_node = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    let b_node = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let b = spawn_rig_with(b_node.clone(), vec![a_node.clone()]).await;
+    let opts = test_opts();
+    opts.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
+    let (mut a, control) = NetManager::spawn_with(
+        MachineInfo { id: mid("aaa"), hostname: "aaa".into(), os: Os::Linux, displays: mock::one_display() },
+        SocketAddr::new(a_node.ips[0], 0),
+        Arc::new(FakeTs {
+            self_node: a_node,
+            peers: vec![b_node.clone()],
+            whois: Arc::new(HashMap::from([(b_node.ips[0], ("bbb".into(), USER))])),
+        }),
+        opts,
+    )
+    .await
+    .unwrap();
+    control.update_dial_targets(vec![(mid("bbb"), b_node.ips[0])]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !matches!(a.events.recv().await, Some(PeerEvent::Connected { .. })) {}
+    })
+    .await
+    .unwrap();
+    wait_until("initial workspace includes both machines", || !b.handle.state().borrow().edges.is_empty()).await;
+    let offset = b.handle.state().borrow().machines.iter().find(|m| m.id == mid("aaa")).unwrap().offset;
+    let incoming = LayoutDoc {
+        stamp: Stamp { lamport: 100, writer: mid("aaa") },
+        machines: [
+            (mid("aaa"), MachinePlacement { offset, enabled: true }),
+            (mid("ccc"), MachinePlacement { offset: Vec2I { x: 3840, y: 0 }, enabled: true }),
+        ]
+        .into(),
+        sensitivity: Default::default(),
+    };
+    assert!(control.send_to(&mid("bbb"), Frame::LayoutSync(incoming)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(PeerEvent::Frame(_, Frame::LayoutSync(doc))) = a.events.recv().await {
+                if doc.stamp.lamport > 100 {
+                    assert!(doc.machines.contains_key(&mid("bbb")), "middle machine was removed");
+                    assert!(doc.machines.contains_key(&mid("ccc")), "new member was removed");
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("merged workspace must retain and republish the middle machine");
 }
 
 async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -782,4 +950,114 @@ async fn peer_master_off_makes_the_edge_uncrossable_until_reenabled() {
     })
     .await;
     drive_a_to_b(&a, &b).await;
+}
+
+#[tokio::test]
+async fn five_machine_workspace_converges_after_middle_machine_restarts() {
+    let ids = ["aaa", "bbb", "ccc", "ddd", "eee"];
+    let nodes: Vec<_> =
+        ids.iter().enumerate().map(|(index, id)| node_at(id, Ipv4Addr::new(127, 0, 0, index as u8 + 1))).collect();
+    let mut rigs = Vec::new();
+    for node in &nodes {
+        rigs.push(
+            spawn_rig_with(
+                node.clone(),
+                nodes.iter().filter(|peer| peer.stable_id != node.stable_id).cloned().collect(),
+            )
+            .await,
+        );
+    }
+    for rig in &rigs {
+        for (id, peer) in ids.iter().zip(&rigs) {
+            rig.dial_ports.write().unwrap().insert(mid(id), peer.addr.port());
+        }
+    }
+    wait_until("all twenty directed peer connections are ready", || {
+        rigs.iter()
+            .enumerate()
+            .all(|(index, rig)| ids.iter().enumerate().all(|(other, id)| index == other || connected_to(rig, id)))
+    })
+    .await;
+    let row: Vec<_> =
+        ids.iter().enumerate().map(|(index, id)| (mid(id), Vec2I { x: index as i32 * 1920, y: 0 })).collect();
+    rigs[4].handle.send(Command::SetArrangement(row.clone()));
+    wait_until("every machine adopts the fifth machine's arrangement", || {
+        rigs.iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 4
+                && state.edges.iter().all(|edge| edge.crossable)
+                && row
+                    .iter()
+                    .all(|(id, pos)| state.machines.iter().any(|machine| &machine.id == id && &machine.offset == pos))
+        })
+    })
+    .await;
+    let middle = rigs.remove(2);
+    let dir = middle.data_dir.clone();
+    drop(middle);
+    wait_until("survivors observe middle machine shutdown", || rigs.iter().all(|rig| !connected_to(rig, "ccc"))).await;
+    let config = splice_core::config::load(&dir).unwrap();
+    assert_eq!(config.layout.as_ref().unwrap().machines.len(), 5);
+    let middle = spawn_rig_configured(
+        nodes[2].clone(),
+        nodes.iter().filter(|node| node.stable_id != "ccc").cloned().collect(),
+        config,
+    )
+    .await;
+    rigs.insert(2, middle);
+    for rig in &rigs {
+        for (id, peer) in ids.iter().zip(&rigs) {
+            rig.dial_ports.write().unwrap().insert(mid(id), peer.addr.port());
+        }
+    }
+    wait_until("all twenty connections and the arrangement recover", || {
+        rigs.iter().enumerate().all(|(index, rig)| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 4
+                && state.edges.iter().all(|edge| edge.crossable)
+                && ids.iter().enumerate().all(|(other, id)| index == other || connected_to(rig, id))
+                && row
+                    .iter()
+                    .all(|(id, pos)| state.machines.iter().any(|machine| &machine.id == id && &machine.offset == pos))
+        })
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn repeated_clipboard_reads_are_independent_and_disabled_callbacks_expire() {
+    let (a, b) = spawn_pair().await;
+    let mime = "image/png";
+    let bytes = vec![37; splice_proto::CLIP_CHUNK * 3 + 7];
+    a.mock.state.lock().local_clip.insert(mime.into(), bytes.clone());
+    a.mock.events.send(PlatformEvent::ClipboardChanged { mimes: vec![mime.into()], inline_text: None }).unwrap();
+    wait_until("clipboard offer arrives", || b.mock.last_fetch.lock().is_some()).await;
+    let fetch = b.mock.last_fetch.lock().clone().unwrap();
+    let (first, second) = tokio::join!(fetch.fetch(mime), fetch.fetch(mime));
+    assert_eq!(first, Some(bytes.clone()));
+    assert_eq!(second, Some(bytes));
+    b.handle.send(Command::SetClipboardSync(false));
+    wait_until("clipboard sharing is disabled", || !b.handle.state().borrow().clipboard_sync).await;
+    assert_eq!(fetch.fetch(mime).await, None);
+    b.handle.send(Command::SetClipboardSync(true));
+    wait_until("clipboard sharing is enabled", || b.handle.state().borrow().clipboard_sync).await;
+    assert_eq!(fetch.fetch(mime).await, None);
+}
+
+#[tokio::test]
+async fn failed_config_writes_are_visible_and_retry_after_storage_recovers() {
+    let rig = spawn_rig_with(node("aaa"), Vec::new()).await;
+    let blocked = rig.data_dir.join("config.json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    rig.handle.send(Command::SetMasterEnabled(false));
+    wait_until("failed save appears in UI", || rig.handle.state().borrow().config_error.is_some()).await;
+    std::fs::remove_dir(blocked).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while rig.handle.state().borrow().config_error.is_some() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.expect("save retries and clears the error");
+    assert!(!splice_core::config::load(&rig.data_dir).unwrap().master_enabled);
 }

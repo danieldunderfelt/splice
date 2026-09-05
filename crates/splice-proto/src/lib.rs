@@ -4,21 +4,14 @@
 //! tailnet peers. WireGuard provides transport encryption; Tailscale WhoIs provides
 //! authentication — there is no crypto at this layer.
 //!
-//! # Evolution rules (postcard is positional, NOT self-describing)
-//! - Never remove, reorder, or change the meaning of existing enum variants or struct fields.
-//! - New frames/fields are ADDED at the end and gated on negotiated capabilities
-//!   ([`Hello::caps`]); a peer must never send a frame the other side didn't advertise.
-//! - `PROTO_VERSION` bumps only for incompatible framing changes (avoid forever).
-
 pub mod framing;
+pub mod validation;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Protocol version spoken by this build. Peers negotiate min(theirs, ours) and refuse
-/// only if ranges are disjoint ("nobody gets turned away" — additions ride on caps instead).
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 /// Well-known Splice TCP port on the tailnet.
 pub const SPLICE_PORT: u16 = 41717;
 /// Hard cap on a single frame (framing layer enforces).
@@ -35,7 +28,7 @@ pub mod caps {
     /// Base input relay (motion/button/scroll/key, enter/leave, source claims).
     pub const INPUT_V1: &str = "input-v1";
     /// Clipboard offers + lazy fetch.
-    pub const CLIPBOARD_V1: &str = "clipboard-v1";
+    pub const CLIPBOARD_V2: &str = "clipboard-v2";
     /// Layout replication.
     pub const LAYOUT_V1: &str = "layout-v1";
     /// Master switch state replication (`Frame::MasterState`).
@@ -130,7 +123,6 @@ pub struct Welcome {
     /// Chosen protocol version.
     pub proto: u16,
     pub machine: MachineInfo,
-    /// Capabilities in effect = intersection.
     pub caps: Vec<String>,
 }
 
@@ -202,7 +194,6 @@ impl LayoutDoc {
     }
 }
 
-/// All frames on the wire. See module docs for evolution rules.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Frame {
     Hello(Hello),
@@ -212,7 +203,6 @@ pub enum Frame {
     Pong { nonce: u64, t_us: u64 },
     /// "I have physical input; I am the source now." Highest stamp wins cluster-wide.
     SourceClaim { stamp: Stamp },
-    /// Replicated layout; adopt iff `stamp` is newer than local.
     LayoutSync(LayoutDoc),
     /// Refreshed self-description (display hotplug etc.).
     MachineUpdate(MachineInfo),
@@ -222,7 +212,6 @@ pub enum Frame {
     Input { session: u64, ev: InputEvent },
     /// Source → target: session end.
     Leave { session: u64, reason: LeaveReason },
-    /// Unconditional safety: receiver releases every held key/button it injected.
     ReleaseAll,
     /// Local clipboard changed. `mimes` in preference order. Small text rides inline.
     ClipOffer {
@@ -232,26 +221,28 @@ pub enum Frame {
         inline_text: Option<String>,
     },
     /// Ask the offering machine for one representation.
-    ClipRequest { id: u64, mime: String },
-    /// Chunked response; `last` marks the final chunk. Empty+last = representation gone.
+    ClipRequest { id: u64, request: u64, mime: String },
     ClipChunk {
-        id: u64,
-        mime: String,
+        request: u64,
         data: Vec<u8>,
         last: bool,
     },
     /// Offer/request cannot be served (expired, over cap, converted away).
-    ClipAbort { id: u64, reason: String },
+    ClipAbort { request: u64, reason: String },
     /// Graceful shutdown notice.
     Bye { reason: String },
     /// Sender's master switch. A machine with it off refuses every Enter, so peers must
     /// not offer it as a crossing target. Gated on `caps::MASTER_V1`.
     MasterState { enabled: bool },
+    Ready,
+    Panic,
 }
 
 /// Errors shared by framing and session-level protocol handling.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
+    #[error("invalid frame: {0}")]
+    InvalidData(&'static str),
     #[error("frame exceeds MAX_FRAME_LEN: {0} bytes")]
     FrameTooLarge(u32),
     #[error("postcard: {0}")]

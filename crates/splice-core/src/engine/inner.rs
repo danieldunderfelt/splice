@@ -22,14 +22,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 
 /// UiState bursts are coalesced to one publish per this window (DESIGN: <=10 Hz).
 const UI_DEBOUNCE: Duration = Duration::from_millis(100);
 /// Config writes are debounced this long after the last change.
 const CFG_DEBOUNCE: Duration = Duration::from_secs(1);
-/// A lazy clipboard pull gives up after this much silence from the origin.
-const CLIP_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PLATFORM_BATCH_EVENTS: usize = 64;
 const DRIVEN_GRACE: Duration = Duration::from_secs(1);
 const TS_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +41,8 @@ enum Focus {
 
 #[derive(Default)]
 struct Peer {
+    hostname: Option<String>,
+    error: Option<String>,
     info: Option<MachineInfo>,
     caps: Vec<String>,
     connected: bool,
@@ -52,47 +52,6 @@ struct Peer {
     /// Tailscale reports a direct path (CurAddr non-empty) vs DERP relay.
     direct: bool,
     rtt_ms: Option<f64>,
-}
-
-struct PendingFetch {
-    buf: Vec<u8>,
-    done: oneshot::Sender<Option<Vec<u8>>>,
-}
-
-type PendingFetches = Arc<parking_lot::Mutex<HashMap<(u64, String), PendingFetch>>>;
-
-/// Engine-side ClipFetch handed to clipboard backends: pulls one representation from
-/// the offering peer over the peer session, reassembling ClipChunks in the engine.
-struct RemoteFetch {
-    net: NetControl,
-    origin: MachineId,
-    id: u64,
-    pending: PendingFetches,
-}
-
-#[async_trait::async_trait]
-impl splice_platform::ClipFetch for RemoteFetch {
-    async fn fetch(&self, mime: &str) -> Option<Vec<u8>> {
-        let key = (self.id, mime.to_string());
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .insert(key.clone(), PendingFetch { buf: Vec::new(), done: tx });
-        if !self
-            .net
-            .send_to(&self.origin, Frame::ClipRequest { id: self.id, mime: mime.to_string() })
-        {
-            self.pending.lock().remove(&key);
-            return None;
-        }
-        match tokio::time::timeout(CLIP_FETCH_TIMEOUT, rx).await {
-            Ok(Ok(data)) => data,
-            _ => {
-                self.pending.lock().remove(&key);
-                None
-            }
-        }
-    }
 }
 
 pub struct Inner {
@@ -139,6 +98,7 @@ pub struct Inner {
     backends: Option<watch::Sender<BackendPrefs>>,
     backend_status: Option<BackendStatus>,
     tailscale_error: Option<String>,
+    config_error: Option<String>,
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
     platform_batch: Vec<PlatformEvent>,
@@ -149,7 +109,8 @@ pub struct Inner {
     last_applied_inline: Option<String>,
     offer_id: u64,
     live_offer: Option<(u64, Vec<String>)>,
-    pending_fetches: PendingFetches,
+    pending_fetches: crate::clipboard::Transfers,
+    clipboard_jobs: tokio::task::JoinSet<()>,
 }
 
 impl Inner {
@@ -163,15 +124,15 @@ impl Inner {
         cmd: mpsc::UnboundedReceiver<Command>,
         ui_tx: watch::Sender<UiState>,
         ready_tx: watch::Sender<Option<SocketAddr>>,
-    ) -> Self {
-        let cfg = config::load(&data_dir);
+    ) -> anyhow::Result<Self> {
+        let cfg = config::load(&data_dir)?;
         let layout_lamport = cfg.layout.as_ref().map(|d| d.stamp.lamport).unwrap_or(0);
         let splice_platform::Platform { capture, emulate, clipboard, displays, events, backends } =
             platform;
         if let Some(backends) = &backends {
             let _ = backends.send(cfg.backends);
         }
-        Inner {
+        Ok(Inner {
             self_info: MachineInfo {
                 id: MachineId(String::new()),
                 hostname: String::new(),
@@ -214,6 +175,7 @@ impl Inner {
             backends,
             backend_status: None,
             tailscale_error: None,
+            config_error: None,
             ui_deadline: None,
             cfg_deadline: None,
             platform_batch: Vec::with_capacity(16),
@@ -223,12 +185,15 @@ impl Inner {
             last_applied_inline: None,
             offer_id: 0,
             live_offer: None,
-            pending_fetches: PendingFetches::default(),
-        }
+            pending_fetches: crate::clipboard::Transfers::default(),
+            clipboard_jobs: tokio::task::JoinSet::new(),
+        })
     }
 
     pub async fn run(mut self) {
-        self.bootstrap().await;
+        if !self.bootstrap().await {
+            return;
+        }
         self.ensure_doc();
         if self.settle_layout() {
             self.bump_layout();
@@ -247,6 +212,13 @@ impl Inner {
             let ui_at = self.ui_deadline;
             let cfg_at = self.cfg_deadline;
             tokio::select! {
+                result = self.clipboard_jobs.join_next(), if !self.clipboard_jobs.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        if !error.is_cancelled() {
+                            tracing::error!(%error, "clipboard request task failed");
+                        }
+                    }
+                }
                 cmd = self.cmd.recv() => match cmd {
                     Some(cmd) => {
                         self.on_command(cmd).await;
@@ -321,8 +293,18 @@ impl Inner {
             }
         }
 
-        // Graceful exit: close peer sessions so the other side sees Disconnected
-        // instead of a half-open socket.
+        match self.focus.clone() {
+            Focus::Remote(target) => {
+                self.end_remote(&target, LeaveReason::Reconfigured, Some(self.last_local_pos), true).await
+            }
+            Focus::Driven(source) => self.end_driven(&source, Some(LeaveReason::Reconfigured)).await,
+            Focus::Local => {}
+        }
+        self.pending_fetches.clear();
+        self.clipboard_jobs.abort_all();
+        if self.cfg_deadline.is_some() {
+            self.save_config();
+        }
         if let Some(net) = &self.net {
             net.update_dial_targets(Vec::new());
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -331,9 +313,12 @@ impl Inner {
 
     /// Learn self from tailscale (retrying while LocalAPI is unreachable) and bring
     /// up the net layer. Runs inside the engine task so spawn returns immediately.
-    async fn bootstrap(&mut self) {
+    async fn bootstrap(&mut self) -> bool {
         let retry = self.poll_interval.min(Duration::from_secs(5));
         loop {
+            if self.cmd.is_closed() {
+                return false;
+            }
             let status = match self.ts_status().await {
                 Ok(status) => status,
                 Err(e) => {
@@ -376,7 +361,7 @@ impl Inner {
                     let _ = self.ready_tx.send(Some(mgr.local_addr));
                     self.net = Some(control);
                     self.net_events = Some(mgr.events);
-                    return;
+                    return true;
                 }
                 Err(e) => {
                     self.tailscale_error = Some(format!("listener bind failed: {e}"));
@@ -410,6 +395,7 @@ impl Inner {
                     }
                     let id = MachineId(node.stable_id.clone());
                     let peer = self.peers.entry(id.clone()).or_default();
+                    peer.hostname = Some(node.hostname.clone());
                     if !node.online || node.user_id != self_user {
                         peer.ts_online = false;
                         continue;
@@ -477,6 +463,9 @@ impl Inner {
             }
             PlatformEvent::Capture(CaptureEvent::Panic) => self.panic().await,
             PlatformEvent::PhysicalActivity => {
+                if !self.cfg.master_enabled || !self.machine_enabled(&self.self_info.id) {
+                    return;
+                }
                 self.claim_source();
                 if let Focus::Driven(source) = self.focus.clone() {
                     self.end_driven(&source, Some(LeaveReason::SourceChanged)).await;
@@ -693,6 +682,7 @@ impl Inner {
             self.touch_ui();
         } else {
             let next = link.to.clone();
+            let held = self.source_ledger.clone();
             self.send_leave(&link.from, LeaveReason::Crossed, false);
             let landing = layout::clamp_into_displays(self.display_slice_of(&next), landing);
             self.session += 1;
@@ -713,7 +703,11 @@ impl Inner {
             }
             if let Some(net) = &self.net {
                 net.set_active(&next, true);
+                for event in held.presses() {
+                    net.send_to(&next, Frame::Input { session: self.active_session, ev: event });
+                }
             }
+            self.source_ledger = held;
             // Capture stays on across the hop.
             self.focus = Focus::Remote(next);
             self.virtual_pos = landing;
@@ -793,7 +787,7 @@ impl Inner {
             self.end_driven(&src, Some(LeaveReason::Panic)).await;
         }
         if let Some(net) = &self.net {
-            net.broadcast(Frame::ReleaseAll);
+            net.broadcast(Frame::Panic);
         }
         self.focus = Focus::Local;
         self.touch_ui();
@@ -824,16 +818,13 @@ impl Inner {
             return;
         }
         self.claim = Some(stamp);
-        // Lost sourceness while driving: hand the cursor back locally. If we are the
-        // Driven side of the previous holder, keep state — its Leave will arrive.
         if let Focus::Remote(target) = self.focus.clone() {
-            self.end_remote(
-                &target,
-                LeaveReason::SourceChanged,
-                Some(self.last_local_pos),
-                false,
-            )
-            .await;
+            self.end_remote(&target, LeaveReason::SourceChanged, Some(self.last_local_pos), false).await;
+        }
+        if let Focus::Driven(source) = self.focus.clone() {
+            if self.claim.as_ref().is_some_and(|claim| claim.writer != source) {
+                self.end_driven(&source, Some(LeaveReason::SourceChanged)).await;
+            }
         }
         self.touch_ui();
     }
@@ -850,6 +841,8 @@ impl Inner {
                     "peer connected"
                 );
                 let peer = self.peers.entry(id.clone()).or_default();
+                peer.hostname = Some(hello.hostname.clone());
+                peer.error = None;
                 peer.info = Some(hello);
                 peer.caps = caps;
                 peer.connected = true;
@@ -885,8 +878,10 @@ impl Inner {
                 self.touch_ui();
             }
             PeerEvent::Disconnected(id, reason) => {
+                self.pending_fetches.disconnect(&id);
                 tracing::debug!(peer = %id, reason, "peer disconnected");
                 let peer = self.peers.entry(id.clone()).or_default();
+                peer.error = Some(reason);
                 peer.connected = false;
                 peer.degraded = false;
                 if self.focus == Focus::Remote(id.clone()) {
@@ -901,6 +896,13 @@ impl Inner {
                 self.peers.entry(id).or_default().rtt_ms = Some(rtt);
                 self.touch_ui();
             }
+            PeerEvent::Rejected { id, reason } => {
+                let peer = self.peers.entry(id).or_default();
+                if !peer.connected {
+                    peer.error = Some(reason);
+                }
+                self.touch_ui();
+            }
         }
     }
 
@@ -909,17 +911,24 @@ impl Inner {
             Frame::SourceClaim { stamp } => self.on_source_claim(stamp).await,
             Frame::LayoutSync(doc) => {
                 self.layout_lamport = self.layout_lamport.max(doc.stamp.lamport);
-                if self.layout.as_ref().is_none_or(|l| doc.stamp > l.stamp) {
-                    tracing::info!(
-                        writer = %doc.stamp.writer,
-                        lamport = doc.stamp.lamport,
-                        machines = ?doc.machines,
-                        "adopting peer layout"
-                    );
-                    self.layout = Some(doc);
+                let newer = self.layout.as_ref().is_none_or(|l| doc.stamp > l.stamp);
+                let previous = if newer { self.layout.replace(doc) } else { Some(doc) };
+                let mut combined = false;
+                if let Some(previous) = previous {
+                    let current = self.layout.as_mut().expect("layout exists");
+                    for (id, placement) in previous.machines {
+                        if let std::collections::btree_map::Entry::Vacant(entry) = current.machines.entry(id) {
+                            entry.insert(placement);
+                            combined = true;
+                        }
+                    }
+                }
+                if newer || combined {
                     self.mark_cfg_dirty();
-                    if self.settle_layout() {
+                    if self.settle_layout() || combined {
                         self.bump_layout();
+                    } else if let (Some(net), Some(doc)) = (&self.net, &self.layout) {
+                        net.broadcast(Frame::LayoutSync(doc.clone()));
                     }
                     self.touch_ui();
                 }
@@ -931,6 +940,10 @@ impl Inner {
             }
             Frame::MachineUpdate(info) => {
                 let id = info.id.clone();
+                if id != *from {
+                    tracing::warn!(peer = %from, claimed = %id, "rejected machine update for another peer");
+                    return;
+                }
                 tracing::info!(
                     peer = %id,
                     hostname = %info.hostname,
@@ -977,36 +990,28 @@ impl Inner {
                         .await;
                 }
             }
-            Frame::ReleaseAll => self.release_target_side().await,
+            Frame::ReleaseAll => {
+                if matches!(&self.focus, Focus::Driven(source) if source == from.as_ref()) {
+                    self.release_target_side().await;
+                }
+            }
+            Frame::Panic => match self.focus.clone() {
+                Focus::Remote(target) => self.end_remote(&target, LeaveReason::Panic, None, true).await,
+                Focus::Driven(source) => self.end_driven(&source, Some(LeaveReason::Panic)).await,
+                Focus::Local => self.release_target_side().await,
+            },
             Frame::ClipOffer { id, stamp, mimes, inline_text } => {
                 self.on_clip_offer((*from).clone(), id, stamp, mimes, inline_text).await;
             }
-            Frame::ClipRequest { id, mime } => {
-                self.on_clip_request((*from).clone(), id, mime).await;
+            Frame::ClipRequest { id, request, mime } => {
+                self.on_clip_request((*from).clone(), id, request, mime);
             }
-            Frame::ClipChunk { id, mime, data, last } => {
-                let key = (id, mime);
-                let mut pending = self.pending_fetches.lock();
-                if let Some(mut fetch) = pending.remove(&key) {
-                    fetch.buf.extend_from_slice(&data);
-                    if fetch.buf.len() > CLIP_MAX_TOTAL {
-                        let _ = fetch.done.send(None);
-                    } else if last {
-                        let _ = fetch.done.send(Some(fetch.buf));
-                    } else {
-                        pending.insert(key, fetch);
-                    }
-                }
+            Frame::ClipChunk { request, data, last } => {
+                self.pending_fetches.chunk(&from, request, data, last);
             }
-            Frame::ClipAbort { id, .. } => {
-                let mut pending = self.pending_fetches.lock();
-                let keys: Vec<_> =
-                    pending.keys().filter(|(fid, _)| *fid == id).cloned().collect();
-                for key in keys {
-                    if let Some(fetch) = pending.remove(&key) {
-                        let _ = fetch.done.send(None);
-                    }
-                }
+            Frame::ClipAbort { request, reason } => {
+                tracing::debug!(peer = %from, request, reason, "clipboard request refused");
+                self.pending_fetches.abort(&from, request);
             }
             _ => {}
         }
@@ -1217,6 +1222,13 @@ impl Inner {
                 self.bump_layout();
             }
             Command::SetArrangement(placements) => {
+                let limit = splice_proto::validation::MAX_COORDINATE;
+                if placements.iter().any(|(id, offset)| {
+                    id.0.is_empty() || !(-limit..=limit).contains(&offset.x) || !(-limit..=limit).contains(&offset.y)
+                }) {
+                    tracing::warn!("rejected invalid workspace arrangement");
+                    return;
+                }
                 self.ensure_doc();
                 let doc = self.layout.as_mut().expect("doc exists");
                 for (id, offset) in placements {
@@ -1229,24 +1241,27 @@ impl Inner {
                 self.bump_layout();
             }
             Command::SetSensitivity { link_key, factor } => {
+                if !factor.is_finite() || !(0.25..=4.0).contains(&factor) {
+                    tracing::warn!(factor, "rejected invalid pointer sensitivity");
+                    return;
+                }
                 self.ensure_doc();
-                self.layout
-                    .as_mut()
-                    .expect("doc exists")
-                    .sensitivity
-                    .insert(link_key, factor.clamp(0.25, 4.0));
+                self.layout.as_mut().expect("doc exists").sensitivity.insert(link_key, factor);
                 self.bump_layout();
             }
             Command::SetClipboardSync(on) => {
                 self.cfg.clipboard_sync = on;
+                if !on {
+                    self.live_offer = None;
+                    self.pending_fetches.clear();
+                    self.clipboard_jobs.abort_all();
+                }
                 self.mark_cfg_dirty();
                 self.touch_ui();
             }
             Command::SetBackends(prefs) => {
                 self.cfg.backends = prefs;
-                if let Err(err) = config::save(&self.data_dir, &self.cfg) {
-                    tracing::warn!(error = %err, "cannot persist backend preferences");
-                }
+                self.save_config();
                 if let Some(backends) = &self.backends {
                     let _ = backends.send(prefs);
                 }
@@ -1293,11 +1308,7 @@ impl Inner {
         if !self.cfg.clipboard_sync {
             return;
         }
-        if !self
-            .peers
-            .get(&from)
-            .is_some_and(|p| p.caps.iter().any(|c| c == caps::CLIPBOARD_V1))
-        {
+        if !self.peers.get(&from).is_some_and(|p| p.caps.iter().any(|c| c == caps::CLIPBOARD_V2)) {
             return;
         }
         if self.clip_seen.as_ref().is_some_and(|seen| stamp <= *seen) {
@@ -1306,51 +1317,54 @@ impl Inner {
         self.clip_seen = Some(stamp);
         self.last_applied_inline = inline_text.clone();
         if let Some(net) = &self.net {
-            let fetch = Arc::new(RemoteFetch {
-                net: net.clone(),
-                origin: from,
-                id,
-                pending: self.pending_fetches.clone(),
-            });
-            let _ = self
-                .clipboard
-                .set_remote_offer(ClipboardOffer { id, mimes, inline_text }, fetch)
-                .await;
+            let fetch = self.pending_fetches.offer(net.clone(), from, id, mimes.clone());
+            let _ = self.clipboard.set_remote_offer(ClipboardOffer { id, mimes, inline_text }, fetch).await;
         }
     }
 
-    async fn on_clip_request(&mut self, from: MachineId, id: u64, mime: String) {
-        let live = self.live_offer.as_ref().is_some_and(|(oid, _)| *oid == id);
-        let Some(net) = &self.net else {
-            return;
-        };
+    fn on_clip_request(&mut self, from: MachineId, id: u64, request: u64, mime: String) {
+        let Some(net) = self.net.clone() else { return };
+        let live = self.cfg.clipboard_sync
+            && self.live_offer.as_ref().is_some_and(|(offer, mimes)| *offer == id && mimes.contains(&mime));
         if !live {
-            net.send_to(&from, Frame::ClipAbort { id, reason: "stale offer".into() });
+            net.send_to(&from, Frame::ClipAbort { request, reason: "clipboard offer is unavailable".into() });
             return;
         }
-        match self.clipboard.read_local(&mime).await {
-            Ok(bytes) if bytes.is_empty() => {
-                net.send_to(&from, Frame::ClipChunk { id, mime, data: Vec::new(), last: true });
-            }
-            Ok(bytes) => {
-                let chunks: Vec<&[u8]> = bytes.chunks(CLIP_CHUNK).collect();
-                let count = chunks.len();
-                for (index, chunk) in chunks.into_iter().enumerate() {
-                    net.send_to(
-                        &from,
-                        Frame::ClipChunk {
-                            id,
-                            mime: mime.clone(),
-                            data: chunk.to_vec(),
-                            last: index + 1 == count,
-                        },
-                    );
+        if self.clipboard_jobs.len() >= 8 {
+            net.send_to(&from, Frame::ClipAbort { request, reason: "too many clipboard reads in progress".into() });
+            return;
+        }
+        let clipboard = self.clipboard.clone();
+        self.clipboard_jobs.spawn(async move {
+            let bytes = match tokio::time::timeout(crate::clipboard::FETCH_TIMEOUT, clipboard.read_local(&mime)).await {
+                Ok(Ok(bytes)) if bytes.len() <= CLIP_MAX_TOTAL => bytes,
+                result => {
+                    let reason = match result {
+                        Ok(Ok(_)) => "clipboard representation exceeds size limit".to_string(),
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "clipboard read timed out".to_string(),
+                    };
+                    net.send_to(&from, Frame::ClipAbort { request, reason });
+                    return;
+                }
+            };
+            if bytes.is_empty() {
+                net.send_to(&from, Frame::ClipChunk { request, data: Vec::new(), last: true });
+            } else {
+                let count = bytes.len().div_ceil(CLIP_CHUNK);
+                for (index, chunk) in bytes.chunks(CLIP_CHUNK).enumerate() {
+                    if !net
+                        .send_to_wait(
+                            &from,
+                            Frame::ClipChunk { request, data: chunk.to_vec(), last: index + 1 == count },
+                        )
+                        .await
+                    {
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                net.send_to(&from, Frame::ClipAbort { id, reason: e.to_string() });
-            }
-        }
+        });
     }
 
     // ----- recompute & helpers -----
@@ -1412,7 +1426,14 @@ impl Inner {
             );
             self.armed_specs = specs.clone();
         }
-        let _ = self.capture.set_edges(specs).await;
+        if let Err(error) = self.capture.set_edges(specs).await {
+            tracing::warn!(%error, "cannot arm capture edges");
+            self.health.capture = Some(error.to_string());
+            if let Focus::Remote(target) = self.focus.clone() {
+                self.end_remote(&target, LeaveReason::CaptureLost, Some(self.last_local_pos), true).await;
+            }
+            self.touch_ui();
+        }
         self.active_sensitivity = match &self.focus {
             Focus::Remote(target) => self.sensitivity(target),
             _ => 1.0,
@@ -1534,9 +1555,15 @@ impl Inner {
 
     fn save_config(&mut self) {
         self.cfg.layout = self.layout.clone();
-        if let Err(e) = config::save(&self.data_dir, &self.cfg) {
-            tracing::warn!(error = %e, "config save failed");
+        match config::save(&self.data_dir, &self.cfg) {
+            Ok(()) => self.config_error = None,
+            Err(error) => {
+                tracing::warn!(%error, "config save failed");
+                self.config_error = Some(format!("Settings could not be saved: {error}"));
+                self.cfg_deadline = Some(Instant::now() + Duration::from_secs(5));
+            }
         }
+        self.touch_ui();
     }
 
     fn publish_ui(&mut self) {
@@ -1641,6 +1668,20 @@ impl Inner {
             panic_chord: format_chord(&self.cfg.panic_chord),
             sensitivity: doc.as_ref().map(|d| d.sensitivity.clone()).unwrap_or_default(),
             tailscale_error: self.tailscale_error.clone(),
+            config_error: self.config_error.clone(),
+            connection_errors: {
+                let mut errors: Vec<_> = self
+                    .peers
+                    .iter()
+                    .filter_map(|(id, peer)| {
+                        peer.error
+                            .as_ref()
+                            .map(|error| format!("{}: {error}", peer.hostname.as_deref().unwrap_or(&id.0)))
+                    })
+                    .collect();
+                errors.sort();
+                errors
+            },
             backends: self.backend_status.clone(),
         }
     }

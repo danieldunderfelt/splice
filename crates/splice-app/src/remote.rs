@@ -88,7 +88,7 @@ fn run(remote: Arc<Remote>, ctx: egui::Context, mirror: Mirror, retry_rx: mpsc::
         loop {
             match ipc::read_message::<ServerMessage>(&mut reader) {
                 Ok(Some(ServerMessage::Snapshot { status, tray, state })) => {
-                    *mirror.state.write() = state;
+                    *mirror.state.write() = *state;
                     *mirror.status.lock() = status;
                     *mirror.tray_hint.lock() = (!tray).then(|| NO_TRAY_HINT.into());
                 }

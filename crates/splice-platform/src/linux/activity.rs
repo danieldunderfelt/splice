@@ -39,7 +39,7 @@ const ECHO_WINDOW: Duration = Duration::from_millis(150);
 const ECHO_CODE_WINDOW: Duration = Duration::from_secs(1);
 
 pub fn spawn(shared: Arc<Shared>, panic: PanicRelease, panic_chord: Vec<u32>, driven: Arc<Driven>) {
-    let _ = tokio::spawn(run(shared, panic, panic_chord, driven));
+    tokio::spawn(run(shared, panic, panic_chord, driven));
 }
 
 #[derive(Debug)]
@@ -215,7 +215,7 @@ fn spawn_reader(
 ) {
     let shared = shared.clone();
     let eacces_reported = eacces_reported.clone();
-    let _ = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut attempt = 0;
         let device = loop {
             match Device::open(&path) {

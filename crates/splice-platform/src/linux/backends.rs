@@ -58,15 +58,15 @@ fn resolve(prefs: BackendPrefs, avail: &Availability) -> Plan {
     let capture = match prefs.capture {
         CapturePref::Overlay if avail.overlay => Some(CaptureKind::Overlay),
         CapturePref::Portal if avail.portal_capture => Some(CaptureKind::Portal),
-        _ if avail.overlay => Some(CaptureKind::Overlay),
-        _ if avail.portal_capture => Some(CaptureKind::Portal),
+        CapturePref::Auto if avail.overlay => Some(CaptureKind::Overlay),
+        CapturePref::Auto if avail.portal_capture => Some(CaptureKind::Portal),
         _ => None,
     };
     let inject = match prefs.inject {
         InjectPref::Uinput if avail.uinput => Some(InjectKind::Uinput),
         InjectPref::Portal if avail.portal_inject => Some(InjectKind::Portal),
-        _ if avail.uinput => Some(InjectKind::Uinput),
-        _ if avail.portal_inject => Some(InjectKind::Portal),
+        InjectPref::Auto if avail.uinput => Some(InjectKind::Uinput),
+        InjectPref::Auto if avail.portal_inject => Some(InjectKind::Portal),
         _ => None,
     };
     let clipboard = if avail.data_control {
@@ -83,9 +83,7 @@ fn status(prefs: BackendPrefs, avail: &Availability, plan: &Plan, inject_note: O
     let capture = match plan.capture {
         Some(CaptureKind::Overlay) => "Wayland overlay (cursor hidden while away)".to_string(),
         Some(CaptureKind::Portal) => "Input Capture portal".to_string(),
-        None => "unavailable: this session has neither the InputCapture portal nor layer-shell \
-                 support"
-            .to_string(),
+        None => "requested capture backend is unavailable".to_string(),
     };
     let capture = match prefs.capture {
         CapturePref::Overlay if !avail.overlay => {
@@ -99,9 +97,7 @@ fn status(prefs: BackendPrefs, avail: &Availability, plan: &Plan, inject_note: O
     let inject = match plan.inject {
         Some(InjectKind::Uinput) => "virtual device (uinput)".to_string(),
         Some(InjectKind::Portal) => "Remote Desktop portal".to_string(),
-        None => "unavailable: /dev/uinput is not accessible and there is no RemoteDesktop \
-                 portal"
-            .to_string(),
+        None => "requested injection backend is unavailable".to_string(),
     };
     let inject = match prefs.inject {
         InjectPref::Uinput if !avail.uinput => {
@@ -321,7 +317,6 @@ struct Running {
     portal_injects: Arc<AtomicBool>,
     uinput: Option<(Arc<dyn Emulate>, Stop)>,
     inject: Option<InjectKind>,
-    /// Why a requested injection backend could not start, shown next to the fallback.
     inject_note: Option<String>,
     clipboard: Option<(ClipKind, Stop)>,
 }
@@ -359,7 +354,10 @@ impl Supervisor {
     async fn apply(&mut self, prefs: BackendPrefs, avail: &Availability) -> Plan {
         let mut plan = resolve(prefs, avail);
         self.apply_capture(plan.capture).await;
-        self.apply_inject(&mut plan, avail).await;
+        if self.running.capture.is_none() {
+            plan.capture = None;
+        }
+        self.apply_inject(&mut plan).await;
         self.apply_clipboard(&mut plan).await;
         let status = status(prefs, avail, &plan, self.running.inject_note.as_deref());
         tracing::info!(?plan, "linux backends resolved");
@@ -369,7 +367,15 @@ impl Supervisor {
 
     async fn apply_capture(&mut self, wanted: Option<CaptureKind>) {
         if self.running.capture.as_ref().map(|(k, _)| *k) == wanted {
-            return;
+            match self.capture.current() {
+                Some(capture) => {
+                    let edges = self.capture.edges.lock().1.clone();
+                    if capture.set_edges(edges).await.is_ok() {
+                        return;
+                    }
+                }
+                None => return,
+            }
         }
         if let Some((kind, stop)) = self.running.capture.take() {
             tracing::info!(?kind, "stopping capture backend");
@@ -441,7 +447,7 @@ impl Supervisor {
         }
     }
 
-    async fn apply_inject(&mut self, plan: &mut Plan, avail: &Availability) {
+    async fn apply_inject(&mut self, plan: &mut Plan) {
         if plan.inject == Some(InjectKind::Uinput) && self.running.uinput.is_none() {
             match uinput::create(self.shared.clone(), self.conn.clone()).await {
                 Ok((e, stop)) => {
@@ -452,7 +458,8 @@ impl Supervisor {
                 Err(err) => {
                     tracing::warn!(error = %err, "uinput injection failed to start");
                     self.running.inject_note = Some(format!("uinput failed to start: {err}"));
-                    plan.inject = avail.portal_inject.then_some(InjectKind::Portal);
+                    self.shared.set_health(|h| h.emulate = self.running.inject_note.clone());
+                    plan.inject = None;
                 }
             }
         } else if plan.inject != Some(InjectKind::Uinput) {
@@ -492,7 +499,7 @@ impl Supervisor {
             };
             *self.emulate.inner.write() = new.clone();
             self.running.inject = plan.inject;
-            self.shared.set_health(|h| h.emulate = None);
+            self.shared.set_health(|h| h.emulate = self.running.inject_note.clone());
             match (new, *session) {
                 (Some(new), Some(pos)) => {
                     if let Err(err) = new.enter(pos).await {
@@ -613,8 +620,7 @@ pub async fn spawn(
         capture_unavailable: plan.capture.is_none(),
         inject_unavailable: plan.inject.is_none(),
     };
-    let mut last = (prefs, avail);
-    let _ = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut reprobe = tokio::time::interval(REPROBE_INTERVAL);
         reprobe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -628,13 +634,28 @@ pub async fn spawn(
             }
             let prefs = *prefs_rx.borrow_and_update();
             let avail = probe::run(supervisor.conn.as_ref()).await;
-            if (prefs, avail.clone()) == last {
-                continue;
-            }
-            last = (prefs, avail.clone());
             supervisor.apply(prefs, &avail).await;
         }
         supervisor.running.stop_all();
     });
     handles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_backend_preferences_never_switch_implementations() {
+        let portal_only = Availability { portal_capture: true, portal_inject: true, ..Default::default() };
+        let native_only = Availability { overlay: true, uinput: true, ..Default::default() };
+        let native = BackendPrefs { capture: CapturePref::Overlay, inject: InjectPref::Uinput };
+        let portal = BackendPrefs { capture: CapturePref::Portal, inject: InjectPref::Portal };
+        assert_eq!(resolve(native, &portal_only).capture, None);
+        assert_eq!(resolve(native, &portal_only).inject, None);
+        assert_eq!(resolve(portal, &native_only).capture, None);
+        assert_eq!(resolve(portal, &native_only).inject, None);
+        assert_eq!(resolve(BackendPrefs::default(), &portal_only).capture, Some(CaptureKind::Portal));
+        assert_eq!(resolve(BackendPrefs::default(), &native_only).inject, Some(InjectKind::Uinput));
+    }
 }
