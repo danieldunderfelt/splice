@@ -134,8 +134,12 @@ async fn spawn_rig_configured(self_node: Node, peers: Vec<Node>, config: splice_
 }
 
 async fn spawn_trio() -> (Rig, Rig, Rig) {
+    spawn_trio_with_source("macos").await
+}
+
+async fn spawn_trio_with_source(os: &str) -> (Rig, Rig, Rig) {
     let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
-    na.os = "macos".into();
+    na.os = os.into();
     let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
     let nc = node_at("ccc", Ipv4Addr::new(127, 0, 0, 3));
     let a = spawn_rig_with(na.clone(), vec![nb.clone(), nc.clone()]).await;
@@ -1605,4 +1609,149 @@ async fn manual_desktop_selection_can_skip_the_middle_computer() {
         focus_of(&a) == UiFocus::Remote(mid("ccc"))
     })
     .await;
+}
+
+async fn enter_linux_raw(source: &Rig, target: &Rig, side: EdgeSide) {
+    wait_until("Linux edge armed", || source.mock.state.lock().edges.iter().any(|e| e.side == side)).await;
+    source.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    let edge = source.mock.state.lock().edges.iter().find(|e| e.side == side).unwrap().clone();
+    source.mock.events.send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+        edge_id: edge.id,
+        along: f64::from(edge.from + edge.to) / 2.0,
+    })).unwrap();
+    wait_until("Linux raw source and destination active", || source.mock.state.lock().raw_output.is_some() && target.mock.state.lock().raw_session.is_some()).await;
+}
+
+#[tokio::test]
+async fn linux_raw_switches_three_machines_and_reverses_direction_without_releasing_wayland() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, c) = spawn_trio_with_source("linux").await;
+    enable_raw(&a, &["bbb", "ccc"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("Linux manual start rejected before Wayland activation", || a.handle.state().borrow().input_error.is_some()).await;
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+    assert!(a.mock.state.lock().raw_output.is_none());
+    enter_linux_raw(&a, &b, EdgeSide::Right).await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    let old_operation = a.mock.state.lock().raw_operation.clone().unwrap();
+    let report = RawReport { device: 1, sequence: 0, captured_us: 10, events: vec![
+        RawEvent::Motion { x: -12345, y: 6789 },
+        RawEvent::Key { code: 42, pressed: true },
+        RawEvent::Button { number: 1, pressed: true },
+        RawEvent::Wheel { x120: 15, y120: -30 },
+    ] };
+    output.send(report.clone()).await.unwrap();
+    push_motion(&a, 999.0, 777.0);
+    wait_until("Linux report retains counts and button/key order", || b.mock.state.lock().raw_reports == [report.clone()]).await;
+    assert!(b.mock.state.lock().injected.is_empty());
+    let ends = a.mock.state.lock().capture_ends.len();
+    a.mock.events.send(PlatformEvent::SwitchTarget).unwrap();
+    wait_until("Linux shortcut reaches the third machine", || c.mock.state.lock().raw_session.is_some() && a.handle.state().borrow().raw_active).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends);
+    assert!(b.mock.state.lock().raw_events.contains(&RawEvent::Key { code: 42, pressed: false }));
+    assert!(b.mock.state.lock().raw_events.contains(&RawEvent::Button { number: 1, pressed: false }));
+    old_operation.fail("stale device failure".into());
+    a.mock.events.send(PlatformEvent::RawCaptureFailed(old_operation)).unwrap();
+    let current = a.mock.state.lock().raw_output.clone().unwrap();
+    let next = RawReport { device: 1, sequence: 0, captured_us: 20, events: vec![RawEvent::Motion { x: 7, y: -11 }] };
+    current.send(next.clone()).await.unwrap();
+    wait_until("old failure cannot stop the new raw session", || c.mock.state.lock().raw_reports == [next.clone()]).await;
+    assert!(output.send(report).await.is_err());
+    a.mock.events.send(PlatformEvent::SwitchTarget).unwrap();
+    wait_until("Linux shortcut returns home", || matches!(focus_of(&a), UiFocus::Local) && c.mock.state.lock().raw_session.is_none()).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends + 1);
+    enable_raw(&b, &["aaa"]).await;
+    enter_linux_raw(&b, &a, EdgeSide::Left).await;
+    let reverse = b.mock.state.lock().raw_output.clone().unwrap();
+    reverse.send(RawReport { device: 7, sequence: 0, captured_us: 1, events: vec![RawEvent::Motion { x: 31, y: -47 }] }).await.unwrap();
+    wait_until("Linux raw works in reverse", || a.mock.state.lock().raw_reports.len() == 1).await;
+    let operation = b.mock.state.lock().raw_operation.clone().unwrap();
+    operation.fail("device permission revoked".into());
+    b.mock.events.send(PlatformEvent::RawCaptureFailed(operation)).unwrap();
+    wait_until("current failure releases both Linux computers", || matches!(focus_of(&b), UiFocus::Local) && a.mock.state.lock().raw_session.is_none() && b.handle.state().borrow().input_error.as_deref() == Some("device permission revoked")).await;
+    assert_eq!(b.handle.state().borrow().input_error.as_deref(), Some("device permission revoked"));
+}
+
+#[tokio::test]
+async fn linux_shortcut_preserves_desktop_held_state_and_switches_between_input_modes() {
+    use splice_proto::PointerButton;
+    let (a, b, c) = spawn_trio_with_source("linux").await;
+    drive_a_to_b(&a, &b).await;
+    let shift = InputEvent::Key { code: 42, pressed: true };
+    let button = InputEvent::Button { button: PointerButton::Left, pressed: true };
+    for event in [shift, button, InputEvent::Key { code: 29, pressed: true }, InputEvent::Key { code: 56, pressed: true }] {
+        a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(event))).unwrap();
+    }
+    wait_until("desktop target has held input", || b.mock.state.lock().injected.contains(&button)).await;
+    let ends = a.mock.state.lock().capture_ends.len();
+    a.mock.events.send(PlatformEvent::SwitchTarget).unwrap();
+    wait_until("held input reaches third desktop target", || c.mock.state.lock().injected.contains(&shift) && c.mock.state.lock().injected.contains(&button)).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends);
+    assert!(!c.mock.state.lock().injected.iter().any(|ev| matches!(ev, InputEvent::Key { code: 29 | 56 | 88, pressed: true })));
+    enable_raw(&a, &["bbb"]).await;
+    enter_linux_raw(&a, &b, EdgeSide::Right).await;
+    a.handle.send(Command::SelectTarget(mid("ccc")));
+    wait_until("desktop captures after reconfiguration", || matches!(focus_of(&a), UiFocus::Remote(id) if id == mid("ccc")) && !a.handle.state().borrow().raw_active).await;
+    let ends = a.mock.state.lock().capture_ends.len();
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("desktop switches to raw without losing Wayland capture", || b.mock.state.lock().raw_session.is_some() && a.handle.state().borrow().raw_active).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends);
+    a.handle.send(Command::SelectTarget(mid("ccc")));
+    wait_until("raw switches back to desktop", || matches!(focus_of(&c), UiFocus::Driven(_)) && !a.handle.state().borrow().raw_active && b.mock.state.lock().raw_session.is_none()).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends);
+    push_key(&a, 30, true);
+    wait_until("desktop keyboard still works", || c.mock.state.lock().injected.contains(&InputEvent::Key { code: 30, pressed: true })).await;
+    a.handle.send(Command::SelectTarget(mid("missing")));
+    wait_until("failed selection releases Wayland", || matches!(focus_of(&a), UiFocus::Local)).await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends + 1);
+}
+
+#[tokio::test]
+async fn linux_raw_preparation_failure_restores_local_input_without_desktop_fallback() {
+    let (a, b, _) = spawn_trio_with_source("linux").await;
+    enable_raw(&a, &["bbb"]).await;
+    b.mock.state.lock().raw_error = Some("uinput permission denied".into());
+    wait_until("Linux edge armed", || !a.mock.state.lock().edges.is_empty()).await;
+    let edge = a.mock.state.lock().edges[0].clone();
+    let ends = a.mock.state.lock().capture_ends.len();
+    a.mock.events.send(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along: 500.0 })).unwrap();
+    wait_until("raw rejection reaches Linux source", || a.handle.state().borrow().input_error.as_ref().is_some_and(|e| e.contains("uinput permission denied"))).await;
+    assert!(matches!(focus_of(&a), UiFocus::Local));
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends + 1);
+    assert!(a.mock.state.lock().raw_output.is_none());
+    assert!(b.mock.state.lock().entered.is_empty());
+}
+
+#[tokio::test]
+async fn linux_raw_stream_failure_keeps_its_reason_without_a_platform_notification() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _) = spawn_trio_with_source("linux").await;
+    enable_raw(&a, &["bbb"]).await;
+    enter_linux_raw(&a, &b, EdgeSide::Right).await;
+    let output = a.mock.state.lock().raw_output.take().unwrap();
+    let operation = a.mock.state.lock().raw_operation.clone().unwrap();
+    output.send(RawReport { device: 1, sequence: 0, captured_us: 1, events: vec![RawEvent::Key { code: 42, pressed: true }] }).await.unwrap();
+    wait_until("target receives held Shift", || b.mock.state.lock().raw_reports.len() == 1).await;
+    operation.fail("kernel input queue overflowed".into());
+    drop(output);
+    wait_until("stream closure releases Shift and preserves the device error", || {
+        b.mock.state.lock().raw_events.contains(&RawEvent::Key { code: 42, pressed: false })
+            && a.handle.state().borrow().input_error.as_deref() == Some("kernel input queue overflowed")
+            && matches!(focus_of(&a), UiFocus::Local)
+    }).await;
+}
+
+#[tokio::test]
+async fn desktop_snapshot_and_callback_duplicates_produce_one_transition() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+    let press = InputEvent::Key { code: 42, pressed: true };
+    let release = InputEvent::Key { code: 42, pressed: false };
+    let button = InputEvent::Button { button: splice_proto::PointerButton::Left, pressed: true };
+    let button_up = InputEvent::Button { button: splice_proto::PointerButton::Left, pressed: false };
+    for event in [press, press, button, button, release, release, button_up, button_up] {
+        a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(event))).unwrap();
+    }
+    wait_until("keyboard and button releases arrive", || b.mock.state.lock().injected.contains(&button_up)).await;
+    assert_eq!(b.mock.state.lock().injected, [press, button, release, button_up]);
 }

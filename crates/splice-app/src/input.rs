@@ -13,7 +13,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
         .machines
         .iter()
         .any(|m| m.id == state.self_id && m.os == Os::Macos);
-    if source_mac {
+    {
         let mut settings = state.input_settings.clone();
         let mut changed = false;
         let mut selected = None;
@@ -40,7 +40,8 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             }
             if ui
                 .add_enabled(
-                    controller.is_live(),
+                    controller.is_live()
+                        && (source_mac || matches!(state.focus, UiFocus::Remote(_))),
                     egui::Button::new(format!("Control {}", machine.hostname)),
                 )
                 .clicked()
@@ -49,54 +50,64 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             }
         }
         ui.add_space(8.0);
-        ui.label("Edge crossing");
-        let mut kind = match settings.crossing {
-            CrossingPolicy::Immediate => 0,
-            CrossingPolicy::Dwell { .. } => 1,
-            CrossingPolicy::Resistance { .. } => 2,
-        };
-        let before = kind;
-        egui::ComboBox::from_id_salt("edge-crossing")
-            .selected_text(["Immediate", "Dwell", "Resistance"][kind])
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut kind, 0, "Immediate");
-                ui.selectable_value(&mut kind, 1, "Dwell");
-                ui.selectable_value(&mut kind, 2, "Resistance");
-            });
-        if kind != before {
-            changed = true;
-            settings.crossing = match kind {
-                1 => CrossingPolicy::Dwell { milliseconds: 250 },
-                2 => CrossingPolicy::Resistance {
-                    points: 80.0,
-                    decay_per_second: 80.0,
-                },
-                _ => CrossingPolicy::Immediate,
+        if source_mac {
+            ui.label("Edge crossing");
+            let mut kind = match settings.crossing {
+                CrossingPolicy::Immediate => 0,
+                CrossingPolicy::Dwell { .. } => 1,
+                CrossingPolicy::Resistance { .. } => 2,
             };
-        }
-        match &mut settings.crossing {
-            CrossingPolicy::Immediate => {}
-            CrossingPolicy::Dwell { milliseconds } => {
-                changed |= ui
-                    .add(egui::Slider::new(milliseconds, 50..=2000).suffix(" ms"))
-                    .changed();
-                ui.label(
-                    RichText::new("Wait at the edge to cross. Moving away cancels.")
-                        .small()
-                        .weak(),
-                );
+            let before = kind;
+            egui::ComboBox::from_id_salt("edge-crossing")
+                .selected_text(["Immediate", "Dwell", "Resistance"][kind])
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut kind, 0, "Immediate");
+                    ui.selectable_value(&mut kind, 1, "Dwell");
+                    ui.selectable_value(&mut kind, 2, "Resistance");
+                });
+            if kind != before {
+                changed = true;
+                settings.crossing = match kind {
+                    1 => CrossingPolicy::Dwell { milliseconds: 250 },
+                    2 => CrossingPolicy::Resistance {
+                        points: 80.0,
+                        decay_per_second: 80.0,
+                    },
+                    _ => CrossingPolicy::Immediate,
+                };
             }
-            CrossingPolicy::Resistance {
-                points,
-                decay_per_second,
-            } => {
-                changed |= ui
-                    .add(egui::Slider::new(points, 5.0..=300.0).text("Resistance"))
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(decay_per_second, 0.0..=300.0).text("Relaxation"))
-                    .changed();
-                ui.label(RichText::new("Keep pushing outward to cross. Pausing relaxes the edge; pulling back cancels.").small().weak());
+            match &mut settings.crossing {
+                CrossingPolicy::Immediate => {}
+                CrossingPolicy::Dwell { milliseconds } => {
+                    changed |= ui
+                        .add(egui::Slider::new(milliseconds, 50..=2000).suffix(" ms"))
+                        .changed();
+                    ui.label(
+                        RichText::new("Wait at the edge to cross. Moving away cancels.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                CrossingPolicy::Resistance {
+                    points,
+                    decay_per_second,
+                } => {
+                    changed |= ui
+                        .add(egui::Slider::new(points, 5.0..=300.0).text("Resistance"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(decay_per_second, 0.0..=300.0).text("Relaxation"))
+                        .changed();
+                    ui.label(RichText::new("Keep pushing outward to cross. Pausing relaxes the edge; pulling back cancels.").small().weak());
+                }
+            }
+        } else {
+            ui.label(RichText::new("Cross a screen edge to start control from Linux. Ctrl+Alt+F12 switches computers while captured.").small().weak());
+            if settings.crossing != CrossingPolicy::Immediate
+                && ui.button("Use immediate crossing on Linux").clicked()
+            {
+                settings.crossing = CrossingPolicy::Immediate;
+                changed = true;
             }
         }
         changed |= ui
@@ -108,7 +119,14 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             .values()
             .any(|mode| *mode == InputMode::Raw)
         {
-            ui.label(RichText::new("Raw input requires focus lock. It forwards physical mouse and keyboard input to Linux. Grant Input Monitoring access on this Mac.").small());
+            ui.label(
+                RichText::new("Raw input requires focus lock and a Linux destination.").small(),
+            );
+            ui.label(RichText::new(if source_mac {
+                "Grant Input Monitoring access on this Mac."
+            } else {
+                "Enable input-device access in Linux setup. Use a relative mouse and keyboard. Touchpads, tablets and exclusive keyboard/mouse remappers are unsupported."
+            }).small());
         }
         if changed {
             controller.send(Command::SetInputSettings(settings));
@@ -119,15 +137,6 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
         if matches!(state.focus, UiFocus::Remote(_)) && ui.button("Return control here").clicked() {
             controller.send(Command::SelectTarget(state.self_id.clone()));
         }
-    } else {
-        if state.input_settings.crossing != CrossingPolicy::Immediate
-            && ui.button("Use immediate crossing on Linux").clicked()
-        {
-            let mut settings = state.input_settings.clone();
-            settings.crossing = CrossingPolicy::Immediate;
-            controller.send(Command::SetInputSettings(settings));
-        }
-        ui.label(RichText::new("Desktop mode supports every direction. A Mac can send raw mouse and keyboard input to this Linux computer.").small().weak());
     }
     if let Some(crossing) = &state.crossing_progress {
         let name = state

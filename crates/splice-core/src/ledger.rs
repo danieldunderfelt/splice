@@ -38,21 +38,13 @@ fn key_button(k: PointerButtonKey) -> PointerButton {
 
 impl HeldLedger {
     /// Observe an event passing through; track press/release state.
-    pub fn observe(&mut self, ev: &InputEvent) {
+    pub fn observe(&mut self, ev: &InputEvent) -> bool {
         match *ev {
-            InputEvent::Key { code, pressed: true } => {
-                self.keys.insert(code);
-            }
-            InputEvent::Key { code, pressed: false } => {
-                self.keys.remove(&code);
-            }
-            InputEvent::Button { button, pressed: true } => {
-                self.buttons.insert(button_key(button));
-            }
-            InputEvent::Button { button, pressed: false } => {
-                self.buttons.remove(&button_key(button));
-            }
-            _ => {}
+            InputEvent::Key { code, pressed: true } => self.keys.insert(code),
+            InputEvent::Key { code, pressed: false } => self.keys.remove(&code),
+            InputEvent::Button { button, pressed: true } => self.buttons.insert(button_key(button)),
+            InputEvent::Button { button, pressed: false } => self.buttons.remove(&button_key(button)),
+            _ => true,
         }
     }
 

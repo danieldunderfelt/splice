@@ -6,7 +6,7 @@ use crate::{
 use splice_proto::raw::{InputMode, QUEUE_REPORTS};
 
 pub(super) struct RawState {
-    pub operation: Arc<()>,
+    pub operation: Arc<splice_platform::raw::RawOperation>,
     pub capture: Option<Arc<dyn splice_platform::raw::RawCapture>>,
     pub emulate: Option<Arc<dyn splice_platform::raw::RawEmulate>>,
     pub settings: InputSettings,
@@ -29,7 +29,7 @@ impl RawState {
     ) -> Self {
         let (tx, events) = mpsc::unbounded_channel();
         Self {
-            operation: Arc::new(()),
+            operation: Arc::default(),
             capture,
             emulate,
             settings,
@@ -48,7 +48,7 @@ impl RawState {
 
 impl Inner {
     pub(super) async fn stop_raw(&mut self) {
-        self.raw.operation = Arc::new(());
+        self.raw.operation = Arc::default();
         if let Some(capture) = &self.raw.capture {
             capture.end();
         }
@@ -71,8 +71,8 @@ impl Inner {
     pub(super) async fn start_raw(&mut self, target: MachineId, pos: Vec2, edge: Option<u32>) {
         let readiness = (|| -> anyhow::Result<()> {
             anyhow::ensure!(
-                self.self_info.os == Os::Macos,
-                "Raw capture is available on macOS only"
+                matches!(self.self_info.os, Os::Macos | Os::Linux),
+                "Raw capture requires macOS or Linux"
             );
             anyhow::ensure!(
                 self.cfg.master_enabled
@@ -86,13 +86,13 @@ impl Inner {
                     .get(&target)
                     .and_then(|p| p.info.as_ref())
                     .is_some_and(|i| i.os == Os::Linux),
-                "Raw input supports Mac sources and Linux destinations"
+                "Raw input requires a Linux destination"
             );
             self.raw
                 .capture
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Raw capture is available on macOS only"))?
-                .readiness()?;
+                .ok_or_else(|| anyhow::anyhow!("The platform has no raw input capture backend"))?
+                .prepare()?;
             Ok(())
         })();
         if let Err(error) = readiness {
@@ -399,7 +399,8 @@ impl Inner {
                     .capture
                     .as_ref()
                     .expect("raw preparation checked capture");
-                if let Err(error) = capture.begin(output, self.raw.edge) {
+                if let Err(error) = capture.begin(output, self.raw.edge, self.raw.operation.clone())
+                {
                     self.raw.error = Some(format!("Cannot capture raw input: {error}"));
                     self.end_remote(
                         &peer,
@@ -421,9 +422,12 @@ impl Inner {
                 self.raw.job = Some(tokio::spawn(async move {
                     let result = raw_transport::send(stream, session, reports).await;
                     capture.end();
-                    let error = match result {
-                        Ok(()) => "Raw capture ended".into(),
-                        Err(error) => format!("Raw input ended: {error:#}"),
+                    let error = match operation.error() {
+                        Some(reason) => reason,
+                        None => match result {
+                            Ok(()) => "Raw capture ended".into(),
+                            Err(error) => format!("Raw input ended: {error:#}"),
+                        },
                     };
                     let _ = tx.send(Event::Ended {
                         operation,
@@ -461,44 +465,87 @@ impl Inner {
     }
 
     pub(super) async fn select_target(&mut self, target: MachineId) {
-        if self.self_info.os != Os::Macos && target != self.self_info.id {
-            self.raw.error = Some("Selecting a destination by shortcut is supported on Mac sources. Use screen edges on Linux.".into());
+        if target == self.self_info.id {
+            if let Focus::Remote(old) = self.focus.clone() {
+                self.end_remote(&old, LeaveReason::Crossed, Some(self.last_local_pos), true)
+                    .await;
+            }
+            return;
+        }
+        if self.self_info.os == Os::Linux && !matches!(self.focus, Focus::Remote(_)) {
+            self.raw.error = Some("Start control from Linux by crossing a screen edge. Once captured, Ctrl+Alt+F12 switches computers.".into());
             self.touch_ui();
             return;
         }
-        if let Focus::Remote(old) = self.focus.clone() {
-            self.end_remote(&old, LeaveReason::Crossed, Some(self.last_local_pos), true)
-                .await;
-        }
-        if target == self.self_info.id {
-            return;
-        }
-        if self.focus != Focus::Local
+        if matches!(self.focus, Focus::Driven(_))
             || !self.cfg.master_enabled
             || !self.machine_enabled(&self.self_info.id)
             || !self.machine_enabled(&target)
             || !self.peer_usable(&target)
         {
+            if let Focus::Remote(old) = self.focus.clone() {
+                self.end_remote(
+                    &old,
+                    LeaveReason::CaptureLost,
+                    Some(self.last_local_pos),
+                    true,
+                )
+                .await;
+            }
             self.raw.error = Some("The selected destination is not available".into());
             self.touch_ui();
             return;
         }
+        let pos = layout::clamp_into_displays(
+            self.display_slice_of(&target),
+            Vec2 { x: 100.0, y: 100.0 },
+        );
+        self.handoff_remote(target, pos).await;
+    }
+
+    pub(super) async fn handoff_remote(&mut self, target: MachineId, pos: Vec2) {
+        let mut held = None;
+        if let Focus::Remote(old) = self.focus.clone() {
+            if self.self_info.os == Os::Linux {
+                if !self.raw.active && self.raw.preparing.is_none() {
+                    held = Some(self.source_ledger.clone());
+                }
+                self.leave_remote(&old, LeaveReason::Crossed, true).await;
+            } else {
+                self.end_remote(&old, LeaveReason::Crossed, Some(self.last_local_pos), true)
+                    .await;
+            }
+        }
         if self.raw.settings.mode(&target) == InputMode::Raw {
-            let pos = layout::clamp_into_displays(
-                self.display_slice_of(&target),
-                Vec2 { x: 100.0, y: 100.0 },
-            );
             self.start_raw(target, pos, None).await;
         } else {
-            let pos = layout::clamp_into_displays(
-                self.display_slice_of(&target),
-                Vec2 { x: 100.0, y: 100.0 },
-            );
-            self.start_desktop(target, pos).await;
+            self.start_desktop(target.clone(), pos).await;
+            if self.focus == Focus::Remote(target.clone()) {
+                if let Some(held) = held {
+                    if let Some(net) = &self.net {
+                        for event in held.presses() {
+                            net.send_to(
+                                &target,
+                                Frame::Input {
+                                    session: self.active_session,
+                                    ev: event,
+                                },
+                            );
+                        }
+                    }
+                    self.source_ledger = held;
+                }
+            }
         }
     }
 
     pub(super) async fn switch_target(&mut self) {
+        for code in [29, 56, 88] {
+            self.source_ledger.observe(&InputEvent::Key {
+                code,
+                pressed: false,
+            });
+        }
         let current = match &self.focus {
             Focus::Remote(peer) => peer,
             _ => &self.self_info.id,
@@ -514,6 +561,9 @@ impl Inner {
         machines.sort();
         if let Some(index) = machines.iter().position(|(_, _, id)| id == current) {
             self.select_target(machines[(index + 1) % machines.len()].2.clone())
+                .await;
+        } else if let Focus::Remote(old) = self.focus.clone() {
+            self.end_remote(&old, LeaveReason::Crossed, Some(self.last_local_pos), true)
                 .await;
         }
     }

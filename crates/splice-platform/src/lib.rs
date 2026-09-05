@@ -143,6 +143,7 @@ pub struct ClipboardOffer {
 pub enum PlatformEvent {
     SwitchTarget,
     RawError(String),
+    RawCaptureFailed(Arc<raw::RawOperation>),
     Capture(CaptureEvent),
     /// Physical (non-injected) local input observed → engine may claim sourceness.
     /// Debounced ≥50 ms by the backend.

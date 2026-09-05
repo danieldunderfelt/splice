@@ -144,11 +144,13 @@ failures, fixes, and remaining live verification.
 
 ## Raw mouse and keyboard input
 
-The working tree adds selectable raw input for Mac sources controlling Linux through a relative
-virtual mouse and keyboard. Desktop mode remains the default in every existing direction.
+Splice supports selectable raw input from Linux and Mac sources to Linux destinations through a
+relative virtual mouse and keyboard. Desktop mode remains the default in every existing direction.
 Raw mode requires **Stay on selected computer**. Use **Ctrl+Alt+F12** to cycle through computers,
-or use the **Control** buttons. Mac sources also have Immediate, Dwell, and Resistance crossing.
+or use the **Control** buttons during capture. On Linux, start capture by crossing a screen edge.
+Mac sources also have Immediate, Dwell, and Resistance crossing.
 
+See [Linux raw input setup and validation](docs/raw-input-linux.md) for device requirements and checks.
 Native Mac capture and gaming validation are pending. See the [implementation status](docs/raw-input-design.md)
-and [Mac build and validation handoff](docs/raw-input-macos-handoff.md) before enabling or releasing raw mode.
+and [Mac build and validation handoff](docs/raw-input-macos-handoff.md) before releasing raw mode.
 Raw input uses TCP 41719 on the Tailscale interface, in addition to KVM port 41717 and updater port 41718.

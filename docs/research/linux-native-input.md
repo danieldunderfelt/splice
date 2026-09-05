@@ -12,8 +12,16 @@ Grabbing `/dev/input/event*` swallows input compositor-independently, but nothin
 Wayland reports the cursor position to a background client, so a grab-only backend cannot
 detect edge crossings; the tools that use it (rkvm) switch machines with a hotkey instead.
 Edge detection needs the compositor: portal barriers (InputCapture) or layer-shell strips.
-Once an edge fires, the compositor also delivers the deltas (EIS or relative-pointer), so
-a grab buys nothing for capture. It stays out of Splice.
+Once an edge fires, the compositor also delivers desktop deltas through EIS or relative-pointer.
+Raw mode additionally reads the physical evdev stream before acceleration, while keeping compositor
+capture active for local suppression. Splice does not grab the physical devices.
+
+An exclusive evdev grab also hides key releases from the compositor. Returning control could then
+leave a key stuck locally, including a modifier held before capture began. The kernel's
+[evdev grab and ungrab implementation](https://github.com/torvalds/linux/blob/master/drivers/input/evdev.c)
+does not resynchronize other evdev clients. Raw mode therefore uses read-only device access and
+runtime stream checks. A remapper's exclusive grab is unsupported and is detected when compositor
+input lacks raw witnesses. See [Linux raw capture](../raw-input-design.md#capture-on-linux).
 
 ## Injection: uinput absolute pointer + keyboard (`uinput.rs`)
 

@@ -524,21 +524,12 @@ impl Inner {
                 }
             }
             PlatformEvent::SwitchTarget => self.switch_target().await,
-            PlatformEvent::RawError(reason) => {
-                self.raw.error = Some(reason);
-                if self.raw.active || self.raw.preparing.is_some() {
-                    if let Focus::Remote(target) = self.focus.clone() {
-                        self.end_remote(
-                            &target,
-                            LeaveReason::CaptureLost,
-                            Some(self.last_local_pos),
-                            true,
-                        )
-                        .await;
-                    }
+            PlatformEvent::RawCaptureFailed(operation) => {
+                if Arc::ptr_eq(&self.raw.operation, &operation) {
+                    self.raw_capture_failed(operation.error().expect("capture failure includes its reason")).await;
                 }
-                self.touch_ui();
             }
+            PlatformEvent::RawError(reason) => self.raw_capture_failed(reason).await,
             PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id, along }) => {
                 self.on_edge_hit(edge_id, along).await;
             }
@@ -722,6 +713,22 @@ impl Inner {
         let _ = self.capture.end_capture(warp).await;
     }
 
+    async fn raw_capture_failed(&mut self, reason: String) {
+        self.raw.error = Some(reason);
+        if self.raw.active || self.raw.preparing.is_some() {
+            if let Focus::Remote(target) = self.focus.clone() {
+                self.end_remote(
+                    &target,
+                    LeaveReason::CaptureLost,
+                    Some(self.last_local_pos),
+                    true,
+                )
+                .await;
+            }
+        }
+        self.touch_ui();
+    }
+
     async fn on_capture_input(&mut self, ev: InputEvent) {
         if self.raw.active || self.raw.preparing.is_some() {
             return;
@@ -732,7 +739,7 @@ impl Inner {
                 if !matches!(self.focus, Focus::Remote(_)) {
                     return;
                 }
-                self.source_ledger.observe(&other);
+                if !self.source_ledger.observe(&other) { return; }
                 if let (Some(net), Focus::Remote(target)) = (&self.net, &self.focus) {
                     net.send_to(target, Frame::Input { session: self.active_session, ev: other });
                 }
@@ -815,14 +822,7 @@ impl Inner {
         if link.to != self.self_info.id
             && self.raw.settings.mode(&link.to) == splice_proto::raw::InputMode::Raw
         {
-            self.end_remote(
-                &link.from,
-                LeaveReason::Crossed,
-                Some(self.last_local_pos),
-                true,
-            )
-            .await;
-            self.start_raw(link.to, landing, None).await;
+            self.handoff_remote(link.to, landing).await;
             return;
         }
         if link.to == self.self_info.id {
@@ -902,10 +902,14 @@ impl Inner {
         release_all: bool,
     ) {
         tracing::debug!(target = %target, ?reason, ?warp, "remote session ended");
+        self.leave_remote(target, reason, release_all).await;
+        let _ = self.capture.end_capture(warp).await;
+    }
+
+    async fn leave_remote(&mut self, target: &MachineId, reason: LeaveReason, release_all: bool) {
         self.crossing = None;
         self.stop_raw().await;
         self.send_leave(target, reason, release_all);
-        let _ = self.capture.end_capture(warp).await;
         self.focus = Focus::Local;
         self.active_sensitivity = 1.0;
         self.touch_ui();

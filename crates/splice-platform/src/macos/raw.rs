@@ -241,7 +241,7 @@ impl HidCapture {
 }
 
 impl RawCapture for HidCapture {
-    fn readiness(&self) -> Result<()> {
+    fn prepare(&self) -> Result<()> {
         if unsafe { IOHIDCheckAccess(1) } != 0 {
             return Err(PlatformError::Permission(
                 "Grant Splice Input Monitoring permission and restart it".into(),
@@ -261,8 +261,8 @@ impl RawCapture for HidCapture {
         Ok(())
     }
 
-    fn begin(&self, output: mpsc::Sender<RawReport>, edge: Option<u32>) -> Result<()> {
-        self.readiness()?;
+    fn begin(&self, output: mpsc::Sender<RawReport>, edge: Option<u32>, _operation: Arc<crate::raw::RawOperation>) -> Result<()> {
+        self.prepare()?;
         let mut state = self.state.lock();
         state.readiness()?;
         if state.output.is_some() {

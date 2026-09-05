@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 #[derive(Default)]
 pub struct MockState {
+    pub raw_operation: Option<Arc<crate::raw::RawOperation>>,
     pub raw_output: Option<mpsc::Sender<splice_proto::raw::RawReport>>,
     pub raw_session: Option<u64>,
     pub raw_reports: Vec<splice_proto::raw::RawReport>,
@@ -146,7 +147,7 @@ pub fn one_display() -> Vec<DisplayRect> {
 struct MockRaw(MockHandle);
 
 impl crate::raw::RawCapture for MockRaw {
-    fn readiness(&self) -> Result<()> {
+    fn prepare(&self) -> Result<()> {
         if let Some(error) = &self.0.state.lock().raw_error {
             return Err(crate::PlatformError::Unavailable(error.clone()));
         }
@@ -156,15 +157,18 @@ impl crate::raw::RawCapture for MockRaw {
         &self,
         output: mpsc::Sender<splice_proto::raw::RawReport>,
         _edge: Option<u32>,
+        operation: Arc<crate::raw::RawOperation>,
     ) -> Result<()> {
-        self.readiness()?;
+        crate::raw::RawCapture::prepare(self)?;
         let mut state = self.0.state.lock();
         state.capturing = true;
         state.raw_output = Some(output);
+        state.raw_operation = Some(operation);
         Ok(())
     }
     fn end(&self) {
         let mut state = self.0.state.lock();
+        state.raw_operation = None;
         if state.raw_output.take().is_some() {
             state.capturing = false;
         }

@@ -36,20 +36,20 @@ pub struct Reservation {
 
 pub enum Event {
     Prepared {
-        operation: Arc<()>,
+        operation: Arc<splice_platform::raw::RawOperation>,
         peer: MachineId,
         session: u64,
         pos: splice_proto::Vec2,
         result: std::result::Result<Reservation, String>,
     },
     Connected {
-        operation: Arc<()>,
+        operation: Arc<splice_platform::raw::RawOperation>,
         peer: MachineId,
         session: u64,
         stream: TcpStream,
     },
     Ended {
-        operation: Arc<()>,
+        operation: Arc<splice_platform::raw::RawOperation>,
         peer: MachineId,
         session: u64,
         error: String,
@@ -57,7 +57,7 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn belongs_to(&self, current: &Arc<()>) -> bool {
+    pub fn belongs_to(&self, current: &Arc<splice_platform::raw::RawOperation>) -> bool {
         let operation = match self {
             Self::Prepared { operation, .. }
             | Self::Connected { operation, .. }

@@ -1,10 +1,12 @@
 # Raw input and deliberate edge crossing
 
-Status: Splice 1.2.0, protocol 4 passes native Mac workspace tests, Clippy, release engine tests,
-and Developer ID signing. A native screen-edge indicator has been implemented and exercised on
-all four edges without taking focus. Captured Mac device descriptors have portable regression tests.
+Status: Splice 1.2.0, protocol 4 supports raw capture from Linux and macOS, with relative injection
+on Linux. Automated Linux checks pass. Native Mac workspace tests, Clippy, release engine tests,
+and Developer ID signing have passed. The Mac screen-edge indicator was exercised on all four edges
+without taking focus, and captured Mac device descriptors have portable regression tests.
 See the [Mac evidence](raw-input-macos-validation.md) for device limits and exact results.
-Physical Mac capture, local suppression, and gaming acceptance remain unverified. Continue with the
+Physical forwarding, local suppression, and gaming acceptance remain unverified. Complete the
+[Linux acceptance checks](raw-input-linux.md#complete-native-acceptance) and the
 [Mac handoff](raw-input-macos-handoff.md) before releasing raw mode.
 
 The current implementation requires explicitly selected focus lock for raw input. Destination
@@ -17,7 +19,7 @@ a Mac panel beside the physical screen edge, including while the Splice window i
 
 Keep the current desktop mode fully supported, including all existing directions, clipboard sharing,
 layout, held modifiers, reconnection, and emergency release. Add a selectable raw input mode alongside it.
-Raw mode initially supports a mouse and keyboard physically connected to a Mac controlling Linux.
+Raw mode supports a mouse and keyboard connected to a Linux or Mac source controlling Linux.
 Both Fedora GNOME and KDE are target desktops. Linux-to-Mac raw input is outside the first version.
 
 Support standard HID mouse and keyboard input without model-specific implementations or a vendor
@@ -42,7 +44,7 @@ The implemented path is:
 
 ```text
 Physical USB or Bluetooth mouse and keyboard
-    -> macOS HID capture, before desktop pointer acceleration
+    -> Linux evdev or macOS HID capture, before desktop pointer acceleration
     -> ordered input connection over the tailnet
     -> Linux virtual relative mouse and keyboard
     -> Linux desktop or game
@@ -73,8 +75,9 @@ The controls are independent:
 | Edge crossing | Immediate, Dwell, Resistance | Existing immediate behavior remains the default |
 | Focus lock | Off, Locked to selected computer | Explicit user selection; switch shortcut and emergency release remain available |
 
-Raw input can be selected for a supported Mac-to-Linux route. Device permissions, target readiness,
-and mode capabilities must be checked before the source starts swallowing input. An unsupported
+Raw input can be selected for Linux-to-Linux and Mac-to-Linux routes. Device permissions, target readiness,
+and mode capabilities must be checked before raw forwarding begins. Linux edge capture is already
+active during preparation, so any failure explicitly restores local control. An unsupported
 selection reports the missing capability. Splice never silently substitutes desktop mode.
 
 Desktop link sensitivity continues to apply only to desktop mode. Raw mode preserves device counts.
@@ -112,6 +115,42 @@ remain ordered at capture activation and release. A read-only HID monitor alone 
 The Mac is only the source in this version. Creating virtual input devices on macOS, obtaining
 virtual-HID or DriverKit distribution entitlements, and bundling a Mac driver are not prerequisites.
 Any future raw input into macOS needs its own platform and signing validation.
+
+## Capture on Linux
+
+The source reads physical evdev devices before libinput acceleration. `RawDevice` preserves kernel
+`SYN_REPORT` groups and exposes `SYN_DROPPED`. A dropped report ends capture because lost motion
+cannot be reconstructed. High-resolution wheel events replace their accompanying legacy detents.
+Key repeat comes from the destination. Device identifiers, report sequence, and monotonic enqueue
+timestamps belong to one source aggregator.
+
+Wayland still suppresses local input. The source starts through an existing portal barrier or overlay
+edge. A Linux source cannot start through a button or shortcut while local, because portal capture
+has no forced-activation request. Once captured, shortcut and manual selection can switch remote
+computers while retaining the Wayland session. Returning home or failing releases that session.
+Raw-to-Desktop handoffs hold compositor delivery closed until a snapshot is queued under the same
+emission lock. Keyboard state comes from the kernel sample. Held buttons come from the compositor,
+which preserves its button mappings. If only one stream reports any held buttons, the handoff keeps
+delivery closed and waits up to 500 ms for compositor callbacks, resampling after each notification.
+Persistent presence disagreement rejects the handoff and restores local control. This check does not
+establish a one-to-one correspondence between simultaneously held buttons. The source ledger rejects
+duplicate key and button transitions.
+
+The reader never uses exclusive device grabs. Even a brief `EVIOCGRAB` probe can hide a physical key
+release from the compositor. Instead, stream checks correlate compositor keyboard, button, and
+motion activity with raw reports. Either callback order is accepted. Missing keyboard or button
+activity expires after 500 ms. Repeated unmatched motion also ends the session. Scroll events are
+excluded from this check because a compositor can produce both smooth and discrete representations
+of one wheel event. These checks detect intercepted activity at runtime; idle devices cannot prove
+that another service has no exclusive grab.
+
+Discovery checks input capabilities before opening devices, excludes software virtual inputs, and
+includes Bluetooth UHID paths. Device replacement at the same event path gets a fresh identity.
+Relevant hotplug, revoked access, unsupported reports, and queue overflow stop raw capture visibly.
+Errors retain their operation identity, so delayed errors cannot stop a newer session. A failure
+records its reason on that operation and closes the raw stream before notifying the engine. The
+transport worker can report the precise cause even if its close notification arrives first.
+Desktop mode is never substituted. See [Linux setup and native checks](raw-input-linux.md).
 
 ## Injection on Linux
 
@@ -151,6 +190,7 @@ keeps these contracts separate:
 | Module | Responsibility |
 |---|---|
 | `splice-platform` Mac raw capture | HID discovery, physical input, local suppression, and permission health |
+| `splice-platform` Linux raw capture | Read-only evdev reports, Wayland suppression, device discovery, and held-state handoffs |
 | `splice-platform` Linux raw injection | Persistent relative mouse and keyboard, device state, and forced release |
 | `splice-proto` | Distinct raw reports, capabilities, and session-bound messages |
 | `splice-core` input session | One active owner, readiness, handoff, ordering, and failure recovery |
@@ -189,8 +229,8 @@ mode selection, focus lock, and crossing policy. On first use, an existing nonze
 Malformed settings are preserved and reported, never replaced with defaults.
 
 Apply the policy consistently to local-to-remote, remote-to-local, and remote-to-remote transitions.
-When a Mac controls either Linux computer, switching between the Linux destinations can keep the Mac
-as the physical input source.
+When a Linux or Mac source controls a Linux computer, switching destinations retains the physical
+input source. Linux keeps its existing Wayland capture session across remote handoffs.
 
 ## Edge observations and gaming lock
 
@@ -206,7 +246,7 @@ predicted cursor coordinates are reliable or silently alter the user's crossing 
 
 Gaming lock disables automatic edge switching for that session. Turning a camera cannot take the
 mouse to another computer. A dedicated switch shortcut chooses another destination or returns to
-the Mac; the existing emergency chord must restore local control even if the network is unavailable.
+the source computer; the existing emergency chord must restore local control even if the network is unavailable.
 No automatic fullscreen or game detection is required for the first version.
 
 ## Implementation sequence and acceptance
