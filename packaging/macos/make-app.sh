@@ -20,11 +20,14 @@ if [[ ! "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
     exit 1
 fi
 
-printf '%s\n' 'Building splice-app in release mode...'
-(
-    cd "$repository_root"
-    cargo build -p splice-app --release
-)
+if [[ "${1:-}" == "--no-build" ]]; then
+    printf '%s\n' 'Using the verified release binary.'
+elif [[ "$#" == 0 ]]; then
+    (cd "$repository_root" && cargo build -p splice-app --release --locked)
+else
+    printf '%s\n' 'usage: make-app.sh [--no-build]' >&2
+    exit 2
+fi
 
 if [[ ! -x "$binary_path" ]]; then
     printf 'The release binary was not found at %s.\n' "$binary_path" >&2
@@ -63,25 +66,12 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-if security find-identity -p codesigning 2>/dev/null | grep -F 'Splice Dev' >/dev/null; then
-    printf '%s\n' 'Found the "Splice Dev" signing identity.'
-else
-    printf '%s\n' 'The "Splice Dev" signing identity is not available.' >&2
+signing_identity="${SPLICE_CODESIGN_IDENTITY:-Splice Dev}"
+if ! security find-identity -v -p codesigning | grep -F -- "$signing_identity" >/dev/null; then
+    printf 'Required signing identity is unavailable: %s\n' "$signing_identity" >&2
+    exit 1
 fi
-
-if codesign --force --options runtime --sign "Splice Dev" "$app_path"; then
-    printf '%s\n' 'Signed the app with "Splice Dev".'
-else
-    cat >&2 <<'WARNING'
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-WARNING: FALLING BACK TO AD-HOC CODE SIGNING ("-").
-MACOS PERMISSIONS WILL SILENTLY BREAK ON EVERY REBUILD.
-Run packaging/macos/make-cert.sh and rebuild with a stable identity.
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-WARNING
-    codesign --force --options runtime --sign "-" "$app_path"
-    printf '%s\n' 'The app has an ad-hoc signature.' >&2
-fi
+codesign --force --options runtime --timestamp --sign "$signing_identity" "$app_path"
 
 codesign --verify --deep --strict "$app_path"
 

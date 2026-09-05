@@ -2,7 +2,7 @@
 
 Splice shares one mouse, keyboard, and clipboard across macOS and Linux computers on the same Tailscale network. It discovers peers automatically. Move the pointer across an arranged screen edge to control another computer.
 
-The current release is Splice 1.0.
+The workspace version is Splice 1.1.0.
 
 Splice is under active development. Linux support targets Wayland sessions: GNOME and KDE through the desktop portals, and KDE, Hyprland, sway, niri, COSMIC and other layer-shell compositors through a native overlay and uinput backend.
 
@@ -98,7 +98,7 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
-1. Install the same current build and start Splice on every computer. Protocol 2 rejects older clients.
+1. Install the same current build and start Splice on every computer. Protocol 3 rejects older clients.
 2. Approve the operating system permission prompts.
 3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
@@ -108,6 +108,19 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 Splice also synchronizes text and images when **Clipboard sync** is enabled. Use the per-machine pointer-speed controls to adjust remote movement.
 
 Press `Left Shift+Right Shift+Escape` to release captured input. You can also choose **Disconnect all** from the app or tray menu.
+
+## Diagnostics and updates
+
+Open **Diagnostics** to inspect connection phases, build identities, heartbeat age, and input queue
+timing, or save a report without clipboard contents or typed keys. See [diagnostics](docs/diagnostics.md).
+
+Use **Updates** to check, download, and install signed releases on this computer or an authorized
+Tailnet peer. See [updating Splice](docs/updates.md) for supported installations and port requirements.
+Existing protocol 2 clients need one manual upgrade.
+
+GitHub Actions builds and tests Linux x86-64 and both macOS architectures. Release tags produce signed
+update manifests and Developer ID signed, notarized Mac bundles. Set the [required secrets](docs/release-secrets.md)
+and follow [the release guide](docs/releasing.md) before publishing the first release.
 
 ## Test
 

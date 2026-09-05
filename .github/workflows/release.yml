@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - run: python3 packaging/release.py validate "${GITHUB_REF_NAME}"
+
+  checks:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      SPLICE_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: splice-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: target/release
+      - run: chmod 755 target/release/splice
+      - if: runner.os == 'macOS'
+        env:
+          SPLICE_MAC_CERT_P12: ${{ secrets.SPLICE_MAC_CERT_P12 }}
+          SPLICE_MAC_CERT_PASSWORD: ${{ secrets.SPLICE_MAC_CERT_PASSWORD }}
+          SPLICE_CODESIGN_IDENTITY: ${{ secrets.SPLICE_CODESIGN_IDENTITY }}
+          SPLICE_APPLE_ID: ${{ secrets.SPLICE_APPLE_ID }}
+          SPLICE_APPLE_TEAM_ID: ${{ secrets.SPLICE_APPLE_TEAM_ID }}
+          SPLICE_APPLE_APP_PASSWORD: ${{ secrets.SPLICE_APPLE_APP_PASSWORD }}
+        run: bash packaging/macos/release.sh
+      - run: python3 packaging/release.py archive "${{ matrix.target }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}
+          path: build/splice-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: build
+      - env:
+          SPLICE_UPDATE_SIGNING_KEY: ${{ secrets.SPLICE_UPDATE_SIGNING_KEY }}
+        run: python3 packaging/release.py manifest
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" build/splice-*.tar.gz build/splice-update.json build/splice-update.sig --verify-tag --generate-notes --title "Splice ${GITHUB_REF_NAME}"

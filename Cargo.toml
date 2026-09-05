@@ -7,10 +7,11 @@ members = [
     "crates/splice-platform",
     "crates/splice-daemon",
     "crates/splice-app",
+    "crates/splice-update",
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 
@@ -20,6 +21,7 @@ splice-proto = { path = "crates/splice-proto" }
 splice-tailscale = { path = "crates/splice-tailscale" }
 splice-core = { path = "crates/splice-core" }
 splice-platform = { path = "crates/splice-platform" }
+splice-update = { path = "crates/splice-update" }
 
 # shared
 tokio = { version = "1", features = ["full"] }

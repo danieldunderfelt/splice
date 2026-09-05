@@ -378,6 +378,10 @@ pub mod preview {
         this.is_source = true;
 
         let mut state = UiState {
+            build: splice_proto::BuildInfo::current(),
+            diagnostics: Default::default(),
+            updates: Default::default(),
+            restart_requested: false,
             self_id: self_id.clone(),
             master_enabled: true,
             clipboard_sync: true,
@@ -475,7 +479,7 @@ pub mod preview {
                     backends.prefs = *prefs;
                 }
             }
-            Command::Refresh => {}
+            Command::Refresh | Command::ExportDiagnostics | Command::Update { .. } => {}
         }
     }
 

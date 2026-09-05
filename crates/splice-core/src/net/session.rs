@@ -6,6 +6,7 @@
 //! cancel-safe at the length-prefix boundary).
 
 use crate::net::{NetControlInner, PeerEvent};
+use crate::diagnostics::{ConnectionPhase, Traffic, unix_ms};
 use splice_proto::framing::{read_frame, read_frame_buffered, write_frame_buffered};
 use splice_proto::{caps, Frame, Hello, MachineId, ProtoError, Welcome};
 use std::net::SocketAddr;
@@ -43,18 +44,35 @@ async fn write_with_timeout<W: AsyncWrite + Unpin>(
 
 #[derive(Clone)]
 pub(crate) struct SessionControl {
-    frames: mpsc::Sender<Frame>,
+    frames: mpsc::Sender<QueuedFrame>,
+    bulk: mpsc::Sender<QueuedFrame>,
+    traffic: Arc<Traffic>,
     shutdown: watch::Sender<Option<String>>,
+}
+
+struct QueuedFrame {
+    frame: Frame,
+    queued: Instant,
 }
 
 impl SessionControl {
     pub async fn send_wait(&self, frame: Frame, timeout: Duration) -> bool {
-        matches!(tokio::time::timeout(timeout, self.frames.send(frame)).await, Ok(Ok(())))
+        let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
+        match tokio::time::timeout(timeout, sender.reserve()).await {
+            Ok(Ok(permit)) => {
+                self.traffic.queued(self.frames.max_capacity() - self.frames.capacity() + self.bulk.max_capacity() - self.bulk.capacity());
+                permit.send(QueuedFrame { frame, queued: Instant::now() });
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn send(&self, frame: Frame) -> bool {
-        match self.frames.try_send(frame) {
-            Ok(()) => true,
+        let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
+        let depth = self.frames.max_capacity() - self.frames.capacity() + self.bulk.max_capacity() - self.bulk.capacity() + 1;
+        match sender.try_send(QueuedFrame { frame, queued: Instant::now() }) {
+            Ok(()) => { self.traffic.queued(depth); true },
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.close("outgoing queue exceeded its limit");
                 false
@@ -68,8 +86,24 @@ impl SessionControl {
     }
 }
 
+struct OutgoingFrames {
+    priority: mpsc::Receiver<QueuedFrame>,
+    bulk: mpsc::Receiver<QueuedFrame>,
+}
+
+impl OutgoingFrames {
+    async fn recv(&mut self) -> Option<QueuedFrame> {
+        tokio::select! {
+            biased;
+            frame = self.priority.recv() => frame,
+            frame = self.bulk.recv() => frame,
+        }
+    }
+}
+
 struct SessionCommands {
-    frames: mpsc::Receiver<Frame>,
+    frames: OutgoingFrames,
+    traffic: Arc<Traffic>,
     shutdown: watch::Receiver<Option<String>>,
 }
 
@@ -78,6 +112,7 @@ fn our_caps() -> Vec<String> {
 }
 
 fn reject(inner: &NetControlInner, peer: &MachineId, reason: String) {
+    inner.phase(peer, ConnectionPhase::Rejected, None, Some(reason.clone()));
     tracing::warn!(%peer, %reason, "peer connection rejected");
     let _ = inner.events.send(PeerEvent::Rejected { id: peer.clone(), reason });
 }
@@ -100,6 +135,7 @@ pub(crate) enum Role {
 /// Registered per-peer state shared with NetControl.
 pub(crate) struct PeerSlot {
     pub seq: u64,
+    pub traffic: Arc<Traffic>,
     pub control: SessionControl,
     /// True when this connection follows the smaller-id-dials rule from our side.
     pub rule_following: bool,
@@ -144,6 +180,7 @@ fn unregister_if_ours(inner: &NetControlInner, id: &MachineId, seq: u64) -> bool
     let mut peers = inner.peers.write();
     match peers.get(id) {
         Some(slot) if slot.seq == seq => {
+            inner.diagnostics.write().entry(id.clone()).or_default().traffic = slot.traffic.snapshot();
             peers.remove(id);
             true
         }
@@ -159,13 +196,16 @@ fn register(
     role: Role,
 ) -> (Registration, u64, SessionCommands, Arc<Liveness>) {
     let (frames, frame_rx) = mpsc::channel(128);
+    let (bulk, bulk_rx) = mpsc::channel(4);
     let (shutdown, shutdown_rx) = watch::channel(None);
-    let cmd_rx = SessionCommands { frames: frame_rx, shutdown: shutdown_rx };
+    let traffic = Arc::new(Traffic::default());
+    let cmd_rx = SessionCommands { frames: OutgoingFrames { priority: frame_rx, bulk: bulk_rx }, shutdown: shutdown_rx, traffic: traffic.clone() };
     let active = Arc::new(Liveness::default());
     let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
     let slot = PeerSlot {
         seq,
-        control: SessionControl { frames, shutdown },
+        traffic: traffic.clone(),
+        control: SessionControl { frames, bulk, shutdown, traffic },
         rule_following: matches!(role, Role::Dialer) == (self_id < peer),
         active: active.clone(),
     };
@@ -190,18 +230,24 @@ pub(crate) async fn run(
 
     match role {
         Role::Dialer => {
+            if let Some(id) = &expected { inner.phase(id, ConnectionPhase::SendingHello, Some(peer_addr), None); }
             let hello = Frame::Hello(Hello {
                 proto_min: inner.opts.proto_min,
                 proto_max: inner.opts.proto_max,
                 machine: self_info.clone(),
                 caps: our_caps(),
             });
-            if write_frame(&inner, &mut sock, &hello).await.is_err() {
+            if let Err(error) = write_frame(&inner, &mut sock, &hello).await {
+                if let Some(id) = &expected { reject(&inner, id, format!("Sending Hello failed: {error}")); }
                 return false;
             }
+            if let Some(id) = &expected { inner.phase(id, ConnectionPhase::AwaitingWelcome, None, None); }
             let frame = match tokio::time::timeout_at(deadline, read_frame(&mut sock)).await {
                 Ok(Ok(f)) => f,
-                _ => return false,
+                error => {
+                    if let Some(id) = &expected { reject(&inner, id, format!("Waiting for Welcome failed: {error:?}; check the Tailnet route and VPN split-tunnel rules")); }
+                    return false;
+                }
             };
             let welcome = match frame {
                 Frame::Welcome(w) => w,
@@ -245,6 +291,8 @@ pub(crate) async fn run(
                     old.close("duplicate connection replaced");
                 }
             }
+            inner.phase(&peer, ConnectionPhase::Connected, Some(peer_addr), None);
+            inner.diagnostics.write().entry(peer.clone()).or_default().build = Some(welcome.machine.build.clone());
             let _ = inner.events.send(PeerEvent::Connected {
                 id: peer.clone(),
                 hello: welcome.machine,
@@ -254,9 +302,13 @@ pub(crate) async fn run(
             session_loop(inner, sock, peer, cmd_rx, active, seq).await
         }
         Role::Listener => {
+            if let Some(id) = &expected { inner.phase(id, ConnectionPhase::AwaitingHello, Some(peer_addr), None); }
             let frame = match tokio::time::timeout_at(deadline, read_frame(&mut sock)).await {
                 Ok(Ok(f)) => f,
-                _ => return false,
+                error => {
+                    if let Some(id) = &expected { reject(&inner, id, format!("Could not read a protocol {} Hello: {error:?}; update every client to the same release", splice_proto::PROTO_VERSION)); }
+                    return false;
+                }
             };
             let hello = match frame {
                 Frame::Hello(h) => h,
@@ -286,6 +338,7 @@ pub(crate) async fn run(
                 reject(&inner, &peer, "cannot send handshake response".into());
                 return false;
             }
+            inner.phase(&peer, ConnectionPhase::AwaitingReady, None, None);
             if !matches!(tokio::time::timeout_at(deadline, read_frame(&mut sock)).await, Ok(Ok(Frame::Ready))) {
                 reject(&inner, &peer, "peer did not confirm the handshake; check Tailnet connectivity".into());
                 return false;
@@ -301,6 +354,8 @@ pub(crate) async fn run(
                     old.close("duplicate connection replaced");
                 }
             }
+            inner.phase(&peer, ConnectionPhase::Connected, Some(peer_addr), None);
+            inner.diagnostics.write().entry(peer.clone()).or_default().build = Some(hello.machine.build.clone());
             let _ = inner.events.send(PeerEvent::Connected {
                 id: peer.clone(),
                 hello: hello.machine,
@@ -384,10 +439,13 @@ async fn session_loop(
                 }
             }
             frame = cmd_rx.frames.recv() => match frame {
-                Some(frame) => {
-                    if let Err(error) = write_with_timeout(inner.opts.write_timeout, &mut wr, &frame, &mut write_buf).await {
+                Some(queued) => {
+                    let queue_time = queued.queued.elapsed();
+                    let started = Instant::now();
+                    if let Err(error) = write_with_timeout(inner.opts.write_timeout, &mut wr, &queued.frame, &mut write_buf).await {
                         break format!("write: {error}");
                     }
+                    cmd_rx.traffic.sent(matches!(queued.frame, Frame::Input { .. }), write_buf.len(), queue_time, started.elapsed());
                 }
                 None => break "control channel closed".to_string(),
             },
@@ -410,6 +468,13 @@ async fn session_loop(
                         }
                         _ => continue,
                     };
+                    {
+                        let mut diagnostics = inner.diagnostics.write();
+                        let entry = diagnostics.entry(peer.clone()).or_default();
+                        entry.last_heartbeat_ms = Some(unix_ms());
+                        if entry.phase != ConnectionPhase::Connected { entry.phase_changed_ms = unix_ms(); }
+                        entry.phase = ConnectionPhase::Connected;
+                    }
                     misses = 0;
                     degraded_since = None;
                     if degraded {
@@ -441,6 +506,7 @@ async fn session_loop(
                         misses += 1;
                         outstanding = None;
                         if misses >= inner.opts.max_misses && !degraded {
+                            { let mut entries = inner.diagnostics.write(); let entry = entries.entry(peer.clone()).or_default(); entry.phase = ConnectionPhase::Degraded; entry.phase_changed_ms = unix_ms(); }
                             degraded = true;
                             degraded_since = Some(Instant::now());
                             let _ = inner.events.send(PeerEvent::Degraded(peer.clone()));
@@ -470,6 +536,8 @@ async fn session_loop(
 
     reader.abort();
     if unregister_if_ours(&inner, &peer, seq) {
+        inner.diagnostics.write().entry(peer.clone()).or_default().disconnects += 1;
+        inner.phase(&peer, ConnectionPhase::Disconnected, None, Some(reason.clone()));
         let _ = inner.events.send(PeerEvent::Disconnected(peer, reason));
     }
     true
@@ -478,6 +546,68 @@ async fn session_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn clipboard_backpressure_does_not_fill_the_input_queue_or_reorder_keys() {
+        let (frames, priority) = mpsc::channel(4);
+        let (bulk, bulk_rx) = mpsc::channel(2);
+        let (shutdown, reason) = watch::channel(None);
+        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
+        let mut receiver = OutgoingFrames { priority, bulk: bulk_rx };
+        for request in [1, 2] {
+            assert!(control.send_wait(Frame::ClipChunk { request, data: vec![7; 32], last: true }, Duration::from_secs(1)).await);
+        }
+        let down = Frame::Input { session: 1, ev: splice_proto::InputEvent::Key { code: 42, pressed: true } };
+        let motion = Frame::Input { session: 1, ev: splice_proto::InputEvent::Motion { dx: 0.5, dy: 1.25 } };
+        let up = Frame::Input { session: 1, ev: splice_proto::InputEvent::Key { code: 42, pressed: false } };
+        for event in [&down, &motion, &up] { assert!(control.send(event.clone())); }
+        for expected in [down, motion, up] { assert_eq!(receiver.recv().await.unwrap().frame, expected); }
+        for request in [1, 2] { assert!(matches!(receiver.recv().await.unwrap().frame, Frame::ClipChunk { request: actual, .. } if actual == request)); }
+        assert!(reason.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn one_clipboard_frame_cannot_hold_input_for_a_second_on_a_one_megabit_writer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut writer, mut link) = tokio::io::duplex(1280);
+        let (mut delivered, mut reader) = tokio::io::duplex(65536);
+        let (started, beginning) = tokio::sync::oneshot::channel();
+        let relay = tokio::spawn(async move {
+            let mut started = Some(started);
+            let mut buffer = [0; 1280];
+            loop {
+                let count = link.read(&mut buffer).await.unwrap();
+                if count == 0 { return; }
+                if let Some(started) = started.take() { started.send(()).unwrap(); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                delivered.write_all(&buffer[..count]).await.unwrap();
+            }
+        });
+        let (frames, priority) = mpsc::channel(4);
+        let (bulk, bulk_rx) = mpsc::channel(4);
+        let (shutdown, _) = watch::channel(None);
+        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
+        let mut receiver = OutgoingFrames { priority, bulk: bulk_rx };
+        assert!(control.send_wait(Frame::ClipChunk { request: 1, data: vec![7; splice_proto::CLIP_CHUNK], last: true }, Duration::from_secs(1)).await);
+        let sender = tokio::spawn(async move {
+            let mut buffer = Vec::new();
+            for _ in 0..2 {
+                let frame = receiver.recv().await.unwrap().frame;
+                write_with_timeout(Duration::from_secs(2), &mut writer, &frame, &mut buffer).await.unwrap();
+            }
+        });
+        beginning.await.unwrap();
+        let queued = Instant::now();
+        let motion = Frame::Input { session: 1, ev: splice_proto::InputEvent::Motion { dx: 0.5, dy: 1.25 } };
+        assert!(control.send(motion.clone()));
+        tokio::time::timeout(Duration::from_millis(750), async {
+            assert!(matches!(read_frame(&mut reader).await.unwrap(), Frame::ClipChunk { .. }));
+            assert_eq!(read_frame(&mut reader).await.unwrap(), motion);
+        }).await.expect("clipboard frame delayed input beyond the bounded writer budget");
+        assert!(queued.elapsed() < Duration::from_millis(350), "input waited {:?}", queued.elapsed());
+        sender.await.unwrap();
+        relay.await.unwrap();
+    }
 
     #[tokio::test]
     async fn a_blocked_writer_has_a_deadline() {
@@ -496,7 +626,8 @@ mod tests {
     fn input_queue_overflow_closes_the_session_explicitly() {
         let (frames, _receiver) = mpsc::channel(2);
         let (shutdown, reason) = watch::channel(None);
-        let control = SessionControl { frames, shutdown };
+        let (bulk, _bulk_rx) = mpsc::channel(4);
+        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
         assert!(control.send(Frame::Panic));
         assert!(control.send(Frame::Panic));
         assert!(!control.send(Frame::Panic));

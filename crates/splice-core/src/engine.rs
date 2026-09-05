@@ -15,6 +15,8 @@ use tokio::sync::{mpsc, watch};
 /// Commands from UI / tray / daemon control.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
+    Update { machine: MachineId, action: splice_update::control::Action },
+    ExportDiagnostics,
     SetMasterEnabled(bool),
     SetMachineEnabled(MachineId, bool),
     /// Commit a whole arrangement at once (the UI's constrained drag moves several cards).
@@ -72,12 +74,14 @@ impl Engine {
         ts: splice_tailscale::Client,
         data_dir: std::path::PathBuf,
     ) -> anyhow::Result<EngineHandle> {
-        Self::spawn_with(
+        let update_host = splice_update::Host::new(&data_dir)?;
+        Self::spawn_internal(
             platform,
             Arc::new(ts),
             data_dir,
             crate::net::NetOpts::default(),
             Duration::from_secs(15),
+            Some(update_host),
         )
         .await
     }
@@ -93,6 +97,17 @@ impl Engine {
         net_opts: crate::net::NetOpts,
         poll_interval: Duration,
     ) -> anyhow::Result<EngineHandle> {
+        Self::spawn_internal(platform, ts, data_dir, net_opts, poll_interval, None).await
+    }
+
+    async fn spawn_internal(
+        platform: splice_platform::Platform,
+        ts: Arc<dyn crate::net::TsApi>,
+        data_dir: std::path::PathBuf,
+        net_opts: crate::net::NetOpts,
+        poll_interval: Duration,
+        update_host: Option<splice_update::Host>,
+    ) -> anyhow::Result<EngineHandle> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = watch::channel(UiState::initial(MachineId(String::new())));
         let (ready_tx, ready_rx) = watch::channel(None);
@@ -105,6 +120,7 @@ impl Engine {
             cmd_rx,
             ui_tx,
             ready_tx,
+            update_host,
         )?;
         tokio::spawn(inner.run());
         Ok(EngineHandle { cmd: cmd_tx, state: ui_rx, ready: ready_rx })

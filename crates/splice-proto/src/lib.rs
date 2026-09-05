@@ -11,13 +11,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTO_VERSION: u16 = 2;
+pub const PROTO_VERSION: u16 = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInfo {
+    pub dirty: bool,
+    pub version: String,
+    pub commit: String,
+    pub target: String,
+    pub protocol: u16,
+}
+
+impl BuildInfo {
+    pub fn current() -> Self {
+        Self {
+            dirty: env!("SPLICE_BUILD_DIRTY") == "true",
+            version: env!("CARGO_PKG_VERSION").into(),
+            commit: env!("SPLICE_BUILD_COMMIT").into(),
+            target: env!("SPLICE_BUILD_TARGET").into(),
+            protocol: PROTO_VERSION,
+        }
+    }
+}
 /// Well-known Splice TCP port on the tailnet.
 pub const SPLICE_PORT: u16 = 41717;
 /// Hard cap on a single frame (framing layer enforces).
 pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 /// Clipboard payload chunk size.
-pub const CLIP_CHUNK: usize = 256 * 1024;
+pub const CLIP_CHUNK: usize = 16 * 1024;
 /// Clipboard total size cap.
 pub const CLIP_MAX_TOTAL: usize = 16 * 1024 * 1024;
 /// Text at or below this length is inlined directly in `ClipOffer`.
@@ -104,6 +125,7 @@ pub enum Os {
 /// Identity + runtime facts a machine shares about itself.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MachineInfo {
+    pub build: BuildInfo,
     pub id: MachineId,
     pub hostname: String,
     pub os: Os,
@@ -143,9 +165,7 @@ pub enum PointerButton {
 pub enum InputEvent {
     Motion { dx: f64, dy: f64 },
     Button { button: PointerButton, pressed: bool },
-    /// Smooth scroll in logical px, device direction (target applies its own natural-scroll).
     ScrollPixels { dx: f64, dy: f64 },
-    /// Discrete scroll in value-120 units (one detent = 120), device direction.
     Scroll120 { dx: i32, dy: i32 },
     /// End of a scroll gesture; `cancel=false` → target may start kinetic scrolling.
     ScrollStop { cancel: bool },

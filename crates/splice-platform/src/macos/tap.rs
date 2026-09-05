@@ -472,15 +472,11 @@ fn scroll(event: &CGEvent) -> Translated {
         return Translated::None;
     }
     let phase = event.get_integer_value_field(ffi::FIELD_SCROLL_PHASE);
-    // Device direction: the target applies its own natural-scroll preference.
-    let sign = if super::natural_scroll_enabled() { -1.0 } else { 1.0 };
 
     if event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
-        let dy = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1)
-            * sign;
-        let dx = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2)
-            * sign;
-        let motion = (dx != 0.0 || dy != 0.0).then_some(InputEvent::ScrollPixels { dx, dy });
+        let dy = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
+        let dx = event.get_double_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
+        let motion = (dx != 0.0 || dy != 0.0).then_some(crate::scroll::mac_pixels_to_wire(dx, dy));
         let stopped = phase == ffi::SCROLL_PHASE_ENDED || phase == ffi::SCROLL_PHASE_CANCELLED;
         let stop = stopped.then_some(InputEvent::ScrollStop {
             cancel: phase == ffi::SCROLL_PHASE_CANCELLED,
@@ -496,10 +492,7 @@ fn scroll(event: &CGEvent) -> Translated {
         if dx == 0 && dy == 0 {
             return Translated::None;
         }
-        Translated::One(InputEvent::Scroll120 {
-            dx: (dx as f64 * sign) as i32 * 120,
-            dy: (dy as f64 * sign) as i32 * 120,
-        })
+        Translated::One(crate::scroll::mac_lines_to_wire(dx, dy))
     }
 }
 

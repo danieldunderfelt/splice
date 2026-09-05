@@ -89,7 +89,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
     avoid hot-corner fights (default 16 px).
-12. **One current protocol.** Every client runs protocol 2 and advertises all required capabilities.
+12. **One current protocol.** Every client runs protocol 3 and advertises all required capabilities.
     A mismatch rejects the connection with an upgrade message. There is no compatibility mode.
 13. **Keep the target awake**: injection declares user activity; while a session is entered the
     target takes a display-sleep inhibition (macOS IOPMAssertion; Linux D-Bus
@@ -97,7 +97,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
 14. **Clipboard is lazy, promise-based, capped.** On local clipboard change: broadcast
     `ClipOffer` with MIME list. Peers install *promised* clipboard items (macOS
     `NSPasteboardItemDataProvider`; Wayland portal `SetSelection` → `SelectionTransfer`).
-    Data is fetched over TCP only when an app actually pastes. Size cap 16 MiB, chunked 256 KiB.
+    Data is fetched over TCP only when an app actually pastes. Size cap 16 MiB, chunked 16 KiB.
     Text ≤ 64 KiB is inlined in the offer (`ClipOffer.inline_text`) so cross-machine paste of
     small text works even if the origin goes offline.
     On Linux the Clipboard portal is attached to the **RemoteDesktop** session (works on GNOME
@@ -109,9 +109,10 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     `public.utf8-plain-text`↔`text/plain;charset=utf-8`, `public.html`↔`text/html`,
     `public.png`/`public.tiff`↔`image/png`, `public.rtf`↔`text/rtf`. File URLs are NOT synced
     in v1 (a `file://` path is meaningless on the other machine).
-15. **Scroll normalization.** Capture normalizes to device-direction values; the target applies
-    its own natural-scroll preference (prevents double inversion). Wire carries either
-    `ScrollPixels{dx,dy}` (smooth/trackpad, logical px) or `ScrollLines` in value-120 units
+15. **Scroll normalization.** Capture preserves the effective direction selected by the source. Positive wire values
+    scroll right and down. Quartz uses opposite signs, so macOS capture and injection each negate
+    both axes. The target does not apply another natural-scroll preference. Wire carries either
+    `ScrollPixels{dx,dy}` (smooth/trackpad, logical px) or `Scroll120` in value-120 units
     (one detent = 120). Never emit both for one physical event. Wayland targets: accumulate
     discrete to full ±120 before emitting (GNOME silently drops sub-120); use `std::trunc`
     semantics, not floor. `ScrollStop{cancel:false}` maps to phase-ended (lets target start

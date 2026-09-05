@@ -302,7 +302,7 @@ async fn newer_two_machine_layout_cannot_erase_connected_middle_machine() {
     let opts = test_opts();
     opts.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
     let (mut a, control) = NetManager::spawn_with(
-        MachineInfo { id: mid("aaa"), hostname: "aaa".into(), os: Os::Linux, displays: mock::one_display() },
+        MachineInfo { build: splice_proto::BuildInfo::current(), id: mid("aaa"), hostname: "aaa".into(), os: Os::Linux, displays: mock::one_display() },
         SocketAddr::new(a_node.ips[0], 0),
         Arc::new(FakeTs {
             self_node: a_node,
@@ -1060,4 +1060,70 @@ async fn failed_config_writes_are_visible_and_retry_after_storage_recovers() {
         }
     }).await.expect("save retries and clears the error");
     assert!(!splice_core::config::load(&rig.data_dir).unwrap().master_enabled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn motion_latency_stays_bounded_during_concurrent_large_clipboard_transfers() {
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    let payload = vec![0x5a; 8 * 1024 * 1024];
+    a.mock.state.lock().local_clip.insert(TEXT_MIME.into(), payload.clone());
+    a.mock.events.send(PlatformEvent::ClipboardChanged { mimes: vec![TEXT_MIME.into()], inline_text: None }).unwrap();
+    wait_until("large clipboard offer arrives", || b.mock.last_fetch.lock().is_some()).await;
+    let fetch = b.mock.last_fetch.lock().clone().unwrap();
+    let mut transfers = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let fetch = fetch.clone();
+        transfers.spawn(async move { fetch.fetch(TEXT_MIME).await });
+    }
+    tokio::task::yield_now().await;
+    let mut delays = Vec::new();
+    for index in 0..64 {
+        let event = InputEvent::Motion { dx: into_sign(&edge) * 0.125, dy: (index + 1) as f64 / 1024.0 };
+        let started = Instant::now();
+        a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(event))).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !b.mock.state.lock().injected.contains(&event) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }).await.unwrap_or_else(|_| panic!("input stalled during clipboard transfer: source={:?}, target={:?}", a.handle.state().borrow().diagnostics.peers, b.handle.state().borrow().diagnostics.peers));
+        delays.push(started.elapsed());
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    while let Some(result) = transfers.join_next().await {
+        assert_eq!(result.unwrap().unwrap(), payload);
+    }
+    delays.sort();
+    let p95 = delays[delays.len() * 95 / 100];
+    let max = *delays.last().unwrap();
+    eprintln!("motion with four 8 MiB clipboard transfers: p95={p95:?}, max={max:?}");
+    assert!(p95 < Duration::from_millis(50), "loopback p95 input delay regressed: {p95:?}");
+    assert!(max < Duration::from_millis(250), "loopback worst input delay regressed: {max:?}");
+    assert!(connected_to(&a, "bbb") && connected_to(&b, "aaa"));
+}
+
+#[tokio::test]
+async fn diagnostics_report_build_heartbeat_and_traffic_without_clipboard_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let (a, b) = spawn_pair().await;
+    let (edge, _) = drive_a_to_b(&a, &b).await;
+    let secret = "PRIVATE_CLIPBOARD_CONTENT_9c2f51";
+    a.mock.events.send(PlatformEvent::ClipboardChanged { mimes: vec![TEXT_MIME.into()], inline_text: Some(secret.into()) }).unwrap();
+    push_motion(&a, into_sign(&edge), 0.0);
+    push_key(&a, 30, true);
+    push_key(&a, 30, false);
+    wait_until("diagnostics include measured traffic and heartbeat", || {
+        let state = a.handle.state();
+        let state = state.borrow();
+        state.diagnostics.peers.get(&mid("bbb")).is_some_and(|p| p.last_heartbeat_ms.is_some() && p.traffic.input_frames_sent >= 3)
+    }).await;
+    a.handle.send(Command::ExportDiagnostics);
+    wait_until("diagnostic export completes", || a.handle.state().borrow().diagnostics.export_path.is_some()).await;
+    let path = a.handle.state().borrow().diagnostics.export_path.clone().unwrap();
+    let bytes = std::fs::read_to_string(&path).unwrap();
+    assert!(!bytes.contains(secret));
+    assert!(!bytes.contains("held_keys") && !bytes.contains("tokens"));
+    let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+    assert_eq!(value["state"]["diagnostics"]["peers"]["bbb"]["build"]["protocol"], splice_proto::PROTO_VERSION);
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
 }

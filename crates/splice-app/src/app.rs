@@ -211,6 +211,10 @@ impl SpliceApp {
                         ui.add_space(10.0);
 
                         health_section(ui, state);
+                        ui.add_space(10.0);
+                        crate::diagnostics::panel(ui, state, &self.ctrl);
+                        ui.add_space(10.0);
+                        crate::updates::panel(ui, state, &self.ctrl);
                         ui.add_space(8.0);
                     });
             });
@@ -670,7 +674,7 @@ impl eframe::App for SpliceApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
-        if self.ctrl.take_quit_request() {
+        if self.ctrl.take_quit_request() || self.ctrl.state().restart_requested {
             self.allow_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

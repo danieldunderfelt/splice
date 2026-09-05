@@ -11,6 +11,8 @@
 //! See docs/DESIGN.md — the FSM, arbitration, and safety rules are specified there.
 
 pub mod config;
+pub mod diagnostics;
+pub mod updates;
 mod clipboard;
 pub mod engine;
 pub mod arrange;

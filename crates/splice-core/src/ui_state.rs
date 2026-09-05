@@ -52,6 +52,10 @@ pub enum UiFocus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
+    pub updates: std::collections::BTreeMap<MachineId, crate::updates::UiUpdate>,
+    pub restart_requested: bool,
+    pub build: splice_proto::BuildInfo,
+    pub diagnostics: crate::diagnostics::Diagnostics,
     pub self_id: MachineId,
     pub master_enabled: bool,
     pub clipboard_sync: bool,
@@ -76,6 +80,10 @@ pub struct UiState {
 impl UiState {
     pub fn initial(self_id: MachineId) -> Self {
         UiState {
+            updates: Default::default(),
+            restart_requested: false,
+            build: splice_proto::BuildInfo::current(),
+            diagnostics: Default::default(),
             self_id,
             master_enabled: true,
             clipboard_sync: true,

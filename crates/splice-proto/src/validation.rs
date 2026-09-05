@@ -28,6 +28,15 @@ fn display(display: &DisplayRect) -> bool {
 fn machine(info: &MachineInfo) -> bool {
     let mut ids = HashSet::new();
     identity(&info.id)
+        && info.build.commit.len() == 40
+        && info.build.commit.bytes().all(|b| b.is_ascii_hexdigit())
+        && !info.build.version.is_empty()
+        && info.build.version.len() <= 64
+        && semver::Version::parse(&info.build.version).is_ok()
+        && info.build.protocol > 0
+        && !info.build.target.is_empty()
+        && info.build.target.len() <= 128
+        && info.build.target.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         && info
             .displays
             .iter()
@@ -56,9 +65,9 @@ impl LayoutDoc {
 impl Frame {
     pub fn validate(&self) -> Result<(), ProtoError> {
         let valid = match self {
-            Frame::Hello(hello) => machine(&hello.machine),
-            Frame::Welcome(welcome) => machine(&welcome.machine),
-            Frame::MachineUpdate(info) => machine(info),
+            Frame::Hello(hello) => machine(&hello.machine) && hello.machine.build.protocol == hello.proto_max,
+            Frame::Welcome(welcome) => machine(&welcome.machine) && welcome.machine.build.protocol == welcome.proto,
+            Frame::MachineUpdate(info) => machine(info) && info.build.protocol == crate::PROTO_VERSION,
             Frame::LayoutSync(doc) => return doc.validate(),
             Frame::SourceClaim { stamp: value } | Frame::ClipOffer { stamp: value, .. } => {
                 stamp(value)
@@ -91,6 +100,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn build_metadata_must_be_valid_and_match_the_handshake() {
+        let info = MachineInfo { build: crate::BuildInfo::current(), id: MachineId("peer".into()), hostname: "peer".into(), os: Os::Linux, displays: vec![] };
+        let mut hello = crate::Hello { proto_min: crate::PROTO_VERSION, proto_max: crate::PROTO_VERSION, machine: info, caps: vec![] };
+        assert!(Frame::Hello(hello.clone()).validate().is_ok());
+        hello.machine.build.protocol += 1;
+        assert!(Frame::Hello(hello.clone()).validate().is_err());
+        hello.machine.build = crate::BuildInfo::current();
+        hello.machine.build.commit = "untrusted".into();
+        assert!(Frame::Hello(hello.clone()).validate().is_err());
+        hello.machine.build = crate::BuildInfo::current();
+        hello.machine.build.version = "invalid version".into();
+        assert!(Frame::Hello(hello).validate().is_err());
+    }
+
+    #[test]
     fn rejects_nonfinite_input_and_overflowing_geometry() {
         assert!(Frame::Input {
             session: 1,
@@ -110,6 +134,7 @@ mod tests {
             scale: 1.25,
         };
         assert!(Frame::MachineUpdate(MachineInfo {
+            build: crate::BuildInfo::current(),
             id: MachineId("peer".into()),
             hostname: "peer".into(),
             os: Os::Linux,

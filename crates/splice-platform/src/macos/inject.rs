@@ -298,9 +298,9 @@ impl Core {
     }
 
     fn post_scroll_lines(&self, st: &mut State, dx120: i32, dy120: i32) {
-        let sign = if super::natural_scroll_enabled() { -1.0 } else { 1.0 };
-        st.scroll_residue.0 += dx120 as f64 * sign;
-        st.scroll_residue.1 += dy120 as f64 * sign;
+        let (dx, dy) = crate::scroll::wire_pixels_to_mac(dx120 as f64, dy120 as f64);
+        st.scroll_residue.0 += dx;
+        st.scroll_residue.1 += dy;
         // std::trunc semantics, not floor: -119/120 must round toward zero, not to -1.
         let mut h = (st.scroll_residue.0 / DETENT).trunc() as i32;
         let mut v = (st.scroll_residue.1 / DETENT).trunc() as i32;
@@ -319,11 +319,11 @@ impl Core {
     }
 
     fn post_scroll_pixels(&self, st: &mut State, dx: f64, dy: f64) {
-        let sign = if super::natural_scroll_enabled() { -1.0 } else { 1.0 };
+        let (dx, dy) = crate::scroll::wire_pixels_to_mac(dx, dy);
         let Some(ev) = self.scroll(
             ffi::kCGScrollEventUnitPixel,
-            (dy * sign).round() as i32,
-            (dx * sign).round() as i32,
+            dy.round() as i32,
+            dx.round() as i32,
         ) else {
             return;
         };

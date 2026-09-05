@@ -62,6 +62,7 @@ fn test_opts() -> NetOpts {
 
 async fn spawn_node(id: &str, whois_peer: &str, opts: NetOpts) -> (NetManager, NetControl) {
     let info = MachineInfo {
+        build: splice_proto::BuildInfo::current(),
         id: MachineId(id.into()),
         hostname: id.into(),
         os: Os::Linux,
@@ -228,6 +229,7 @@ async fn sending_welcome_does_not_mark_an_unconfirmed_peer_connected() {
             proto_min: splice_proto::PROTO_VERSION,
             proto_max: splice_proto::PROTO_VERSION,
             machine: MachineInfo {
+                build: splice_proto::BuildInfo::current(),
                 id: MachineId("aaa".into()),
                 hostname: "aaa".into(),
                 os: Os::Linux,
@@ -324,6 +326,7 @@ async fn send_to_broadcast_and_machine_update() {
     .await;
 
     let info = MachineInfo {
+        build: splice_proto::BuildInfo::current(),
         id: MachineId("aaa".into()),
         hostname: "renamed".into(),
         os: Os::Macos,

@@ -106,8 +106,12 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
         .context("installing SIGTERM handler")?;
     let mut last_spawn: Option<Instant> = None;
     tracing::info!(socket = %path.display(), "splice service running");
+    let mut state_version = shared.version.subscribe();
     loop {
         tokio::select! {
+            _ = state_version.changed() => {
+                if shared.state.read().restart_requested { break; }
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
@@ -182,6 +186,7 @@ async fn engine_loop(shared: Arc<Shared>, mut retry_rx: mpsc::UnboundedReceiver<
         while watch.changed().await.is_ok() {
             *shared.state.write() = watch.borrow_and_update().clone();
             shared.bump();
+            if shared.state.read().restart_requested { return; }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         *shared.engine.lock() = None;

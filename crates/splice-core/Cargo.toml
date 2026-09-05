@@ -8,6 +8,7 @@ license.workspace = true
 splice-proto = { workspace = true }
 splice-platform = { workspace = true }
 splice-tailscale = { workspace = true }
+splice-update = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -22,3 +23,4 @@ directories = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+tempfile = "3"

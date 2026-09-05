@@ -36,7 +36,6 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
 use parking_lot::{Mutex, RwLock};
 use splice_proto::{DisplayRect, Vec2};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -65,27 +64,6 @@ impl MacShared {
             self.emit(PlatformEvent::Health(report));
         }
     }
-}
-
-/// Cached `com.apple.swipescrolldirection`, refreshed lazily. Capture normalizes to device
-/// direction and injection re-applies the local preference (DESIGN 15) — reading the
-/// default on every scroll event would be far too slow for a synchronous tap callback.
-static NATURAL_SCROLL: AtomicBool = AtomicBool::new(false);
-static NATURAL_SCROLL_READ_MS: AtomicU64 = AtomicU64::new(0);
-
-pub fn natural_scroll_enabled() -> bool {
-    let now = cursor::now_ms();
-    let last = NATURAL_SCROLL_READ_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) > 5_000 {
-        NATURAL_SCROLL_READ_MS.store(now, Ordering::Relaxed);
-        let enabled = objc2::rc::autoreleasepool(|_| {
-            objc2_foundation::NSUserDefaults::standardUserDefaults()
-                .boolForKey(&objc2_foundation::NSString::from_str("com.apple.swipescrolldirection"))
-        });
-        NATURAL_SCROLL.store(enabled, Ordering::Relaxed);
-        return enabled;
-    }
-    NATURAL_SCROLL.load(Ordering::Relaxed)
 }
 
 /// `None` when Secure Input is off. While it is on, keyboard events vanish from every tap

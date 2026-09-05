@@ -99,6 +99,10 @@ pub struct Inner {
     backend_status: Option<BackendStatus>,
     tailscale_error: Option<String>,
     config_error: Option<String>,
+    diagnostics: crate::diagnostics::Diagnostics,
+    update_host: Option<splice_update::Host>,
+    updates: Option<crate::updates::Updates>,
+    restart_requested: bool,
     ui_deadline: Option<Instant>,
     cfg_deadline: Option<Instant>,
     platform_batch: Vec<PlatformEvent>,
@@ -124,6 +128,7 @@ impl Inner {
         cmd: mpsc::UnboundedReceiver<Command>,
         ui_tx: watch::Sender<UiState>,
         ready_tx: watch::Sender<Option<SocketAddr>>,
+        update_host: Option<splice_update::Host>,
     ) -> anyhow::Result<Self> {
         let cfg = config::load(&data_dir)?;
         let layout_lamport = cfg.layout.as_ref().map(|d| d.stamp.lamport).unwrap_or(0);
@@ -134,6 +139,7 @@ impl Inner {
         }
         Ok(Inner {
             self_info: MachineInfo {
+                build: splice_proto::BuildInfo::current(),
                 id: MachineId(String::new()),
                 hostname: String::new(),
                 os: Os::Other,
@@ -176,6 +182,10 @@ impl Inner {
             backend_status: None,
             tailscale_error: None,
             config_error: None,
+            diagnostics: Default::default(),
+            update_host,
+            updates: None,
+            restart_requested: false,
             ui_deadline: None,
             cfg_deadline: None,
             platform_batch: Vec::with_capacity(16),
@@ -208,10 +218,21 @@ impl Inner {
             self.poll_interval,
         );
         let mut platform_open = true;
+        let mut diagnostic_tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             let ui_at = self.ui_deadline;
             let cfg_at = self.cfg_deadline;
             tokio::select! {
+                _ = diagnostic_tick.tick() => {
+                    if let Some(updates) = &mut self.updates {
+                        updates.poll();
+                        if updates.restart_requested() {
+                            self.restart_requested = true;
+                            break;
+                        }
+                    }
+                    self.touch_ui();
+                }
                 result = self.clipboard_jobs.join_next(), if !self.clipboard_jobs.is_empty() => {
                     if let Some(Err(error)) = result {
                         if !error.is_cancelled() {
@@ -309,6 +330,7 @@ impl Inner {
             net.update_dial_targets(Vec::new());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        if self.restart_requested { self.publish_ui(); }
     }
 
     /// Learn self from tailscale (retrying while LocalAPI is unreachable) and bring
@@ -337,6 +359,7 @@ impl Inner {
             };
             self.tailscale_error = None;
             self.self_info = MachineInfo {
+                build: splice_proto::BuildInfo::current(),
                 id: MachineId(status.self_node.stable_id.clone()),
                 hostname: if status.self_node.hostname.is_empty() {
                     status.self_node.dns_name.trim_end_matches('.').to_string()
@@ -361,6 +384,9 @@ impl Inner {
                     let _ = self.ready_tx.send(Some(mgr.local_addr));
                     self.net = Some(control);
                     self.net_events = Some(mgr.events);
+                    if let Some(host) = self.update_host.take() {
+                        self.updates = Some(crate::updates::Updates::new(host, self.self_info.id.clone(), bind_ip, self.ts.clone()).await);
+                    }
                     return true;
                 }
                 Err(e) => {
@@ -414,6 +440,7 @@ impl Inner {
                     }
                 }
                 // LocalAPI errors keep the last known targets; success replaces them.
+                if let Some(updates) = &mut self.updates { updates.discover(&targets); }
                 if let Some(net) = &self.net {
                     net.update_dial_targets(targets);
                 }
@@ -1187,6 +1214,20 @@ impl Inner {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
+            Command::Update { machine, action } => {
+                if let Some(updates) = &mut self.updates { updates.request(machine, action); }
+                self.touch_ui();
+            }
+            Command::ExportDiagnostics => {
+                match crate::diagnostics::export(&self.data_dir, &self.build_ui()) {
+                    Ok(path) => {
+                        self.diagnostics.export_path = Some(path.display().to_string());
+                        self.diagnostics.export_error = None;
+                    }
+                    Err(error) => self.diagnostics.export_error = Some(format!("Cannot save diagnostics: {error:#}")),
+                }
+                self.touch_ui();
+            }
             Command::SetMasterEnabled(on) => {
                 self.cfg.master_enabled = on;
                 self.mark_cfg_dirty();
@@ -1656,7 +1697,15 @@ impl Inner {
             Focus::Remote(t) => UiFocus::Remote(t.clone()),
             Focus::Driven(s) => UiFocus::Driven(s.clone()),
         };
+        let mut diagnostics = self.diagnostics.clone();
+        if let Some(net) = &self.net {
+            diagnostics.peers = net.diagnostics();
+        }
         UiState {
+            updates: self.updates.as_ref().map(|u| u.snapshot()).unwrap_or_default(),
+            restart_requested: self.restart_requested,
+            build: splice_proto::BuildInfo::current(),
+            diagnostics,
             self_id: self.self_info.id.clone(),
             master_enabled: self.cfg.master_enabled,
             clipboard_sync: self.cfg.clipboard_sync,

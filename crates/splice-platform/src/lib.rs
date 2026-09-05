@@ -12,6 +12,7 @@
 
 pub mod keymap;
 pub mod mock;
+pub mod scroll;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

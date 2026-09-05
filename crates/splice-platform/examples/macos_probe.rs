@@ -39,7 +39,6 @@ fn main() {
     }
 
     println!("scroll");
-    println!("  natural scroll direction: {}", macos::natural_scroll_enabled());
 }
 
 #[cfg(not(target_os = "macos"))]

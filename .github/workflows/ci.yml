@@ -1,0 +1,51 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      SPLICE_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev libudev-dev libdbus-1-dev libegl1-mesa-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev
+      - if: runner.os == 'macOS'
+        run: |
+          for address in 2 3 4 5; do
+            sudo ifconfig lo0 alias "127.0.0.${address}" up
+          done
+      - run: rustup toolchain install 1.98.0 --profile minimal --component clippy
+      - run: cargo +1.98.0 test --workspace --locked
+      - run: cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo +1.98.0 test -p splice-core --release --test engine_e2e --locked
+      - run: cargo +1.98.0 build -p splice-app --release --locked
+      - run: ./target/release/splice --version-json
+      - run: python3 -m unittest discover -s packaging/tests -v
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: splice-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: target/release/splice
+          if-no-files-found: error
+          retention-days: 14

@@ -18,6 +18,7 @@
 mod session;
 
 use futures::future::BoxFuture;
+use crate::diagnostics::{ConnectionPhase, PeerDiagnostics, unix_ms};
 use parking_lot::{Mutex, RwLock};
 use splice_proto::{Frame, MachineId};
 use std::collections::{HashMap, HashSet};
@@ -179,6 +180,7 @@ impl NetManager {
             opts,
             status_cache: tokio::sync::Mutex::new(None),
             next_seq: AtomicU64::new(1),
+            diagnostics: RwLock::new(Default::default()),
         });
         let manager = NetManager { events: events_rx, local_addr };
         let control = NetControl { inner: inner.clone() };
@@ -208,9 +210,34 @@ pub(crate) struct NetControlInner {
     /// Last tailscale status + fetch time, for inbound WhoIs authorization.
     status_cache: tokio::sync::Mutex<Option<(Instant, splice_tailscale::Status)>>,
     next_seq: AtomicU64,
+    diagnostics: RwLock<std::collections::BTreeMap<MachineId, PeerDiagnostics>>,
+}
+
+impl NetControlInner {
+    pub(crate) fn phase(&self, id: &MachineId, phase: ConnectionPhase, address: Option<SocketAddr>, error: Option<String>) {
+        if phase != ConnectionPhase::Connected && self.peers.read().contains_key(id) {
+            return;
+        }
+        let mut diagnostics = self.diagnostics.write();
+        let peer = diagnostics.entry(id.clone()).or_default();
+        peer.phase = phase;
+        peer.phase_changed_ms = unix_ms();
+        if address.is_some() { peer.address = address; }
+        if error.is_some() { peer.last_error = error; }
+        if peer.phase == ConnectionPhase::Connecting { peer.attempts += 1; }
+        if peer.phase == ConnectionPhase::Connected { peer.last_connected_ms = Some(unix_ms()); peer.last_heartbeat_ms = None; }
+    }
 }
 
 impl NetControl {
+    pub fn diagnostics(&self) -> std::collections::BTreeMap<MachineId, PeerDiagnostics> {
+        let mut result = self.inner.diagnostics.read().clone();
+        for (id, slot) in self.inner.peers.read().iter() {
+            result.entry(id.clone()).or_default().traffic = slot.traffic.snapshot();
+        }
+        result
+    }
+
     /// Replace the set of peers we should be connected to (from discovery): id + IP.
     /// The manager dials (respecting the smaller-id-dials rule), redials with backoff
     /// while a target remains listed, and drops connections to unlisted peers.
@@ -366,6 +393,7 @@ async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
             .get(&id)
             .copied()
             .unwrap_or(splice_proto::SPLICE_PORT);
+        inner.phase(&id, ConnectionPhase::Connecting, Some(SocketAddr::new(ip, port)), None);
         let attempt = tokio::time::timeout(inner.opts.dial_timeout, async {
             let socket = if ip.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
             socket.bind(SocketAddr::new(inner.bind_ip, 0))?;
@@ -382,8 +410,8 @@ async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
                     backoff = inner.opts.backoff_min;
                 }
             }
-            Ok(Err(e)) => tracing::debug!(peer = %id, error = %e, "net: dial failed"),
-            Err(_) => tracing::debug!(peer = %id, "net: dial timed out"),
+            Ok(Err(e)) => inner.phase(&id, ConnectionPhase::Disconnected, None, Some(format!("TCP connection failed: {e}"))),
+            Err(_) => inner.phase(&id, ConnectionPhase::Disconnected, None, Some("TCP connection timed out; check the Tailnet route and VPN split-tunnel rules".into())),
         }
         if !inner.targets.read().contains_key(&id) {
             break;

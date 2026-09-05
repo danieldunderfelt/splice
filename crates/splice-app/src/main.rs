@@ -17,6 +17,8 @@ mod app;
 #[cfg(target_os = "linux")]
 mod autostart;
 mod drag;
+mod diagnostics;
+mod updates;
 #[cfg(target_os = "linux")]
 mod ipc;
 #[cfg(target_os = "linux")]
@@ -97,6 +99,16 @@ fn dispatch(preview: bool) {
 }
 
 fn main() -> eframe::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version-json") => { println!("{}", serde_json::to_string(&splice_proto::BuildInfo::current()).expect("build information serializes")); return Ok(()); }
+        Some("--version") => { let b = splice_proto::BuildInfo::current(); println!("Splice {} · {} · protocol {}", b.version, b.commit, b.protocol); return Ok(()); }
+        Some("--apply-update") => {
+            let result = std::env::args_os().nth(2).ok_or_else(|| anyhow::anyhow!("missing update plan path")).and_then(|p| splice_update::install::apply(std::path::Path::new(&p)));
+            if let Err(error) = result { eprintln!("{error:#}"); std::process::exit(1); }
+            return Ok(());
+        }
+        _ => {}
+    }
     let preview = std::env::var("SPLICE_UI_PREVIEW").ok().as_deref() == Some("1");
     #[cfg(target_os = "linux")]
     dispatch(preview);
