@@ -1,6 +1,6 @@
 # Raw input and deliberate edge crossing
 
-Status: Splice 1.2.0, protocol 4 supports raw capture from Linux and macOS, with relative injection
+Status: Splice 1.2.0, protocol 5 supports raw capture from Linux and macOS, with relative injection
 on Linux. Automated Linux checks pass. Native Mac workspace tests, Clippy, release engine tests,
 and Developer ID signing have passed. The Mac screen-edge indicator was exercised on all four edges
 without taking focus, and captured Mac device descriptors have portable regression tests.
@@ -9,8 +9,8 @@ Physical forwarding, local suppression, and gaming acceptance remain unverified.
 [Linux acceptance checks](raw-input-linux.md#complete-native-acceptance) and the
 [Mac handoff](raw-input-macos-handoff.md) before releasing raw mode.
 
-The current implementation requires explicitly selected focus lock for raw input. Destination
-edge observations are not implemented. Dwell and resistance work with a Mac source, including
+Raw input stays on the selected computer automatically. Destination edge observations are not
+implemented. Dwell and resistance work with a Mac source, including
 its desktop sessions across Linux destinations. Linux source edges retain Immediate crossing;
 selecting a delayed policy there produces an error. Progress appears in the Splice window and in
 a Mac panel beside the physical screen edge, including while the Splice window is hidden.
@@ -67,18 +67,23 @@ Splice's implementation is native and does not depend on a VirtualHere installat
 
 ## Settings and compatibility
 
-The controls are independent:
+Input settings:
 
 | Setting | Choices | Initial behavior |
 |---|---|---|
 | Input mode for a destination | Desktop, Raw input | Desktop remains the default |
 | Edge crossing | Immediate, Dwell, Resistance | Existing immediate behavior remains the default |
-| Focus lock | Off, Locked to selected computer | Explicit user selection; switch shortcut and emergency release remain available |
+| Stay on selected computer in Desktop mode | Off, On | Off by default; switch shortcut and emergency release remain available |
 
 Raw input can be selected for Linux-to-Linux and Mac-to-Linux routes. Device permissions, target readiness,
 and mode capabilities must be checked before raw forwarding begins. Linux edge capture is already
 active during preparation, so any failure explicitly restores local control. An unsupported
 selection reports the missing capability. Splice never silently substitutes desktop mode.
+
+Raw sessions stay on the selected computer automatically because destination edge observations are
+not available. Selecting Raw is sufficient; it does not require or change the Desktop focus setting.
+Use the switch shortcut, Control buttons, or emergency release to change computers during Raw input.
+Returning to Desktop restores its configured edge-crossing behavior.
 
 Desktop link sensitivity continues to apply only to desktop mode. Raw mode preserves device counts.
 The receiving desktop or game applies its own settings, as with a locally attached relative device.
@@ -98,7 +103,8 @@ The implementation uses IOHIDManager input report callbacks and descriptor-drive
 It monitors devices without seizing them. The existing active session event tap suppresses local
 mouse and keyboard events; a second active tap suppresses media events of type 14. Native tests
 must prove these two paths neither lose physical reports nor leak local input.
-Timestamps currently record callback enqueue time on a monotonic clock, not hardware report time.
+Timestamped IOHID callbacks preserve the native report-arrival time. Mach ticks are converted to
+microseconds using the timebase ratio. Capture enqueue time is recorded separately.
 
 Capture must preserve signed relative motion, buttons, wheel resolution, physical key state, and
 standard media keys. Handle composite receivers, multiple HID collections, different report IDs,
@@ -121,8 +127,8 @@ Any future raw input into macOS needs its own platform and signing validation.
 The source reads physical evdev devices before libinput acceleration. `RawDevice` preserves kernel
 `SYN_REPORT` groups and exposes `SYN_DROPPED`. A dropped report ends capture because lost motion
 cannot be reconstructed. High-resolution wheel events replace their accompanying legacy detents.
-Key repeat comes from the destination. Device identifiers, report sequence, and monotonic enqueue
-timestamps belong to one source aggregator.
+Key repeat comes from the destination. Device identifiers and report sequence belong to one source aggregator. Each evdev reader selects
+CLOCK_MONOTONIC and retains the native SYN_REPORT timestamp, independently of enqueue time.
 
 Wayland still suppresses local input. The source starts through an existing portal barrier or overlay
 edge. A Linux source cannot start through a button or shortcut while local, because portal capture
@@ -179,10 +185,28 @@ behavior makes an ordered transport a reasonable first candidate. TCP still stal
 measure this explicitly. A datagram transport is a separate decision only if measurements justify
 its loss-recovery and ordering complexity.
 
-Each report carries device identity, session generation, sequence, source timestamp, and its input
-data. Keep timestamps for timing diagnostics without comparing unsynchronized clocks as if they were
-one-way latency measurements. Preserve reports at supported polling rates without a frame timer or
-lossy event queue. Overload ends the session with a visible error and releases held state.
+Each report carries device identity, session generation, sequence, native capture time, send time,
+and input data. Sequence is the sole global ordering check. Device timestamps may interleave.
+The receiver maps source time into its monotonic clock using the minimum receive-minus-send offset
+from the current and previous ten-second windows. Heartbeats update the estimate while idle;
+four initial samples precede capture. These windows bound drift without assuming symmetric paths.
+This estimate includes the unknown fastest transit time and is not a one-way latency measurement.
+
+Linux injects mapped timestamps immediately, preserving report boundaries and native progression
+across changes to the clock estimate when current time permits. Interleaved native times use a
+high-water mark. Each virtual device retains its last emitted timestamp across sessions; timestamps are bounded to that value, the
+preceding two seconds, and the current monotonic time. Adjustments are counted. Teardown releases
+use current time. There is no replay timer, smoothing, or lossy motion coalescing.
+
+The source queue is bounded to 1,024 reports. Source capture age and receiver mapped age must stay
+below 750 ms; exceeding either ends the session and releases held input, with an explicit failure reason. The mapped age excludes the unknown transit floor.
+Read/write timeouts alone do not bound buffered report age.
+
+Aggregate `raw input timing` logs report capture-to-enqueue delay, source queue age, socket writes,
+heartbeat RTT, receive gaps, transit above the observed floor, mapped capture age, injection cost,
+uinput writes, and timestamp adjustments. Each ten-second window and session end reports counts,
+mean, maximum, and logarithmic-histogram percentile upper bounds, all in microseconds. No input
+contents are logged. See [timing validation](raw-input-timing-validation.md) for interpretation.
 
 Use distinct types for desktop pixel movement and raw device movement. The module ownership
 keeps these contracts separate:
@@ -241,8 +265,8 @@ capture path. Injection must not make the destination incorrectly claim physical
 
 This is a concrete feasibility checkpoint. Raw forwarding into a game can work before automatic raw
 return crossings do. If a desktop cannot provide the needed edge observations, advertise that
-limitation explicitly and offer an explicitly selected shortcut-only focus lock. Do not pretend
-predicted cursor coordinates are reliable or silently alter the user's crossing setting.
+limitation when Raw is selected and keep switching available through the shortcut and Control buttons.
+Do not predict cursor coordinates or alter the user's Desktop focus or crossing settings.
 
 Gaming lock disables automatic edge switching for that session. Turning a camera cannot take the
 mouse to another computer. A dedicated switch shortcut chooses another destination or returns to

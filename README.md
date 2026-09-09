@@ -98,7 +98,7 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
-1. Install the same current build and start Splice on every computer. Protocol 4 rejects older clients.
+1. Install the same current build and start Splice on every computer. Protocol 5 rejects older clients.
 2. Approve the operating system permission prompts.
 3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
@@ -146,7 +146,7 @@ failures, fixes, and remaining live verification.
 
 Splice supports selectable raw input from Linux and Mac sources to Linux destinations through a
 relative virtual mouse and keyboard. Desktop mode remains the default in every existing direction.
-Raw mode requires **Stay on selected computer**. Use **Ctrl+Alt+F12** to cycle through computers,
+Raw mode stays on the selected computer automatically. Use **Ctrl+Alt+F12** to cycle through computers,
 or use the **Control** buttons during capture. On Linux, start capture by crossing a screen edge.
 Mac sources also have Immediate, Dwell, and Resistance crossing.
 

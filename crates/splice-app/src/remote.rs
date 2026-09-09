@@ -62,13 +62,44 @@ pub fn start(ctx: egui::Context, mirror: Mirror) -> Arc<Remote> {
 }
 
 fn run(remote: Arc<Remote>, ctx: egui::Context, mirror: Mirror, retry_rx: mpsc::Receiver<()>) {
+    run_with_connector(
+        remote,
+        ctx,
+        mirror,
+        retry_rx,
+        RETRY_INTERVAL,
+        |start_service| {
+            if start_service {
+                ipc::ensure_service()
+            } else {
+                ipc::connect()
+            }
+        },
+    );
+}
+
+fn run_with_connector<C>(
+    remote: Arc<Remote>,
+    ctx: egui::Context,
+    mirror: Mirror,
+    retry_rx: mpsc::Receiver<()>,
+    retry_interval: std::time::Duration,
+    mut connect: C,
+) where
+    C: FnMut(bool) -> std::io::Result<UnixStream>,
+{
+    let mut start_service = true;
     loop {
-        let stream = match ipc::ensure_service() {
+        let may_start = std::mem::replace(&mut start_service, false);
+        let stream = match connect(may_start) {
             Ok(stream) => stream,
             Err(err) => {
-                *mirror.status.lock() = BootStatus::Offline(format!("cannot start the Splice service: {err}"));
+                let action = if may_start { "start" } else { "connect to" };
+                *mirror.status.lock() = BootStatus::Offline(format!("cannot {action} the Splice service: {err}"));
                 ctx.request_repaint();
-                let _ = retry_rx.recv_timeout(RETRY_INTERVAL);
+                if retry_rx.recv_timeout(retry_interval).is_ok() {
+                    start_service = true;
+                }
                 continue;
             }
         };
@@ -80,7 +111,9 @@ fn run(remote: Arc<Remote>, ctx: egui::Context, mirror: Mirror, retry_rx: mpsc::
             Err(err) => {
                 *mirror.status.lock() = BootStatus::Offline(format!("cannot talk to the Splice service: {err}"));
                 ctx.request_repaint();
-                let _ = retry_rx.recv_timeout(RETRY_INTERVAL);
+                if retry_rx.recv_timeout(retry_interval).is_ok() {
+                    start_service = true;
+                }
                 continue;
             }
         }
@@ -93,7 +126,12 @@ fn run(remote: Arc<Remote>, ctx: egui::Context, mirror: Mirror, retry_rx: mpsc::
                     *mirror.tray_hint.lock() = (!tray).then(|| NO_TRAY_HINT.into());
                 }
                 Ok(Some(ServerMessage::Focus)) => mirror.focus_request.store(true, Ordering::Release),
-                Ok(Some(ServerMessage::Quit)) => mirror.quit_request.store(true, Ordering::Release),
+                Ok(Some(ServerMessage::Quit)) => {
+                    mirror.quit_request.store(true, Ordering::Release);
+                    ctx.request_repaint();
+                    *remote.writer.lock() = None;
+                    return;
+                }
                 Ok(None) => break,
                 Err(err) => {
                     tracing::warn!(error = %err, "service connection failed");
@@ -105,6 +143,158 @@ fn run(remote: Arc<Remote>, ctx: egui::Context, mirror: Mirror, retry_rx: mpsc::
         *remote.writer.lock() = None;
         *mirror.status.lock() = BootStatus::Offline("Splice service stopped".into());
         ctx.request_repaint();
-        let _ = retry_rx.recv_timeout(RETRY_INTERVAL);
+        let _ = retry_rx.recv_timeout(retry_interval);
+        start_service = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::BufReader;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+
+    fn mirror() -> Mirror {
+        Mirror {
+            state: Arc::new(RwLock::new(UiState::initial(splice_proto::MachineId("self".into())))),
+            status: Arc::new(Mutex::new(BootStatus::Starting)),
+            tray_hint: Arc::new(Mutex::new(None)),
+            focus_request: Arc::new(AtomicBool::new(false)),
+            quit_request: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn read_hello(stream: &UnixStream) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        assert!(matches!(
+            ipc::read_message::<ClientMessage>(&mut reader).unwrap(),
+            Some(ClientMessage::Hello { window: true })
+        ));
+    }
+
+    #[test]
+    fn reconnect_restarts_service_after_unexpected_disconnect() {
+        let (client1, server1) = UnixStream::pair().unwrap();
+        let (client2, mut server2) = UnixStream::pair().unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let modes = Arc::new(Mutex::new(Vec::new()));
+        let observed_modes = modes.clone();
+        let mut clients = VecDeque::from([client1, client2]);
+        let server = std::thread::spawn(move || {
+            read_hello(&server1);
+            drop(server1);
+            read_hello(&server2);
+            ipc::write_message(&mut server2, &ServerMessage::Quit).unwrap();
+        });
+        let remote = Arc::new(Remote { writer: Mutex::new(None), retry: retry_tx });
+        let mirror = mirror();
+        let quit = mirror.quit_request.clone();
+        run_with_connector(
+            remote,
+            egui::Context::default(),
+            mirror,
+            retry_rx,
+            std::time::Duration::from_millis(10),
+            move |start_service| {
+                observed_modes.lock().push(start_service);
+                clients.pop_front().ok_or_else(|| std::io::Error::other("no test connection"))
+            },
+        );
+        server.join().unwrap();
+        assert_eq!(*modes.lock(), vec![true, true]);
+        assert!(quit.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_initial_start_does_not_authorize_automatic_restart() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            read_hello(&server);
+            ipc::write_message(&mut server, &ServerMessage::Quit).unwrap();
+        });
+        let remote = Arc::new(Remote { writer: Mutex::new(None), retry: retry_tx });
+        let mut connections = VecDeque::from([
+            Err(std::io::Error::other("initial start failed")),
+            Ok(client),
+        ]);
+        let mut modes = Vec::new();
+        run_with_connector(
+            remote,
+            egui::Context::default(),
+            mirror(),
+            retry_rx,
+            std::time::Duration::from_millis(10),
+            |start_service| {
+                modes.push(start_service);
+                connections.pop_front().expect("unexpected reconnect")
+            },
+        );
+        server_thread.join().unwrap();
+        assert_eq!(modes, vec![true, false]);
+    }
+
+    #[test]
+    fn explicit_retry_can_start_service_after_initial_failure() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let retry = retry_tx.clone();
+        let server_thread = std::thread::spawn(move || {
+            read_hello(&server);
+            ipc::write_message(&mut server, &ServerMessage::Quit).unwrap();
+        });
+        let remote = Arc::new(Remote { writer: Mutex::new(None), retry: retry_tx });
+        let mut client = Some(client);
+        let mut modes = Vec::new();
+        run_with_connector(
+            remote,
+            egui::Context::default(),
+            mirror(),
+            retry_rx,
+            std::time::Duration::from_secs(1),
+            |start_service| {
+                modes.push(start_service);
+                if modes.len() == 1 {
+                    retry.send(()).unwrap();
+                    Err(std::io::Error::other("initial start failed"))
+                } else {
+                    Ok(client.take().expect("unexpected reconnect"))
+                }
+            },
+        );
+        server_thread.join().unwrap();
+        assert_eq!(modes, vec![true, true]);
+    }
+
+    #[test]
+    fn quit_message_stops_remote_worker_without_reconnect() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (retry_tx, retry_rx) = mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            read_hello(&server);
+            ipc::write_message(&mut server, &ServerMessage::Quit).unwrap();
+        });
+        let remote = Arc::new(Remote { writer: Mutex::new(None), retry: retry_tx });
+        let mirror = mirror();
+        let quit = mirror.quit_request.clone();
+        let connections = Arc::new(Mutex::new(0));
+        let observed = connections.clone();
+        let mut client = Some(client);
+        run_with_connector(
+            remote,
+            egui::Context::default(),
+            mirror,
+            retry_rx,
+            std::time::Duration::from_millis(10),
+            move |_| {
+                *observed.lock() += 1;
+                client.take().ok_or_else(|| std::io::Error::other("unexpected reconnect"))
+            },
+        );
+        server_thread.join().unwrap();
+        assert!(quit.load(Ordering::Acquire));
+        assert_eq!(*connections.lock(), 1);
     }
 }

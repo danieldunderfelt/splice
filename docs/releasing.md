@@ -66,7 +66,7 @@ prerelease tags. An already published release is not overwritten.
 ## Bootstrap existing computers
 
 Protocol 2 clients do not include the updater. Install this version manually on every computer once.
-Splice 1.2.0 uses KVM protocol 4 and refuses older KVM protocols.
+Splice 1.2.0 uses KVM protocol 5 and refuses older KVM protocols.
 
 On Linux, build and use the per-user installer:
 

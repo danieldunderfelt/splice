@@ -6,15 +6,15 @@ mod witness;
 
 use super::{Shared, VIRTUAL_DEVICE_PREFIX};
 use crate::{
+    raw::{shortcut::Stream, RawCapture},
     Capture, CaptureEvent, EdgeSpec, PlatformError, PlatformEvent, Result,
-    raw::{RawCapture, shortcut::Stream},
 };
-use anyhow::{Context, ensure};
-use evdev::{KeyCode, RelativeAxisCode as Rel, raw_stream::RawDevice};
+use anyhow::{ensure, Context};
+use evdev::{raw_stream::RawDevice, KeyCode, RelativeAxisCode as Rel};
 use parking_lot::Mutex;
 use splice_proto::{
+    raw::{RawEvent, RawReport, MAX_DEVICES},
     Vec2,
-    raw::{MAX_DEVICES, RawEvent, RawReport},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,7 +25,7 @@ use std::{
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
-    sync::{Arc, Weak, atomic::Ordering},
+    sync::{atomic::Ordering, Arc, Weak},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
@@ -35,7 +35,6 @@ pub struct DeviceCapture {
     desktop: Arc<dyn Capture>,
     runtime: tokio::runtime::Handle,
     state: Mutex<State>,
-    origin: Instant,
 }
 
 #[derive(Default)]
@@ -51,7 +50,7 @@ struct State {
 }
 
 struct Output {
-    reports: mpsc::Sender<RawReport>,
+    reports: mpsc::Sender<crate::raw::CapturedReport>,
     operation: Arc<crate::raw::RawOperation>,
 }
 
@@ -70,7 +69,6 @@ impl DeviceCapture {
             desktop,
             runtime: tokio::runtime::Handle::current(),
             state: Mutex::new(State::default()),
-            origin: Instant::now(),
         });
         let weak = Arc::downgrade(&capture);
         std::thread::Builder::new()
@@ -101,7 +99,13 @@ impl DeviceCapture {
         Ok(())
     }
 
-    fn send(&self, state: &mut State, id: u64, events: Vec<RawEvent>) -> anyhow::Result<()> {
+    fn send(
+        &self,
+        state: &mut State,
+        id: u64,
+        events: Vec<RawEvent>,
+        captured_us: u64,
+    ) -> anyhow::Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -111,13 +115,13 @@ impl DeviceCapture {
         let report = RawReport {
             device: id,
             sequence: state.sequence,
-            captured_us: self.origin.elapsed().as_micros() as u64,
+            captured_us,
             events,
         };
         report.validate().map_err(anyhow::Error::msg)?;
         output
             .reports
-            .try_send(report)
+            .try_send(report.into())
             .context("Raw input queue overflowed or the connection closed; capture released")?;
         state.sequence = state
             .sequence
@@ -200,7 +204,16 @@ impl DeviceCapture {
                     self.shared.emit(PlatformEvent::SwitchTarget);
                 }
                 if forward && !self.shared.capture_control.switching.load(Ordering::SeqCst) {
-                    self.send(state, id, report)?;
+                    self.send(
+                        state,
+                        id,
+                        report,
+                        event
+                            .timestamp()
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_micros()
+                            .try_into()?,
+                    )?;
                 }
             }
         }
@@ -223,7 +236,7 @@ impl RawCapture for DeviceCapture {
 
     fn begin(
         &self,
-        output: mpsc::Sender<RawReport>,
+        output: mpsc::Sender<crate::raw::CapturedReport>,
         _edge: Option<u32>,
         operation: Arc<crate::raw::RawOperation>,
     ) -> Result<()> {
@@ -265,7 +278,7 @@ impl RawCapture for DeviceCapture {
         let snapshots: anyhow::Result<Vec<_>> = state.devices.values().map(|d| Ok((d.id, d.reports.snapshot()?.into_iter().filter(|ev| !matches!(ev, RawEvent::Key { code, .. } if self.shared.capture_control.suppressed(*code))).collect()))).collect();
         let result = snapshots.and_then(|snapshots| {
             for (id, snapshot) in snapshots {
-                self.send(&mut state, id, snapshot)?;
+                self.send(&mut state, id, snapshot, crate::raw::clock::now_us())?;
             }
             Ok(())
         });
@@ -436,6 +449,10 @@ fn physical_paths() -> anyhow::Result<BTreeMap<PathBuf, Identity>> {
 fn open(path: &Path, id: u64) -> anyhow::Result<Option<Device>> {
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC).open(path).with_context(|| format!("Cannot read {}. Install packaging/linux/70-splice.rules and check device permissions", path.display()))?;
     let input = RawDevice::from_fd(file.into())?;
+    let clock = libc::CLOCK_MONOTONIC;
+    if unsafe { libc::ioctl(input.as_raw_fd(), 0x400445a0u64 as libc::c_ulong, &clock) } < 0 {
+        return Err(io::Error::last_os_error()).context("cannot select monotonic evdev timestamps");
+    }
     if input
         .name()
         .is_some_and(|name| name.starts_with(VIRTUAL_DEVICE_PREFIX))

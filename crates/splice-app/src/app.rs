@@ -693,7 +693,6 @@ impl eframe::App for SpliceApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        self.tray.poll();
         self.tray.sync(&self.ctrl.state());
         while let Ok(action) = self.actions.try_recv() {
             match action {

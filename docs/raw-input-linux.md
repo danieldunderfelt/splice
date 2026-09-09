@@ -12,9 +12,8 @@ Linux-to-Mac control uses Desktop mode.
 3. Allow TCP 41719 on the Tailscale interface. Keep KVM TCP 41717 and updater TCP 41718 available.
 4. Arrange the computers in the workspace.
 5. On the source, choose **Raw input** for the Linux destination.
-6. Enable **Stay on selected computer**.
-7. Cross the arranged screen edge to start capture.
-8. Press **Ctrl+Alt+F12** to cycle through enabled, connected computers in workspace order.
+6. Cross the arranged screen edge to start capture.
+7. Press **Ctrl+Alt+F12** to cycle through enabled, connected computers in workspace order.
    The source computer is included. The configured emergency chord also returns control locally.
 
 A Linux source starts through an edge because Wayland capture must already be active to suppress
@@ -28,7 +27,9 @@ buttons and cross the edge again before retrying. This can happen when a button 
 before Wayland capture started. This presence check preserves compositor button mappings; it cannot
 prove that every simultaneously held physical button has a corresponding compositor report.
 
-Raw mode locks focus because device counts cannot predict where a game puts its pointer.
+Raw mode stays on the selected computer automatically because device counts cannot predict where a
+game puts its pointer. The **Stay on selected computer in Desktop mode** setting only affects Desktop
+sessions; it can remain off when using Raw input.
 Linux starts with Immediate crossing. Dwell and Resistance remain Mac source features.
 
 ## Supported devices and settings

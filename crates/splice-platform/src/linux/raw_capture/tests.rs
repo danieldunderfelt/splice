@@ -101,7 +101,7 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        use evdev::{AttributeSet, BusType, InputId, uinput::VirtualDevice};
+        use evdev::{uinput::VirtualDevice, AttributeSet, BusType, InputId};
         let mut keys = AttributeSet::new();
         for code in [
             KeyCode::KEY_A,
@@ -162,7 +162,6 @@ impl Fixture {
                 next_device: 1,
                 ..Default::default()
             }),
-            origin: Instant::now(),
         });
         Self {
             device: Some(device),
@@ -188,18 +187,41 @@ fn event(kind: evdev::EventType, code: u16, value: i32) -> evdev::InputEvent {
 }
 
 #[tokio::test]
+#[ignore = "requires /dev/uinput; grabs only a generated fixture device"]
+async fn native_evdev_preserves_capture_time_when_reading_is_delayed() {
+    let mut fixture = Fixture::new();
+    fixture.capture.shared.capture_control.activate();
+    let (tx, mut rx) = mpsc::channel(8);
+    fixture.capture.begin(tx, None, Arc::default()).unwrap();
+    let captured_us = crate::raw::clock::now_us() - 100_000;
+    fixture.emit(&[evdev::InputEvent::from(libc::input_event {
+        time: libc::timeval {
+            tv_sec: (captured_us / 1_000_000) as _,
+            tv_usec: (captured_us % 1_000_000) as _,
+        },
+        type_: evdev::EventType::RELATIVE.0,
+        code: Rel::REL_X.0,
+        value: 17,
+    })]);
+    fixture.read(true).unwrap();
+    let captured = rx.try_recv().unwrap();
+    assert_eq!(captured.report.captured_us, captured_us);
+    assert!(captured.enqueued_us - captured_us >= 100_000);
+    assert_eq!(captured.report.events, [RawEvent::Motion { x: 17, y: 0 }]);
+    fixture.capture.end();
+}
+
+#[tokio::test]
 #[ignore = "requires /dev/uinput; only generated fixture devices are grabbed and emit input"]
 async fn native_evdev_counts_snapshots_handoffs_and_failures() {
     use evdev::EventType;
     let mut fixture = Fixture::new();
     assert!(!physical_paths().unwrap().contains_key(&fixture.path));
     let (tx, mut reports) = mpsc::channel(32);
-    assert!(
-        fixture
-            .capture
-            .begin(tx.clone(), None, Arc::default())
-            .is_err()
-    );
+    assert!(fixture
+        .capture
+        .begin(tx.clone(), None, Arc::default())
+        .is_err());
     fixture.emit(&[
         event(EventType::RELATIVE, Rel::REL_X.0, 123),
         event(EventType::KEY, 42, 1),
@@ -208,7 +230,7 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
     fixture.read(false).unwrap();
     fixture.capture.shared.capture_control.activate();
     fixture.capture.begin(tx, Some(1), Arc::default()).unwrap();
-    let snapshot = reports.try_recv().unwrap();
+    let snapshot = reports.try_recv().unwrap().report;
     assert_eq!(snapshot.sequence, 0);
     assert_eq!(
         snapshot.events,
@@ -240,7 +262,7 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
         event(EventType::RELATIVE, Rel::REL_WHEEL_HI_RES.0, 15),
     ]);
     fixture.read(true).unwrap();
-    let report = reports.try_recv().unwrap();
+    let report = reports.try_recv().unwrap().report;
     assert_eq!(report.sequence, 1);
     assert!(report.captured_us >= snapshot.captured_us);
     assert_eq!(
@@ -266,14 +288,12 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
             },
         )));
     fixture.capture.end();
-    assert!(
-        fixture
-            .capture
-            .shared
-            .capture_control
-            .active
-            .load(Ordering::SeqCst)
-    );
+    assert!(fixture
+        .capture
+        .shared
+        .capture_control
+        .active
+        .load(Ordering::SeqCst));
     fixture.emit(&[event(EventType::KEY, 44, 1)]);
     fixture
         .capture
@@ -347,14 +367,12 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
     ));
     assert!(fixture.mock.state.lock().capture_ends.is_empty());
     fixture.capture.end_capture(None).await.unwrap();
-    assert!(
-        !fixture
-            .capture
-            .shared
-            .capture_control
-            .active
-            .load(Ordering::SeqCst)
-    );
+    assert!(!fixture
+        .capture
+        .shared
+        .capture_control
+        .active
+        .load(Ordering::SeqCst));
     assert!(!fixture.capture.state.lock().desktop_snapshot);
     fixture.emit(&[
         event(EventType::KEY, 42, 0),
@@ -378,7 +396,7 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
         .await
         .unwrap();
     assert_eq!(
-        reports.try_recv().unwrap().events,
+        reports.try_recv().unwrap().report.events,
         [RawEvent::Motion { x: 1, y: 0 }]
     );
     assert!(matches!(
@@ -390,14 +408,12 @@ async fn native_evdev_counts_snapshots_handoffs_and_failures() {
         matches!(failure, PlatformEvent::RawCaptureFailed(failed) if Arc::ptr_eq(&failed, &operation))
     );
     assert!(fixture.events.try_recv().is_err());
-    assert!(
-        !fixture
-            .capture
-            .shared
-            .capture_control
-            .active
-            .load(Ordering::SeqCst)
-    );
+    assert!(!fixture
+        .capture
+        .shared
+        .capture_control
+        .active
+        .load(Ordering::SeqCst));
     assert_eq!(fixture.mock.state.lock().capture_ends.len(), 2);
     fixture.device.take();
     assert!(fixture.read(false).is_err());
@@ -436,7 +452,7 @@ fn releasing_one_keyboard_keeps_the_shortcut_suppressed_on_the_other() {
 #[tokio::test]
 #[ignore = "requires /dev/uinput; only generated fixture devices are grabbed and emit input"]
 async fn native_evdev_desktop_handoff_waits_for_wayland_buttons() {
-    use std::future::{Future, poll_fn};
+    use std::future::{poll_fn, Future};
     use std::task::Poll;
 
     let mut fixture = Fixture::new();
@@ -450,13 +466,11 @@ async fn native_evdev_desktop_handoff_waits_for_wayland_buttons() {
         Poll::Ready(())
     })
     .await;
-    assert!(
-        capture
-            .shared
-            .capture_control
-            .raw_hold
-            .load(Ordering::SeqCst)
-    );
+    assert!(capture
+        .shared
+        .capture_control
+        .raw_hold
+        .load(Ordering::SeqCst));
     let emission = capture.shared.emission.lock();
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let callback = {
@@ -487,13 +501,11 @@ async fn native_evdev_desktop_handoff_waits_for_wayland_buttons() {
         }))
     ));
     assert!(fixture.events.try_recv().is_err());
-    assert!(
-        !capture
-            .shared
-            .capture_control
-            .raw_hold
-            .load(Ordering::SeqCst)
-    );
+    assert!(!capture
+        .shared
+        .capture_control
+        .raw_hold
+        .load(Ordering::SeqCst));
 
     capture.prepare().unwrap();
     fixture.emit(&[event(evdev::EventType::KEY, KeyCode::BTN_LEFT.0, 0)]);
@@ -518,21 +530,17 @@ async fn native_evdev_desktop_handoff_waits_for_wayland_buttons() {
     fixture.emit(&[event(evdev::EventType::KEY, KeyCode::BTN_LEFT.0, 1)]);
     let error = capture.begin_capture().await.unwrap_err();
     assert!(error.to_string().contains("within 500 ms"));
-    assert!(
-        capture
-            .shared
-            .capture_control
-            .raw_hold
-            .load(Ordering::SeqCst)
-    );
+    assert!(capture
+        .shared
+        .capture_control
+        .raw_hold
+        .load(Ordering::SeqCst));
     assert!(fixture.events.try_recv().is_err());
     capture.end_capture(None).await.unwrap();
-    assert!(
-        !capture
-            .shared
-            .capture_control
-            .raw_hold
-            .load(Ordering::SeqCst)
-    );
+    assert!(!capture
+        .shared
+        .capture_control
+        .raw_hold
+        .load(Ordering::SeqCst));
     assert!(!capture.shared.capture_control.active.load(Ordering::SeqCst));
 }

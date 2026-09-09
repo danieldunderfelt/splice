@@ -75,13 +75,12 @@ impl Held {
 pub struct RawLedger {
     devices: BTreeMap<u64, BTreeSet<Held>>,
     sequence: u64,
-    captured_us: u64,
 }
 
 impl RawLedger {
     pub fn apply(&mut self, report: &RawReport) -> Result<Vec<RawEvent>, &'static str> {
         report.validate()?;
-        if report.sequence != self.sequence || report.captured_us < self.captured_us {
+        if report.sequence != self.sequence {
             return Err("raw reports arrived out of order");
         }
         if !self.devices.contains_key(&report.device) && self.devices.len() == MAX_DEVICES {
@@ -127,7 +126,6 @@ impl RawLedger {
             }
         }
         self.sequence = next_sequence;
-        self.captured_us = report.captured_us;
         Ok(output)
     }
 
@@ -192,6 +190,22 @@ mod tests {
             ledger.apply(&report(1, 1, vec![motion])).unwrap(),
             vec![motion]
         );
+    }
+
+    #[test]
+    fn native_device_timestamps_do_not_replace_global_sequence_order() {
+        let mut ledger = RawLedger::default();
+        let events = vec![RawEvent::Motion { x: 1, y: -1 }];
+        for (sequence, device, captured_us) in [(0, 1, 2000), (1, 2, 1000), (2, 1, 1500)] {
+            let report = RawReport {
+                sequence,
+                device,
+                captured_us,
+                events: events.clone(),
+            };
+            assert_eq!(ledger.apply(&report).unwrap(), events);
+            assert!(ledger.apply(&report).is_err());
+        }
     }
 
     #[test]

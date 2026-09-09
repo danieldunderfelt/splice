@@ -15,6 +15,7 @@ use splice_proto::MachineId;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 
 use crate::ipc::{self, ClientMessage, ServerMessage};
 use crate::runtime::{self, BootStatus, RETRY_INTERVAL};
@@ -24,6 +25,7 @@ use crate::tray::{self, AppAction};
 const SPAWN_GRACE: Duration = Duration::from_secs(3);
 /// Time given to the engine to release captured input before the process exits.
 const RELEASE_GRACE: Duration = Duration::from_millis(150);
+const CLIENT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 struct Shared {
     state: Arc<RwLock<UiState>>,
@@ -48,7 +50,63 @@ impl Shared {
     }
 }
 
-type WindowRegistry = Arc<Mutex<Vec<mpsc::UnboundedSender<ServerMessage>>>>;
+struct PendingSpawn {
+    at: Instant,
+    token: u64,
+}
+
+struct WindowRegistry {
+    senders: Vec<mpsc::UnboundedSender<ServerMessage>>,
+    pending_spawn: Option<PendingSpawn>,
+    next_token: u64,
+}
+
+impl WindowRegistry {
+    fn register(&mut self, sender: mpsc::UnboundedSender<ServerMessage>) {
+        self.pending_spawn = None;
+        self.senders.push(sender);
+    }
+
+    fn remove(&mut self, sender: &mpsc::UnboundedSender<ServerMessage>) {
+        self.senders.retain(|candidate| !candidate.same_channel(sender));
+    }
+
+    fn focus_live(&mut self) -> bool {
+        let mut focused = false;
+        self.senders.retain(|sender| {
+            if sender.is_closed() {
+                return false;
+            }
+            if !focused {
+                match sender.send(ServerMessage::Focus) {
+                    Ok(()) => focused = true,
+                    Err(_) => return false,
+                }
+            }
+            true
+        });
+        focused
+    }
+
+    fn spawn_pending(&mut self) -> u64 {
+        let token = self.next_token;
+        self.next_token = self.next_token.checked_add(1).expect("window spawn token exhausted");
+        self.pending_spawn = Some(PendingSpawn { at: Instant::now(), token });
+        token
+    }
+
+    fn spawn_pending_recent(&self) -> bool {
+        self.pending_spawn.as_ref().is_some_and(|pending| pending.at.elapsed() < SPAWN_GRACE)
+    }
+
+    fn clear_pending(&mut self, token: u64) {
+        if self.pending_spawn.as_ref().is_some_and(|pending| pending.token == token) {
+            self.pending_spawn = None;
+        }
+    }
+}
+
+type SharedWindowRegistry = Arc<Mutex<WindowRegistry>>;
 
 pub fn run() -> anyhow::Result<()> {
     let path = ipc::socket_path()?;
@@ -92,10 +150,15 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
         version: watch::channel(0).0,
         engine: Mutex::new(None),
     });
-    let windows: WindowRegistry = Arc::new(Mutex::new(Vec::new()));
+    let windows: SharedWindowRegistry = Arc::new(Mutex::new(WindowRegistry {
+        senders: Vec::new(),
+        pending_spawn: None,
+        next_token: 0,
+    }));
     let (actions_tx, mut actions_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (retry_tx, retry_rx) = mpsc::unbounded_channel::<()>();
     tokio::spawn(engine_loop(shared.clone(), retry_rx));
+    let mut clients = JoinSet::new();
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel::<AppAction>();
     let tray = tray::linux::spawn(shared.state.clone(), tray_tx, tokio::runtime::Handle::current());
@@ -104,7 +167,6 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing SIGTERM handler")?;
-    let mut last_spawn: Option<Instant> = None;
     tracing::info!(socket = %path.display(), "splice service running");
     let mut state_version = shared.version.subscribe();
     loop {
@@ -115,15 +177,20 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        tokio::spawn(client(stream, shared.clone(), actions_tx.clone(), windows.clone()));
+                        clients.spawn(client(stream, shared.clone(), actions_tx.clone(), windows.clone()));
                     }
                     Err(err) => tracing::warn!(error = %err, "accept failed"),
+                }
+            }
+            result = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(err)) = result {
+                    tracing::warn!(error = %err, "client task failed");
                 }
             }
             action = actions_rx.recv() => {
                 let Some(action) = action else { break };
                 match action {
-                    ClientMessage::Open => open_window(&windows, &mut last_spawn),
+                    ClientMessage::Open => open_window(&windows),
                     ClientMessage::Quit => break,
                     ClientMessage::Command(cmd) => {
                         match shared.engine.lock().as_ref() {
@@ -142,7 +209,8 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
         }
     }
     tracing::info!("splice service shutting down");
-    for window in windows.lock().iter() {
+    drop(listener);
+    for window in windows.lock().senders.iter() {
         let _ = window.send(ServerMessage::Quit);
     }
     let engine = shared.engine.lock().clone();
@@ -150,7 +218,21 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
         engine.send(Command::Panic);
         tokio::time::sleep(RELEASE_GRACE).await;
     }
+    drain_clients(&mut clients).await;
     Ok(())
+}
+
+async fn drain_clients(clients: &mut JoinSet<()>) {
+    let drain = async {
+        while let Some(result) = clients.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(error = %err, "client task failed");
+            }
+        }
+    };
+    if tokio::time::timeout(CLIENT_DRAIN_GRACE, drain).await.is_err() {
+        clients.abort_all();
+    }
 }
 
 /// Bootstrap the engine, forward its state, and re-bootstrap after failures. A panic
@@ -239,12 +321,12 @@ async fn sync_tray(tray: tray::linux::LinuxTray, shared: Arc<Shared>) {
     }
 }
 
-fn open_window(windows: &WindowRegistry, last_spawn: &mut Option<Instant>) {
-    if let Some(window) = windows.lock().last() {
-        let _ = window.send(ServerMessage::Focus);
+fn open_window(windows: &SharedWindowRegistry) {
+    let mut registry = windows.lock();
+    if registry.focus_live() {
         return;
     }
-    if last_spawn.is_some_and(|at| at.elapsed() < SPAWN_GRACE) {
+    if registry.spawn_pending_recent() {
         return;
     }
     let exe = match std::env::current_exe() {
@@ -262,9 +344,11 @@ fn open_window(windows: &WindowRegistry, last_spawn: &mut Option<Instant>) {
         .spawn()
     {
         Ok(mut child) => {
-            *last_spawn = Some(Instant::now());
+            let token = registry.spawn_pending();
+            let windows = windows.clone();
             std::thread::spawn(move || {
                 let _ = child.wait();
+                windows.lock().clear_pending(token);
             });
         }
         Err(err) => tracing::warn!(error = %err, "cannot spawn splice window"),
@@ -275,7 +359,7 @@ async fn client(
     stream: UnixStream,
     shared: Arc<Shared>,
     actions: mpsc::UnboundedSender<ClientMessage>,
-    windows: WindowRegistry,
+    windows: SharedWindowRegistry,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -290,7 +374,7 @@ async fn client(
                     Ok(ClientMessage::Hello { window }) => {
                         if window && !is_window {
                             is_window = true;
-                            windows.lock().push(out_tx.clone());
+                            windows.lock().register(out_tx.clone());
                             if write(&mut writer, &shared.snapshot()).await.is_err() {
                                 break;
                             }
@@ -309,14 +393,18 @@ async fn client(
             }
             message = out_rx.recv() => {
                 let Some(message) = message else { break };
+                let quit = matches!(message, ServerMessage::Quit);
                 if write(&mut writer, &message).await.is_err() {
+                    break;
+                }
+                if quit {
                     break;
                 }
             }
         }
     }
     if is_window {
-        windows.lock().retain(|sender| !sender.same_channel(&out_tx));
+        windows.lock().remove(&out_tx);
     }
 }
 
@@ -330,6 +418,54 @@ async fn write(writer: &mut tokio::net::unix::OwnedWriteHalf, message: &ServerMe
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn window_client_receives_quit_and_finishes_before_socket_closes() {
+        let shared = Arc::new(Shared {
+            state: Arc::new(RwLock::new(UiState::initial(MachineId("self".into())))),
+            status: Mutex::new(BootStatus::Starting),
+            tray: AtomicBool::new(false),
+            version: watch::channel(0).0,
+            engine: Mutex::new(None),
+        });
+        assert!(shared.engine.lock().is_none());
+        let windows: SharedWindowRegistry = Arc::new(Mutex::new(WindowRegistry {
+            senders: Vec::new(),
+            pending_spawn: None,
+            next_token: 0,
+        }));
+        let (actions_tx, _actions_rx) = mpsc::unbounded_channel();
+        let (stream, remote) = UnixStream::pair().unwrap();
+        let (remote_reader, mut remote_writer) = remote.into_split();
+        let mut lines = BufReader::new(remote_reader).lines();
+        let mut clients = JoinSet::new();
+        clients.spawn(client(stream, shared, actions_tx, windows.clone()));
+
+        let mut hello = serde_json::to_vec(&ClientMessage::Hello { window: true }).unwrap();
+        hello.push(b'\n');
+        remote_writer.write_all(&hello).await.unwrap();
+
+        let initial = tokio::time::timeout(CLIENT_DRAIN_GRACE, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(serde_json::from_str::<ServerMessage>(&initial).unwrap(), ServerMessage::Snapshot { .. }));
+
+        for sender in windows.lock().senders.iter() {
+            sender.send(ServerMessage::Quit).unwrap();
+        }
+        drain_clients(&mut clients).await;
+        assert!(clients.is_empty());
+        assert!(windows.lock().senders.is_empty());
+
+        let quit = tokio::time::timeout(CLIENT_DRAIN_GRACE, lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(serde_json::from_str::<ServerMessage>(&quit).unwrap(), ServerMessage::Quit));
+    }
+
     #[test]
     fn only_one_service_can_own_the_socket_at_a_time() {
         let path = std::env::temp_dir().join(format!("splice-service-lock-{}", std::process::id()));
@@ -339,5 +475,59 @@ mod tests {
         let next = acquire_service_lock(&path).unwrap().unwrap();
         drop(next);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn closed_window_can_be_reopened_before_spawn_grace_expires() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut registry = WindowRegistry {
+            senders: Vec::new(),
+            pending_spawn: None,
+            next_token: 0,
+        };
+        registry.spawn_pending();
+        registry.register(sender);
+        assert!(registry.pending_spawn.is_none());
+        drop(receiver);
+        assert!(!registry.focus_live());
+        assert!(registry.senders.is_empty());
+        assert!(!registry.spawn_pending_recent());
+    }
+
+    #[test]
+    fn simultaneous_opens_deduplicate_pending_spawn() {
+        let mut registry = WindowRegistry {
+            senders: Vec::new(),
+            pending_spawn: None,
+            next_token: 0,
+        };
+        registry.spawn_pending();
+        assert!(registry.spawn_pending_recent());
+    }
+
+    #[test]
+    fn dead_sender_does_not_swallow_open_request() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut registry = WindowRegistry {
+            senders: vec![sender],
+            pending_spawn: None,
+            next_token: 0,
+        };
+        drop(receiver);
+        assert!(!registry.focus_live());
+        assert!(!registry.spawn_pending_recent());
+    }
+
+    #[test]
+    fn old_child_exit_cannot_clear_new_pending_spawn() {
+        let mut registry = WindowRegistry {
+            senders: Vec::new(),
+            pending_spawn: None,
+            next_token: 0,
+        };
+        let old = registry.spawn_pending();
+        let new = registry.spawn_pending();
+        registry.clear_pending(old);
+        assert_eq!(registry.pending_spawn.as_ref().map(|pending| pending.token), Some(new));
     }
 }

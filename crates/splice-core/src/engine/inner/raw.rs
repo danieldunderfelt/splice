@@ -80,7 +80,6 @@ impl Inner {
                     && self.machine_enabled(&target),
                 "destination is not available"
             );
-            anyhow::ensure!(self.raw.settings.focus_lock, "Raw input requires Focus lock: automatic destination edge observations are not available on this release. Use Ctrl+Alt+F12 to switch computers.");
             anyhow::ensure!(
                 self.peers
                     .get(&target)
@@ -619,6 +618,7 @@ mod tests {
                         pressed: true,
                     }],
                 },
+                splice_platform::raw::clock::now_us(),
             )
             .unwrap();
         inner

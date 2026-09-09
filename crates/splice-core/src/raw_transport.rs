@@ -1,7 +1,7 @@
 use crate::net::TsApi;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use splice_platform::raw::RawEmulate;
+use splice_platform::raw::{clock::now_us, diagnostics::Diagnostics, CapturedReport, RawEmulate};
 use splice_proto::{raw::RawReport, MachineId};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -18,13 +18,25 @@ const IO_TIMEOUT: Duration = Duration::from_millis(750);
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PACKET: usize = 32768;
 pub const RAW_PORT: u16 = 41719;
+#[path = "raw_transport/timing.rs"]
+mod timing;
 
 #[derive(Serialize, Deserialize)]
 enum Packet {
-    Open { session: u64, ticket: [u8; 32] },
+    Open {
+        session: u64,
+        ticket: [u8; 32],
+    },
     Accepted,
-    Report { session: u64, report: RawReport },
-    Ping(u64),
+    Report {
+        session: u64,
+        sent_us: u64,
+        report: RawReport,
+    },
+    Ping {
+        tick: u64,
+        sent_us: u64,
+    },
     Pong(u64),
 }
 
@@ -133,6 +145,9 @@ impl Reservation {
             .await
             .context("raw source did not connect before preparation expired")??;
         drop(self.listener);
+        let mut clock = timing::ClockMap::default();
+        let mut diagnostics = Diagnostics::new("receive");
+        let mut last_receive = None;
         loop {
             match tokio::time::timeout(IO_TIMEOUT, read(&mut stream))
                 .await
@@ -140,12 +155,39 @@ impl Reservation {
             {
                 Packet::Report {
                     session: offered,
+                    sent_us,
                     report,
                 } => {
                     ensure!(offered == session, "raw report belongs to another session");
-                    target.inject(session, &report)?;
+                    ensure!(
+                        report.captured_us > 0 && report.captured_us <= sent_us,
+                        "invalid raw capture timestamp"
+                    );
+                    let received_us = now_us();
+                    clock.observe(sent_us, received_us);
+                    let captured_local_us = clock.map(report.captured_us);
+                    ensure!(
+                        received_us.saturating_sub(captured_local_us)
+                            < IO_TIMEOUT.as_micros() as u64,
+                        "raw input exceeded the 750 ms delivery age limit; input released"
+                    );
+                    diagnostics.record("transit_above_floor", received_us - clock.map(sent_us));
+                    diagnostics.record(
+                        "mapped_capture_age",
+                        received_us.saturating_sub(captured_local_us),
+                    );
+                    if let Some(last) = last_receive {
+                        diagnostics.record("receive_gap", received_us.saturating_sub(last));
+                    }
+                    last_receive = Some(received_us);
+                    let inject_us = now_us();
+                    diagnostics.record("receive_to_inject", inject_us - received_us);
+                    target.inject(session, &report, captured_local_us)?;
+                    diagnostics.record("inject_duration", now_us() - inject_us);
+                    diagnostics.flush_if_due(received_us);
                 }
-                Packet::Ping(tick) => {
+                Packet::Ping { tick, sent_us } => {
+                    clock.observe(sent_us, now_us());
                     write(&mut stream, &Packet::Pong(tick)).await?;
                 }
                 _ => bail!("unexpected raw input packet"),
@@ -195,6 +237,22 @@ pub async fn connect(
             matches!(read(&mut stream).await?, Packet::Accepted),
             "raw destination did not accept the session"
         );
+        for tick in 0..4 {
+            write(
+                &mut stream,
+                &Packet::Ping {
+                    tick,
+                    sent_us: now_us(),
+                },
+            )
+            .await?;
+        }
+        for tick in 0..4 {
+            ensure!(
+                matches!(read(&mut stream).await?, Packet::Pong(received) if received == tick),
+                "raw destination did not acknowledge clock samples"
+            );
+        }
         Ok(stream)
     })
     .await
@@ -204,7 +262,7 @@ pub async fn connect(
 pub async fn send(
     stream: TcpStream,
     session: u64,
-    mut reports: mpsc::Receiver<RawReport>,
+    mut reports: mpsc::Receiver<CapturedReport>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (pong_tx, mut pong_rx) = mpsc::channel(4);
@@ -220,6 +278,8 @@ pub async fn send(
         }
     };
     let write_reports = async {
+        let mut diagnostics = Diagnostics::new("send");
+        let mut pending_pings = std::collections::BTreeMap::new();
         let mut heartbeat = tokio::time::interval(Duration::from_millis(200));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut next_ping = 0;
@@ -229,18 +289,31 @@ pub async fn send(
             tokio::select! {
                 report = reports.recv() => {
                     let Some(report) = report else { return Ok(()); };
+                    let CapturedReport { report, enqueued_us } = report;
                     report.validate().map_err(|e| anyhow!(e))?;
-                    write(&mut writer, &Packet::Report { session, report }).await?;
+                    let sent_us = now_us();
+                    ensure!(report.captured_us > 0 && report.captured_us <= enqueued_us && enqueued_us <= sent_us, "invalid raw source timestamps");
+                    ensure!(sent_us - report.captured_us < IO_TIMEOUT.as_micros() as u64, "raw source exceeded the 750 ms capture age limit; input released");
+                    diagnostics.record("capture_to_enqueue", enqueued_us - report.captured_us);
+                    diagnostics.record("source_queue", sent_us - enqueued_us);
+                    write(&mut writer, &Packet::Report { session, sent_us, report }).await?;
+                    diagnostics.record("socket_write", now_us() - sent_us);
+                    diagnostics.flush_if_due(sent_us);
                 }
                 pong = pong_rx.recv() => {
                     let tick = pong.ok_or_else(|| anyhow!("raw acknowledgement channel closed"))?;
                     ensure!(tick < next_ping && last_pong_tick.is_none_or(|last| tick > last), "invalid raw acknowledgement");
                     last_pong_tick = Some(tick);
                     last_pong = tokio::time::Instant::now();
+                    let sent_us = pending_pings.remove(&tick).ok_or_else(|| anyhow!("unknown raw heartbeat"))?;
+                    diagnostics.record("heartbeat_rtt", now_us() - sent_us);
                 }
                 _ = heartbeat.tick() => {
                     ensure!(last_pong.elapsed() < IO_TIMEOUT, "raw destination stopped acknowledging input");
-                    write(&mut writer, &Packet::Ping(next_ping)).await?;
+                    let sent_us = now_us();
+                    pending_pings.insert(next_ping, sent_us);
+                    write(&mut writer, &Packet::Ping { tick: next_ping, sent_us }).await?;
+                    diagnostics.flush_if_due(sent_us);
                     next_ping = next_ping.checked_add(1).ok_or_else(|| anyhow!("raw heartbeat sequence exhausted"))?;
                 }
             }
@@ -380,16 +453,31 @@ pub(crate) mod tests {
         let report = RawReport {
             device: 1,
             sequence: 0,
-            captured_us: 0,
+            captured_us: now_us(),
             events: vec![RawEvent::Key {
                 code: 30,
                 pressed: true,
             }],
         };
-        write(&mut stream, &Packet::Report { session: 1, report })
-            .await
-            .unwrap();
-        write(&mut stream, &Packet::Ping(0)).await.unwrap();
+        write(
+            &mut stream,
+            &Packet::Report {
+                session: 1,
+                sent_us: now_us(),
+                report,
+            },
+        )
+        .await
+        .unwrap();
+        write(
+            &mut stream,
+            &Packet::Ping {
+                tick: 0,
+                sent_us: now_us(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(read(&mut stream).await.unwrap(), Packet::Pong(0)));
         assert_eq!(handle.state.lock().raw_reports.len(), 1);
         drop(stream);
@@ -453,5 +541,194 @@ pub(crate) mod tests {
             let mut input = bytes.as_slice();
             assert!(read(&mut input).await.is_err());
         }
+    }
+
+    struct StalledTarget {
+        inner: Arc<dyn RawEmulate>,
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_expired_reports_and_releases_previously_held_input() {
+        let (platform, handle) =
+            splice_platform::mock::create(splice_platform::mock::one_display());
+        let target = platform.raw_emulate.unwrap();
+        target.prepare().await.unwrap();
+        target.begin(1).unwrap();
+        let reservation = Reservation::bind("127.0.0.2".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = SocketAddr::new("127.0.0.2".parse().unwrap(), reservation.port);
+        let ticket = reservation.ticket;
+        let receiver = tokio::spawn(reservation.receive(
+            MachineId("a".into()),
+            "127.0.0.1".parse().unwrap(),
+            1,
+            Arc::new(Identity("b")),
+            target,
+        ));
+        let mut stream = connect(
+            "127.0.0.1".parse().unwrap(),
+            addr,
+            1,
+            ticket,
+            Arc::new(Identity("a")),
+            &MachineId("b".into()),
+        )
+        .await
+        .unwrap();
+        let report = RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: now_us(),
+            events: vec![RawEvent::Key {
+                code: 42,
+                pressed: true,
+            }],
+        };
+        write(
+            &mut stream,
+            &Packet::Report {
+                session: 1,
+                sent_us: now_us(),
+                report,
+            },
+        )
+        .await
+        .unwrap();
+        write(
+            &mut stream,
+            &Packet::Ping {
+                tick: 0,
+                sent_us: now_us(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(read(&mut stream).await.unwrap(), Packet::Pong(0)));
+        let report = RawReport {
+            device: 1,
+            sequence: 1,
+            captured_us: now_us() - 800_000,
+            events: vec![RawEvent::Key {
+                code: 30,
+                pressed: true,
+            }],
+        };
+        write(
+            &mut stream,
+            &Packet::Report {
+                session: 1,
+                sent_us: now_us(),
+                report,
+            },
+        )
+        .await
+        .unwrap();
+        let error = receiver.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("750 ms delivery age"), "{error}");
+        let state = handle.state.lock();
+        assert!(state.raw_session.is_none());
+        assert_eq!(state.raw_reports.len(), 1);
+        assert_eq!(
+            state.raw_events,
+            [
+                RawEvent::Key {
+                    code: 42,
+                    pressed: true
+                },
+                RawEvent::Key {
+                    code: 42,
+                    pressed: false
+                }
+            ]
+        );
+    }
+
+    #[async_trait::async_trait]
+    impl RawEmulate for StalledTarget {
+        async fn prepare(&self) -> splice_platform::Result<()> {
+            self.inner.prepare().await
+        }
+        fn begin(&self, session: u64) -> splice_platform::Result<()> {
+            self.inner.begin(session)
+        }
+        fn end(&self, session: u64) -> splice_platform::Result<()> {
+            self.inner.end(session)
+        }
+        fn inject(
+            &self,
+            session: u64,
+            report: &RawReport,
+            timestamp: u64,
+        ) -> splice_platform::Result<()> {
+            if report.sequence == 1 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            self.inner.inject(session, report, timestamp)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_report_spacing_survives_a_receiver_stall_without_paced_replay() {
+        let (platform, handle) =
+            splice_platform::mock::create(splice_platform::mock::one_display());
+        let target = Arc::new(StalledTarget {
+            inner: platform.raw_emulate.unwrap(),
+        });
+        target.prepare().await.unwrap();
+        target.begin(1).unwrap();
+        let reservation = Reservation::bind("127.0.0.2".parse().unwrap())
+            .await
+            .unwrap();
+        let address = SocketAddr::new("127.0.0.2".parse().unwrap(), reservation.port);
+        let ticket = reservation.ticket;
+        let receive = tokio::spawn(reservation.receive(
+            MachineId("a".into()),
+            "127.0.0.1".parse().unwrap(),
+            1,
+            Arc::new(Identity("b")),
+            target,
+        ));
+        let stream = connect(
+            "127.0.0.1".parse().unwrap(),
+            address,
+            1,
+            ticket,
+            Arc::new(Identity("a")),
+            &MachineId("b".into()),
+        )
+        .await
+        .unwrap();
+        let (tx, rx) = mpsc::channel(128);
+        let send = tokio::spawn(send(stream, 1, rx));
+        let source = std::thread::spawn(move || {
+            for sequence in 0..50 {
+                let report = RawReport {
+                    device: 1,
+                    sequence,
+                    captured_us: now_us(),
+                    events: vec![RawEvent::Motion { x: 1, y: -1 }],
+                };
+                tx.blocking_send(report.into()).unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        tokio::task::spawn_blocking(move || source.join().unwrap())
+            .await
+            .unwrap();
+        send.await.unwrap().unwrap();
+        assert!(receive.await.unwrap().is_err());
+        let state = handle.state.lock();
+        assert_eq!(state.raw_reports.len(), 50);
+        assert_eq!(state.raw_events.len(), 50);
+        let native_span = state.raw_reports[49].captured_us - state.raw_reports[2].captured_us;
+        let mapped_span = state.raw_timestamps[49] - state.raw_timestamps[2];
+        assert!(native_span >= 40_000);
+        assert!(
+            native_span.abs_diff(mapped_span) < 5000,
+            "native {native_span} mapped {mapped_span}"
+        );
+        assert!(state.raw_timestamps.iter().all(|stamp| *stamp <= now_us()));
+        assert!(state.raw_session.is_none());
     }
 }

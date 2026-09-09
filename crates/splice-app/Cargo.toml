@@ -58,6 +58,11 @@ assets = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tray-icon = { workspace = true }
+block2 = "0.6"
 objc2 = { workspace = true }
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
+
+[[test]]
+name = "macos_tray"
+harness = false

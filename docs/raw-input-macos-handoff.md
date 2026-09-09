@@ -1,9 +1,11 @@
 # Build and validate raw input on macOS
 
-Continue physical acceptance testing of Splice 1.2.0, KVM protocol 4. The native Mac implementation,
+Continue physical acceptance testing of Splice 1.2.0, KVM protocol 5. The native Mac implementation,
 builds, signing, descriptor fixtures, and screen-edge indicator checks are recorded in
-[Mac validation](raw-input-macos-validation.md). A Developer ID signed test app has been installed at
-`/Applications/Splice.app`; no release was published. Do not call raw mode ready for gaming until the
+[Mac validation](raw-input-macos-validation.md). The earlier signed test app was installed at
+`/Applications/Splice.app`. The protocol 5 timing repair is built separately; see
+[timing validation](raw-input-timing-validation.md) for its installation status. No release was
+published. Do not call raw mode ready for gaming until the
 physical-device and game checks below pass.
 
 Keep Desktop mode fully supported. Do not substitute Desktop input when Raw fails. The repository
@@ -23,8 +25,9 @@ also prohibits adding code comments. Read [the design](raw-input-design.md),
 | Crossing | Immediate, Dwell, Resistance on Mac sources; current Desktop return and onward crossings share the gesture policy |
 | Diagnostics | Input settings, active/preparing state, progress, and errors are included in the existing exported UiState |
 
-Raw mode requires the user to select **Stay on selected computer**. There is no destination
-edge observer in this implementation. Raw counts never predict Linux pointer coordinates.
+Raw mode stays on the selected computer automatically. The Desktop focus setting can remain off.
+Use Ctrl+Alt+F12 or the Control buttons to switch during Raw input. There is no destination edge
+observer in this implementation. Raw counts never predict Linux pointer coordinates.
 Linux source edges continue using Immediate crossing. The Splice panel and a native Mac panel beside
 the physical screen edge show gesture progress. The native panel works without the app window open.
 
@@ -35,9 +38,10 @@ clears the affected device error so the user can retry. Invalid descriptors and 
 scaling still prevent activation. Vendor-defined usages are ignored because vendor commands,
 firmware, RGB, and arbitrary USB passthrough are outside the standard-input contract.
 
-Source timestamps are monotonic callback enqueue times. They are not hardware timestamps or
-one-way latency. The existing peer traffic counters describe the control/Desktop connection;
-they do not measure the raw socket. Do not use those counters to claim raw report latency.
+Source timestamps now preserve native IOHID report-arrival times. Enqueue and send use the same
+Mach clock domain. Aggregate raw timing logs cover the input connection separately from the
+control/Desktop counters. Mapped age is an estimate with an unknown transit floor, not one-way
+latency. See [timing validation](raw-input-timing-validation.md).
 
 ## Locate the code
 
@@ -62,6 +66,17 @@ It bounds descriptor expansion before entering the parser, reads wheel multiplie
 and rejects conflicting multipliers whose collection identities the parser cannot distinguish.
 Add captured descriptors as portable regression fixtures when a device exposes a decoder bug.
 
+HID discovery uses one matching dictionary containing `DeviceUsagePairs`. Separate overlapping
+matching dictionaries create multiple subscriptions to a composite device on macOS. Verify native
+service uniqueness without capturing input:
+
+```sh
+cargo test -p splice-platform --lib --locked native_hid_discovery_subscribes_once_per_service -- --ignored --nocapture
+```
+
+This check requires an attached composite HID device and fails if two device objects reference the
+same IORegistry service. It does not depend on permission to read physical reports.
+
 ## Build on the Mac
 
 1. Transfer the complete working changes to the Mac. Check `git status --short`, including untracked
@@ -85,13 +100,14 @@ cargo build -p splice-app --release --locked
 ./target/release/splice --version-json
 ```
 
-The reported version must be 1.2.0 and protocol 4. A dirty source checkout must report itself as dirty.
+The reported version must be 1.2.0 and protocol 5. A dirty source checkout must report itself as dirty.
 Linux cross-checks of the platform crate do not replace this native build and link step.
 
-4. Build the app with the user's stable Developer ID identity:
+4. Build the app with the signing identity used by the current installation. Inspect it with
+   `codesign -dvv /Applications/Splice.app` before rebuilding:
 
 ```sh
-export SPLICE_CODESIGN_IDENTITY='Developer ID Application: YOUR NAME (TEAMID)'
+export SPLICE_CODESIGN_IDENTITY='YOUR EXISTING SIGNING IDENTITY'
 packaging/macos/make-app.sh --no-build
 codesign --verify --deep --strict build/Splice.app
 ```
@@ -103,10 +119,10 @@ identities between tests. Follow [release signing and notarization](releasing.md
 5. Quit the running Mac instance, install the test bundle at its normal stable path, and launch it.
    Grant Accessibility and Input Monitoring to that installed bundle, then restart it. Keep the
    working release available for restoration. Do not run two Splice instances during capture checks.
-6. Build/install protocol 4 on both Linux destinations. Verify `/dev/uinput` access using
+6. Build/install protocol 5 on both Linux destinations. Verify `/dev/uinput` access using
    [Linux setup](linux-setup.md). Allow TCP 41717, 41718, and 41719 on the Tailscale interface.
-7. On the Mac, select Raw for one Linux destination, select **Stay on selected computer**, and click
-   its **Control** button. Preparation must finish before the Mac begins suppressing local input.
+7. On the Mac, select Raw for one Linux destination and click its **Control** button, or cross its
+   arranged screen edge. Preparation must finish before the Mac begins suppressing local input.
 
 ## Prove capture and suppression first
 
@@ -134,9 +150,9 @@ connection type, polling rate, DPI, OS versions, build identity, and network pat
    wake/reconnect before claiming Bluetooth support on tested hardware.
 
 Inspect callback scheduling, event-tap timeout handling, and device lifetime against the native SDK.
-Consider `IOHIDManagerRegisterInputReportWithTimeStampCallback` for hardware timestamps if supported
-on the deployment target. Keep clocks explicit. Add a bounded capture trace or native test harness
-when needed; do not log keystrokes or clipboard contents in ordinary diagnostics.
+The implementation uses `IOHIDManagerRegisterInputReportWithTimeStampCallback`, available since
+macOS 10.15. Native callback timing and the Linux output path have regression coverage. Keep
+clocks explicit and do not log keystrokes or clipboard contents in ordinary diagnostics.
 
 ## Exercise recovery and the gesture UI
 

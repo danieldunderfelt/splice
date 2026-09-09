@@ -142,7 +142,6 @@ pub struct ClipboardOffer {
 #[derive(Clone, Debug)]
 pub enum PlatformEvent {
     SwitchTarget,
-    RawError(String),
     RawCaptureFailed(Arc<raw::RawOperation>),
     Capture(CaptureEvent),
     /// Physical (non-injected) local input observed → engine may claim sourceness.

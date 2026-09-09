@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTO_VERSION: u16 = 4;
+pub const PROTO_VERSION: u16 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {

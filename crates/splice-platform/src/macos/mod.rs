@@ -116,6 +116,7 @@ pub fn ax_trusted(prompt: bool) -> bool {
 
 struct MacCapture {
     state: Arc<tap::TapState>,
+    _displays: displays::Registration,
 }
 
 #[async_trait::async_trait]
@@ -126,8 +127,7 @@ impl Capture for MacCapture {
     }
 
     async fn begin_capture(&self) -> Result<()> {
-        self.state.begin();
-        Ok(())
+        self.state.begin()
     }
 
     async fn end_capture(&self, warp_to: Option<Vec2>) -> Result<()> {
@@ -161,7 +161,8 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     }
     shared.set_health(|h| h.secure_input = secure_input_status());
 
-    displays::register(shared.clone());
+    let display_registration = displays::register(shared.clone())?;
+    let emulate = Arc::new(inject::Injector::new(shared.clone())?);
 
     let tap_state = tap::TapState::new(shared.clone(), opts.panic_chord);
     tap::spawn(tap_state.clone());
@@ -169,22 +170,24 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     // Corners depend on the display list; keep them fresh alongside DisplaysChanged.
     {
         let tap_state = tap_state.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(5));
             loop {
-                ticker.tick().await;
-                tap_state.refresh_corners();
+                tokio::select! {
+                    _ = shared.tx.closed() => break,
+                    _ = ticker.tick() => tap_state.refresh_corners(),
+                }
             }
         });
     }
 
-    let emulate = Arc::new(inject::Injector::new(shared.clone())?);
     let clipboard = Arc::new(pasteboard::PasteboardClip::new(shared.clone()));
 
     Ok(Platform {
         raw_capture: Some(raw::HidCapture::spawn(shared.clone(), tap_state.clone())),
         raw_emulate: None,
-        capture: Arc::new(MacCapture { state: tap_state }),
+        capture: Arc::new(MacCapture { state: tap_state, _displays: display_registration }),
         emulate,
         clipboard,
         displays,

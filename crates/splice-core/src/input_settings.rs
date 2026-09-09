@@ -72,7 +72,7 @@ impl InputSettings {
                 let mut settings = Self::default();
                 if edge_dwell_ms != 0 {
                     settings.crossing = CrossingPolicy::Dwell {
-                        milliseconds: edge_dwell_ms,
+                        milliseconds: edge_dwell_ms.clamp(50, 5000),
                     };
                 }
                 settings.validate()?;
@@ -97,6 +97,7 @@ impl InputSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{self, Config};
 
     #[test]
     fn settings_round_trip_and_reject_bad_input_without_overwriting_it() {
@@ -124,5 +125,45 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn legacy_config_dwell_migrates_into_supported_settings() {
+        for (legacy_dwell, expected) in [
+            (25, CrossingPolicy::Dwell { milliseconds: 50 }),
+            (5001, CrossingPolicy::Dwell { milliseconds: 5000 }),
+            (0, CrossingPolicy::Immediate),
+            (250, CrossingPolicy::Dwell { milliseconds: 250 }),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                edge_dwell_ms: legacy_dwell,
+                ..Config::default()
+            };
+            config::save(dir.path(), &config).unwrap();
+            let legacy = config::load(dir.path()).unwrap();
+            let settings = InputSettings::load(dir.path(), legacy.edge_dwell_ms).unwrap();
+            assert_eq!(settings.crossing, expected);
+        }
+    }
+
+    #[test]
+    fn existing_input_settings_take_precedence_over_legacy_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            edge_dwell_ms: 25,
+            ..Config::default()
+        };
+        config::save(dir.path(), &config).unwrap();
+        let expected = InputSettings {
+            crossing: CrossingPolicy::Dwell { milliseconds: 500 },
+            ..InputSettings::default()
+        };
+        expected.save(dir.path()).unwrap();
+        let legacy = config::load(dir.path()).unwrap();
+        assert_eq!(
+            InputSettings::load(dir.path(), legacy.edge_dwell_ms).unwrap(),
+            expected
+        );
     }
 }

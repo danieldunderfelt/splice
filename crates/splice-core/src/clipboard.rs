@@ -1,4 +1,5 @@
 use crate::net::NetControl;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use splice_platform::ClipFetch;
 use splice_proto::{Frame, MachineId, CLIP_MAX_TOTAL};
@@ -11,6 +12,87 @@ use tokio::sync::oneshot;
 pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 64;
 const MAX_BUFFERED: usize = 64 * 1024 * 1024;
+
+#[derive(Clone)]
+struct PendingOffer {
+    origin: MachineId,
+    offer: splice_platform::ClipboardOffer,
+    fetch: Arc<dyn ClipFetch>,
+}
+
+pub(crate) struct Offers {
+    pending: tokio::sync::watch::Sender<Option<PendingOffer>>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Offers {
+    pub fn new(clipboard: Arc<dyn splice_platform::Clipboard>) -> Self {
+        let (pending, mut updates) = tokio::sync::watch::channel::<Option<PendingOffer>>(None);
+        let worker = tokio::spawn(async move {
+            loop {
+                let pending = updates.borrow_and_update().clone();
+                if let Some(pending) = pending {
+                    tokio::select! {
+                        biased;
+                        changed = updates.changed() => {
+                            if changed.is_err() { break; }
+                            continue;
+                        }
+                        result = tokio::time::timeout(FETCH_TIMEOUT, std::panic::AssertUnwindSafe(clipboard.set_remote_offer(pending.offer, pending.fetch)).catch_unwind()) => {
+                            match result {
+                                Ok(Ok(Ok(()))) => {}
+                                Ok(Ok(Err(error))) => tracing::warn!(%error, "cannot apply remote clipboard offer"),
+                                Ok(Err(_)) => tracing::error!("clipboard backend panicked while applying a remote offer"),
+                                Err(_) => tracing::warn!("applying remote clipboard offer timed out"),
+                            }
+                        }
+                    }
+                }
+                if updates.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self { pending, worker }
+    }
+
+    pub fn set(
+        &self,
+        origin: MachineId,
+        offer: splice_platform::ClipboardOffer,
+        fetch: Arc<dyn ClipFetch>,
+    ) {
+        self.pending.send_replace(Some(PendingOffer {
+            origin,
+            offer,
+            fetch,
+        }));
+    }
+
+    pub fn clear(&self) {
+        self.pending.send_replace(None);
+    }
+
+    pub fn disconnect(&self, origin: &MachineId) {
+        self.pending.send_if_modified(|pending| {
+            if pending
+                .as_ref()
+                .is_some_and(|offer| &offer.origin == origin)
+            {
+                *pending = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+impl Drop for Offers {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
 
 type FetchKey = (MachineId, u64);
 

@@ -89,7 +89,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
     avoid hot-corner fights (default 16 px).
-12. **One current protocol.** Every client runs protocol 4 and advertises all required capabilities.
+12. **One current protocol.** Every client runs protocol 5 and advertises all required capabilities.
     A mismatch rejects the connection with an upgrade message. There is no compatibility mode.
 13. **Keep the target awake**: injection declares user activity; while a session is entered the
     target takes a display-sleep inhibition (macOS IOPMAssertion; Linux D-Bus
@@ -100,6 +100,9 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     Data is fetched over TCP only when an app actually pastes. Size cap 16 MiB, chunked 16 KiB.
     Text ≤ 64 KiB is inlined in the offer (`ClipOffer.inline_text`) so cross-machine paste of
     small text works even if the origin goes offline.
+    Installing an offer runs in one cancellable worker with a five-second deadline; input
+    processing never awaits it. Newer offers replace pending ones. Local copy, disconnect,
+    disabling sync and engine shutdown cancel obsolete work.
     On Linux the Clipboard portal is attached to the **RemoteDesktop** session (works on GNOME
     46+ and KDE ≥6.4 today) — NOT the InputCapture session (that path needs GNOME 51+ and is
     "active-only"). macOS: poll `changeCount` at 500 ms; use `detectPatterns`/`detectMetadata`
@@ -218,7 +221,7 @@ Every rule below closes a verified way for the cursor to end up captured with no
 
 ## Wire protocol (splice-proto)
 
-Length-prefixed `u32` big-endian, max 1 MiB, postcard-encoded `Frame`. Protocol version 2.
+Length-prefixed `u32` big-endian, max 1 MiB, postcard-encoded `Frame`. Protocol version 5.
 The dialer sends `Hello`, the listener returns `Welcome`, and the dialer confirms with `Ready`.
 The listener publishes a connected peer only after receiving `Ready`. The dialer already has
 bidirectional application traffic when it receives `Welcome`. Handshakes expire after five seconds.
@@ -266,8 +269,8 @@ Trait contracts live in `splice-platform/src/lib.rs` (authoritative). Implementa
   (Chromium-derived tables, MIT; what lan-mouse ships). Wrap it in `keymap.rs` with our own
   tests over the full modifier/nav/function set. Known quirks to handle: arrow keys on macOS
   must carry `CGEventFlagNumericPad|SecondaryFn` flags when injected; Caps Lock lock-state
-  cannot be toggled via CGEventPost (needs IOKit `IOHIDSetModifierLockState`) — v1 policy:
-  do not forward CapsLock as a toggle, forward lock *state* only.
+  cannot be toggled via CGEventPost. Desktop capture leaves Caps Lock local and never
+  replays it as a held press. Raw HID capture forwards physical Caps Lock edges separately.
 
 ## UI (crates/splice-app)
 
@@ -354,6 +357,7 @@ the control owner's Tailscale identity, address, session number, and a random si
 Local operation identities distinguish async completions even when a peer restarts and reuses a
 wire session number. Disconnect, timeout, bad reports, and capture errors release held state.
 
-Raw mode requires explicit focus lock until destination edge observations are implemented.
-The source chooses input mode per destination. Crossing policy and focus lock are separate local
-settings in input.json. The shared gesture state consumes the outward movement used for crossing.
+Raw mode stays on the selected computer automatically until destination edge observations are
+implemented. The source chooses input mode per destination. Crossing policy and Desktop focus lock
+are separate local settings in input.json; Raw activation does not require or change the Desktop
+focus setting. The shared gesture state consumes the outward movement used for crossing.

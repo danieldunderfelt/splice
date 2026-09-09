@@ -111,7 +111,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             }
         }
         changed |= ui
-            .checkbox(&mut settings.focus_lock, "Stay on selected computer")
+            .checkbox(&mut settings.focus_lock, "Stay on selected computer in Desktop mode")
             .changed();
         ui.label(RichText::new("Ctrl+Alt+F12 switches computers in workspace order. The emergency chord returns control here.").small().weak());
         if settings
@@ -120,7 +120,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             .any(|mode| *mode == InputMode::Raw)
         {
             ui.label(
-                RichText::new("Raw input requires focus lock and a Linux destination.").small(),
+                RichText::new("Raw input stays on the selected Linux computer. Use Ctrl+Alt+F12 or the Control buttons to switch.").small(),
             );
             ui.label(RichText::new(if source_mac {
                 "Grant Input Monitoring access on this Mac."
@@ -159,7 +159,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             ui.label(format!("Preparing input on {name}…"));
         });
     } else if state.raw_active {
-        ui.label(RichText::new("Raw input active · focus locked").strong());
+        ui.label(RichText::new("Raw input active").strong());
     }
     if let Some(error) = &state.input_error {
         ui.colored_label(crate::theme::ERR, error);

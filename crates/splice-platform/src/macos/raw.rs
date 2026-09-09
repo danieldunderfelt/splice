@@ -28,15 +28,15 @@ use tokio::sync::mpsc;
 
 type Ref = *mut c_void;
 type DeviceCallback = unsafe extern "C" fn(Ref, i32, Ref, Ref);
-type ReportCallback = unsafe extern "C" fn(Ref, i32, Ref, u32, u32, *mut u8, isize);
+type ReportCallback = unsafe extern "C" fn(Ref, i32, Ref, u32, u32, *mut u8, isize, u64);
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
     fn IOHIDCheckAccess(request: u32) -> u32;
     fn IOHIDManagerCreate(allocator: Ref, options: u32) -> Ref;
-    fn IOHIDManagerSetDeviceMatchingMultiple(
+    fn IOHIDManagerSetDeviceMatching(
         manager: Ref,
-        matching: core_foundation::array::CFArrayRef,
+        matching: core_foundation::dictionary::CFDictionaryRef,
     );
     fn IOHIDManagerRegisterDeviceMatchingCallback(
         manager: Ref,
@@ -48,7 +48,7 @@ extern "C" {
         callback: DeviceCallback,
         context: Ref,
     );
-    fn IOHIDManagerRegisterInputReportCallback(
+    fn IOHIDManagerRegisterInputReportWithTimeStampCallback(
         manager: Ref,
         callback: ReportCallback,
         context: Ref,
@@ -83,7 +83,6 @@ pub struct HidCapture {
     shared: Arc<MacShared>,
     tap: Arc<TapState>,
     state: Mutex<State>,
-    origin: Instant,
     media_recreate: AtomicBool,
 }
 
@@ -99,11 +98,16 @@ struct State {
     devices: BTreeMap<usize, Device>,
     next_device: u64,
     sequence: u64,
-    output: Option<mpsc::Sender<RawReport>>,
+    output: Option<Output>,
     error: Option<String>,
     ready: bool,
     media_ready: bool,
     rejected: BTreeMap<usize, String>,
+}
+
+struct Output {
+    reports: mpsc::Sender<crate::raw::CapturedReport>,
+    operation: Arc<crate::raw::RawOperation>,
 }
 
 impl State {
@@ -156,7 +160,6 @@ impl HidCapture {
             shared,
             tap,
             state: Mutex::new(State::default()),
-            origin: Instant::now(),
             media_recreate: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&capture);
@@ -178,15 +181,22 @@ impl HidCapture {
 
     fn fail(&self, reason: String) {
         let mut state = self.state.lock();
-        let active = state.output.take().is_some();
+        self.fail_locked(&mut state, reason);
+    }
+
+    fn fail_locked(&self, state: &mut State, reason: String) {
+        let output = state.output.take();
         self.tap
             .raw_enabled
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        drop(state);
-        if active {
+        if let Some(Output { reports, operation }) = output {
+            operation.fail(reason);
+            drop(reports);
             self.tap.end(None);
+            self.shared.emit(PlatformEvent::RawCaptureFailed(operation));
+        } else {
+            tracing::warn!(%reason, "Mac raw capture unavailable");
         }
-        self.shared.emit(PlatformEvent::RawError(reason));
     }
 
     fn report_error(&self, device: Ref, reason: &str) {
@@ -195,8 +205,7 @@ impl HidCapture {
             return;
         };
         device.error = Some(reason.into());
-        drop(state);
-        self.fail(reason.into());
+        self.fail_locked(&mut state, reason.into());
     }
 
     fn release_shortcut_keys(&self, state: &State, removed: &Device) {
@@ -215,6 +224,7 @@ impl HidCapture {
         state: &mut State,
         device: u64,
         events: Vec<RawEvent>,
+        captured_us: u64,
     ) -> std::result::Result<(), String> {
         if events.is_empty() {
             return Ok(());
@@ -225,12 +235,13 @@ impl HidCapture {
         let report = RawReport {
             device,
             sequence: state.sequence,
-            captured_us: self.origin.elapsed().as_micros() as u64,
+            captured_us,
             events,
         };
         report.validate().map_err(str::to_owned)?;
         output
-            .try_send(report)
+            .reports
+            .try_send(report.into())
             .map_err(|e| format!("Raw input could not keep up; capture released: {e}"))?;
         state.sequence = state
             .sequence
@@ -261,7 +272,12 @@ impl RawCapture for HidCapture {
         Ok(())
     }
 
-    fn begin(&self, output: mpsc::Sender<RawReport>, edge: Option<u32>, _operation: Arc<crate::raw::RawOperation>) -> Result<()> {
+    fn begin(
+        &self,
+        output: mpsc::Sender<crate::raw::CapturedReport>,
+        edge: Option<u32>,
+        operation: Arc<crate::raw::RawOperation>,
+    ) -> Result<()> {
         self.prepare()?;
         let mut state = self.state.lock();
         state.readiness()?;
@@ -275,17 +291,19 @@ impl RawCapture for HidCapture {
                 "Edge crossing cancelled because the pointer left the edge".into(),
             ));
         }
-        self.tap.begin();
+        self.tap.begin()?;
         self.tap
             .raw_enabled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         state.sequence = 0;
-        state.output = Some(output);
+        state.output = Some(Output {
+            reports: output,
+            operation,
+        });
         let snapshots: Vec<_> = state.devices.values().map(|d| (d.id, d.decoder.snapshot().into_iter().filter(|e| !matches!(e, RawEvent::Key { code, .. } if self.tap.shortcut_suppressed(*code))).collect())).collect();
         for (device, events) in snapshots {
-            if let Err(error) = self.send(&mut state, device, events) {
+            if let Err(error) = self.send(&mut state, device, events, crate::raw::clock::now_us()) {
                 state.output = None;
-                drop(state);
                 self.tap.end(None);
                 return Err(PlatformError::Unavailable(error));
             }
@@ -299,7 +317,6 @@ impl RawCapture for HidCapture {
         self.tap
             .raw_enabled
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        drop(state);
         if active {
             self.tap.end(None);
         }
@@ -386,17 +403,20 @@ unsafe extern "C" fn removed(context: Ref, _: i32, _: Ref, device: Ref) {
     state.rejected.remove(&(device as usize));
     if let Some(device) = state.devices.remove(&(device as usize)) {
         capture.release_shortcut_keys(&state, &device);
-        if let Err(error) = capture.send(&mut state, device.id, vec![RawEvent::Removed]) {
-            drop(state);
-            capture.fail(error);
+        if let Err(error) = capture.send(
+            &mut state,
+            device.id,
+            vec![RawEvent::Removed],
+            crate::raw::clock::now_us(),
+        ) {
+            capture.fail_locked(&mut state, error);
             return;
         }
         if state.output.is_some()
             && (!state.devices.values().any(|d| d.decoder.mouse)
                 || !state.devices.values().any(|d| d.decoder.keyboard))
         {
-            drop(state);
-            capture.fail("Raw mouse or keyboard disconnected".into());
+            capture.fail_locked(&mut state, "Raw mouse or keyboard disconnected".into());
         }
     }
 }
@@ -409,6 +429,7 @@ unsafe extern "C" fn report(
     id: u32,
     bytes: *mut u8,
     len: isize,
+    timestamp: u64,
 ) {
     let capture = &*(context as *const HidCapture);
     if result != 0 || kind != 0 || bytes.is_null() || !(1..=4096).contains(&len) || id > 255 {
@@ -437,10 +458,8 @@ unsafe extern "C" fn report(
         Err(error) => {
             let reason = format!("HID input device {}: {error:#}", device.name);
             device.error = Some(reason.clone());
-            let active = state.output.is_some();
-            drop(state);
-            if active {
-                capture.fail(reason);
+            if state.output.is_some() {
+                capture.fail_locked(&mut state, reason);
             }
             return;
         }
@@ -481,9 +500,13 @@ unsafe extern "C" fn report(
         .raw_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
     {
-        if let Err(error) = capture.send(&mut state, device_id, events) {
-            drop(state);
-            capture.fail(error);
+        if let Err(error) = capture.send(
+            &mut state,
+            device_id,
+            events,
+            crate::raw::clock::mach_us(timestamp),
+        ) {
+            capture.fail_locked(&mut state, error);
         }
     }
 }
@@ -548,7 +571,7 @@ fn run(capture: &Arc<HidCapture>) -> anyhow::Result<()> {
         let mut lifecycle = capture.tap.lifecycle.load(Ordering::SeqCst);
         let mut last_attempt = Instant::now();
         capture.state.lock().ready = true;
-        while Arc::strong_count(capture) > 1 {
+        while Arc::strong_count(capture) > 1 && !capture.shared.tx.is_closed() {
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, Duration::from_millis(20), false);
             let current_lifecycle = capture.tap.lifecycle.load(Ordering::SeqCst);
             if current_lifecycle != lifecycle
@@ -614,12 +637,7 @@ struct HidManager {
 }
 
 impl HidManager {
-    unsafe fn open(
-        context: Ref,
-        added: DeviceCallback,
-        removed: DeviceCallback,
-        report: ReportCallback,
-    ) -> anyhow::Result<Self> {
+    unsafe fn discover() -> anyhow::Result<Self> {
         let manager = IOHIDManagerCreate(std::ptr::null_mut(), 0);
         anyhow::ensure!(!manager.is_null(), "cannot create HID manager");
         let manager = Self {
@@ -641,12 +659,26 @@ impl HidManager {
                 ])
             })
             .collect();
-        let matching = CFArray::from_CFTypes(&matches);
+        let matching = CFDictionary::from_CFType_pairs(&[(
+            CFString::new("DeviceUsagePairs").as_CFType(),
+            CFArray::from_CFTypes(&matches).as_CFType(),
+        )]);
         let handle = manager.owner.as_CFTypeRef() as Ref;
-        IOHIDManagerSetDeviceMatchingMultiple(handle, matching.as_concrete_TypeRef());
+        IOHIDManagerSetDeviceMatching(handle, matching.as_concrete_TypeRef());
+        Ok(manager)
+    }
+
+    unsafe fn open(
+        context: Ref,
+        added: DeviceCallback,
+        removed: DeviceCallback,
+        report: ReportCallback,
+    ) -> anyhow::Result<Self> {
+        let manager = Self::discover()?;
+        let handle = manager.owner.as_CFTypeRef() as Ref;
         IOHIDManagerRegisterDeviceMatchingCallback(handle, added, context);
         IOHIDManagerRegisterDeviceRemovalCallback(handle, removed, context);
-        IOHIDManagerRegisterInputReportCallback(handle, report, context);
+        IOHIDManagerRegisterInputReportWithTimeStampCallback(handle, report, context);
         IOHIDManagerScheduleWithRunLoop(
             handle,
             manager.runloop.as_concrete_TypeRef(),
@@ -675,7 +707,45 @@ impl Drop for HidManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_foundation::set::{CFSet, CFSetGetValues, CFSetRef};
     use parking_lot::RwLock;
+
+    extern "C" {
+        fn IOHIDManagerCopyDevices(manager: Ref) -> CFSetRef;
+        fn IOHIDDeviceGetService(device: Ref) -> u32;
+        fn IORegistryEntryGetRegistryEntryID(service: u32, id: *mut u64) -> i32;
+    }
+
+    #[test]
+    #[ignore = "requires an attached composite HID device; enumerates without capturing input"]
+    fn native_hid_discovery_subscribes_once_per_service() {
+        unsafe {
+            let manager = HidManager::discover().unwrap();
+            let raw = IOHIDManagerCopyDevices(manager.owner.as_CFTypeRef() as Ref);
+            assert!(!raw.is_null(), "no attached HID input devices");
+            let devices: CFSet = CFSet::wrap_under_create_rule(raw);
+            let mut values = vec![std::ptr::null(); devices.len()];
+            CFSetGetValues(devices.as_concrete_TypeRef(), values.as_mut_ptr());
+            let mut ids = std::collections::BTreeSet::new();
+            let mut composite = false;
+            for device in values {
+                let device = device as Ref;
+                composite |= property(device, "DeviceUsagePairs")
+                    .and_then(|p| p.downcast::<CFArray>())
+                    .is_some_and(|p| p.len() > 1);
+                let mut id = 0;
+                assert_eq!(
+                    IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(device), &mut id),
+                    0
+                );
+                assert!(
+                    ids.insert(id),
+                    "duplicate HID subscription for registry service {id}"
+                );
+            }
+            assert!(composite, "no attached composite HID device");
+        }
+    }
 
     fn capture() -> HidCapture {
         let (tx, _) = mpsc::unbounded_channel();
@@ -688,9 +758,94 @@ mod tests {
             tap: TapState::new(shared.clone(), Vec::new()),
             shared,
             state: Mutex::new(State::default()),
-            origin: Instant::now(),
             media_recreate: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn capture_failures_keep_the_operation_that_failed() {
+        let mut capture = capture();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        capture.tap = TapState::new(shared.clone(), Vec::new());
+        capture.shared = shared;
+        let old = Arc::default();
+        let (reports, mut reports_rx) = mpsc::channel(1);
+        capture.state.lock().output = Some(Output {
+            reports,
+            operation: Arc::clone(&old),
+        });
+        capture.fail("old device failure".into());
+        assert!(reports_rx.try_recv().is_err());
+        let new = Arc::default();
+        let (reports, _reports_rx) = mpsc::channel(1);
+        capture.state.lock().output = Some(Output {
+            reports,
+            operation: Arc::clone(&new),
+        });
+        let PlatformEvent::RawCaptureFailed(failed) = rx.try_recv().unwrap() else {
+            panic!("unscoped capture failure")
+        };
+        assert!(Arc::ptr_eq(&failed, &old));
+        assert_eq!(failed.error().as_deref(), Some("old device failure"));
+        assert!(new.error().is_none());
+        assert!(capture.state.lock().output.is_some());
+    }
+
+    #[test]
+    fn hid_callback_preserves_native_time_through_decoding_and_enqueue() {
+        let capture = capture();
+        let decoder = Decoder::new(include_bytes!(
+            "../../tests/fixtures/hid/logitech-c548-keyboard.bin"
+        ))
+        .unwrap();
+        let (reports, mut rx) = mpsc::channel(4);
+        {
+            let mut state = capture.state.lock();
+            state.devices.insert(
+                1,
+                Device {
+                    id: 1,
+                    name: "keyboard".into(),
+                    decoder,
+                    error: None,
+                },
+            );
+            state.output = Some(Output {
+                reports,
+                operation: Arc::default(),
+            });
+        }
+        capture.tap.raw_enabled.store(true, Ordering::SeqCst);
+        let ticks = unsafe { crate::raw::clock::mach::mach_absolute_time() } - 1_000_000;
+        let native_us = crate::raw::clock::mach_us(ticks);
+        unsafe {
+            report(
+                &capture as *const HidCapture as Ref,
+                0,
+                1usize as Ref,
+                0,
+                0,
+                [0u8, 0, 4, 0, 0, 0, 0, 0].as_mut_ptr(),
+                8,
+                ticks,
+            )
+        };
+        let captured = rx.try_recv().unwrap();
+        assert_eq!(captured.report.captured_us, native_us);
+        assert!(captured.enqueued_us > native_us);
+        assert_eq!(
+            captured.report.events,
+            [RawEvent::Key {
+                code: 30,
+                pressed: true
+            }]
+        );
+        capture.end();
     }
 
     #[test]
@@ -714,7 +869,18 @@ mod tests {
         }
         capture.tap.switch_target(crate::raw::shortcut::Stream::Hid);
         let context = &capture as *const HidCapture as Ref;
-        unsafe { report(context, 0, 1usize as Ref, 0, 0, [0u8; 8].as_mut_ptr(), 8) };
+        unsafe {
+            report(
+                context,
+                0,
+                1usize as Ref,
+                0,
+                0,
+                [0u8; 8].as_mut_ptr(),
+                8,
+                crate::raw::clock::mach::mach_absolute_time(),
+            )
+        };
         assert!(capture.tap.shortcut_suppressed(29));
         unsafe { removed(context, 0, std::ptr::null_mut(), 2usize as Ref) };
         assert!(!capture.tap.shortcut_suppressed(29));

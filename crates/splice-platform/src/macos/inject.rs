@@ -36,6 +36,12 @@ struct EventSource(CGEventSourceRef);
 unsafe impl Send for EventSource {}
 unsafe impl Sync for EventSource {}
 
+impl Drop for EventSource {
+    fn drop(&mut self) {
+        unsafe { core_foundation::base::CFRelease(self.0.cast()) };
+    }
+}
+
 struct State {
     pos: CGPoint,
     flags: CGEventFlags,
@@ -118,6 +124,17 @@ impl Injector {
         }
     }
 
+    fn stop(&self) {
+        let tasks = std::mem::take(&mut *self.tasks.lock());
+        for task in [tasks.repeat, tasks.keep_awake].into_iter().flatten() {
+            task.abort();
+        }
+        self.core.release_everything();
+        if let Some(id) = self.core.state.lock().assertion.take() {
+            unsafe { ffi::IOPMAssertionRelease(id) };
+        }
+    }
+
     /// Injected CGEvents never auto-repeat, so the target regenerates them (DESIGN 16).
     fn start_repeat(&self, code: u32) {
         let (delay, interval) = repeat_timings();
@@ -133,6 +150,12 @@ impl Injector {
             }
         });
         self.tasks.lock().repeat = Some(handle);
+    }
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -483,15 +506,7 @@ impl Emulate for Injector {
     }
 
     async fn leave(&self) -> Result<()> {
-        self.cancel_repeat();
-        if let Some(h) = self.tasks.lock().keep_awake.take() {
-            h.abort();
-        }
-        self.core.release_everything();
-        let assertion = self.core.state.lock().assertion.take();
-        if let Some(id) = assertion {
-            unsafe { ffi::IOPMAssertionRelease(id) };
-        }
+        self.stop();
         Ok(())
     }
 
@@ -505,6 +520,40 @@ impl Emulate for Injector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_injector_stops_background_tasks_and_releases_core() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let injector = Injector::new(Arc::new(MacShared {
+            tx,
+            displays: parking_lot::RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        })).unwrap();
+        let weak = Arc::downgrade(&injector.core);
+        let mut cancelled = Vec::new();
+        for repeat in [true, false] {
+            let core = injector.core.clone();
+            let (done, receiver) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                let _done = done;
+                let _core = core;
+                std::future::pending::<()>().await;
+            });
+            let mut tasks = injector.tasks.lock();
+            if repeat {
+                tasks.repeat = Some(task);
+            } else {
+                tasks.keep_awake = Some(task);
+            }
+            cancelled.push(receiver);
+        }
+        drop(injector);
+        for receiver in cancelled {
+            assert!(tokio::time::timeout(Duration::from_millis(500), receiver)
+                .await.expect("injector left a background task running").is_err());
+        }
+        assert!(weak.upgrade().is_none());
+    }
 
     fn rect(id: &str, x: i32, y: i32, w: u32, h: u32) -> DisplayRect {
         DisplayRect { id: id.into(), x, y, w, h, scale: 1.0 }

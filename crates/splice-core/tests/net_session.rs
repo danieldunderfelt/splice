@@ -9,9 +9,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{Notify, Semaphore};
 
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -20,6 +21,86 @@ struct FakeTs {
     self_id: String,
     user_id: u64,
     whois: Arc<HashMap<IpAddr, (String, u64)>>,
+}
+
+#[derive(Clone)]
+struct AdmissionTs {
+    calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    seventeenth: Arc<Notify>,
+    release: Arc<Semaphore>,
+    block: Arc<AtomicBool>,
+    fail: Arc<AtomicBool>,
+}
+
+impl AdmissionTs {
+    fn new(block: bool, fail: bool) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::new(AtomicUsize::new(0)),
+            seventeenth: Arc::new(Notify::new()),
+            release: Arc::new(Semaphore::new(0)),
+            block: Arc::new(AtomicBool::new(block)),
+            fail: Arc::new(AtomicBool::new(fail)),
+        }
+    }
+}
+
+impl TsApi for AdmissionTs {
+    fn status(&self) -> Pin<Box<dyn Future<Output = Result<Status, TsError>> + Send + '_>> {
+        Box::pin(async {
+            Ok(Status {
+                self_node: Node { stable_id: "aaa".into(), user_id: 7, ..Default::default() },
+                peers: vec![],
+            })
+        })
+    }
+
+    fn whois(
+        &self,
+        addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<WhoIs, TsError>> + Send + '_>> {
+        let calls = self.calls.clone();
+        let active = self.active.clone();
+        let max_active = self.max_active.clone();
+        let completed = self.completed.clone();
+        let seventeenth = self.seventeenth.clone();
+        let release = self.release.clone();
+        let block = self.block.clone();
+        let fail = self.fail.clone();
+        Box::pin(async move {
+            let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 17 {
+                seventeenth.notify_waiters();
+            }
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut previous = max_active.load(Ordering::SeqCst);
+            while current > previous {
+                match max_active.compare_exchange(previous, current, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(actual) => previous = actual,
+                }
+            }
+            if block.load(Ordering::SeqCst) {
+                let permit = release.acquire().await.expect("release semaphore closed");
+                drop(permit);
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            completed.fetch_add(1, Ordering::SeqCst);
+            if fail.load(Ordering::SeqCst) {
+                Err(TsError::PeerNotFound(addr))
+            } else {
+                Ok(WhoIs {
+                    node_stable_id: "bbb".into(),
+                    user: WhoIsUser { id: 7, login_name: "tester".into() },
+                })
+            }
+        })
+    }
 }
 
 impl TsApi for FakeTs {
@@ -114,6 +195,19 @@ async fn wait_for(
             return ev;
         }
     }
+}
+
+async fn wait_for_count(value: &AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if value.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for counter");
 }
 
 fn connected(peer: &str) -> impl Fn(&PeerEvent) -> bool {
@@ -215,6 +309,137 @@ async fn entering_a_session_starts_active_heartbeats_immediately() {
     wait_for(&mut a, Duration::from_secs(2), connected("bbb")).await;
     ca.set_active(&MachineId("bbb".into()), true);
     wait_for(&mut a, Duration::from_millis(300), |event| matches!(event, PeerEvent::Degraded(_))).await;
+}
+
+#[tokio::test]
+async fn heartbeat_deadlines_are_not_rounded_to_the_next_cadence() {
+    let a_opts = NetOpts {
+        idle_hb: Duration::from_secs(10),
+        active_hb: Duration::from_millis(800),
+        max_misses: 1,
+        degraded_timeout: Duration::from_millis(100),
+        ..test_opts()
+    };
+    let b_opts = test_opts();
+    b_opts.answer_pings.store(false, Ordering::Relaxed);
+    let ((mut a, ca), (_b, _cb)) = pair(a_opts, b_opts).await;
+    wait_for(&mut a, Duration::from_secs(3), connected("bbb")).await;
+
+    ca.set_active(&MachineId("bbb".into()), true);
+    wait_for(&mut a, Duration::from_millis(2200), |event| {
+        matches!(event, PeerEvent::Degraded(id) if id.0 == "bbb")
+    })
+    .await;
+
+    ca.set_active(&MachineId("bbb".into()), false);
+    wait_for(&mut a, Duration::from_millis(400), disconnected("bbb")).await;
+}
+
+#[tokio::test]
+async fn consecutive_misses_use_expiry_deadlines() {
+    let a_opts = NetOpts {
+        idle_hb: Duration::from_secs(10),
+        active_hb: Duration::from_millis(400),
+        max_misses: 3,
+        degraded_timeout: Duration::from_secs(10),
+        ..test_opts()
+    };
+    let b_opts = test_opts();
+    b_opts.answer_pings.store(false, Ordering::Relaxed);
+    let ((mut a, ca), (_b, _cb)) = pair(a_opts, b_opts).await;
+    wait_for(&mut a, Duration::from_secs(3), connected("bbb")).await;
+
+    ca.set_active(&MachineId("bbb".into()), true);
+    wait_for(&mut a, Duration::from_millis(2400), |event| {
+        matches!(event, PeerEvent::Degraded(id) if id.0 == "bbb")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn inbound_admission_limits_whois_and_releases_after_authorization_failure() {
+    let ts = AdmissionTs::new(true, true);
+    let (mut manager, _control) = NetManager::spawn_with(
+        MachineInfo {
+            build: splice_proto::BuildInfo::current(),
+            id: MachineId("aaa".into()),
+            hostname: "aaa".into(),
+            os: Os::Linux,
+            displays: vec![],
+        },
+        SocketAddr::new(LOCAL, 0),
+        Arc::new(ts.clone()),
+        test_opts(),
+    )
+    .await
+    .expect("spawn");
+    let mut sockets = Vec::new();
+    for _ in 0..17 {
+        sockets.push(tokio::net::TcpStream::connect(manager.local_addr).await.expect("connect"));
+    }
+    wait_for_count(&ts.calls, 16).await;
+    assert_eq!(ts.calls.load(Ordering::SeqCst), 16);
+    assert_eq!(ts.active.load(Ordering::SeqCst), 16);
+    assert!(tokio::time::timeout(Duration::from_secs(1), ts.seventeenth.notified()).await.is_err());
+    assert_eq!(ts.max_active.load(Ordering::SeqCst), 16);
+
+    ts.release.add_permits(16);
+    wait_for_count(&ts.completed, 16).await;
+    ts.release.add_permits(1);
+    sockets.push(tokio::net::TcpStream::connect(manager.local_addr).await.expect("connect"));
+    wait_for_count(&ts.calls, 17).await;
+    assert!(manager.events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn inbound_admission_releases_after_handshake_success() {
+    use splice_proto::framing::{read_frame, write_frame};
+
+    let ts = AdmissionTs::new(true, false);
+    let (mut manager, _control) = NetManager::spawn_with(
+        MachineInfo {
+            build: splice_proto::BuildInfo::current(),
+            id: MachineId("aaa".into()),
+            hostname: "aaa".into(),
+            os: Os::Linux,
+            displays: vec![],
+        },
+        SocketAddr::new(LOCAL, 0),
+        Arc::new(ts.clone()),
+        test_opts(),
+    )
+    .await
+    .expect("spawn");
+    let mut sockets = Vec::new();
+    for _ in 0..17 {
+        sockets.push(tokio::net::TcpStream::connect(manager.local_addr).await.expect("connect"));
+    }
+    wait_for_count(&ts.calls, 16).await;
+    assert_eq!(ts.calls.load(Ordering::SeqCst), 16);
+    assert!(tokio::time::timeout(Duration::from_secs(1), ts.seventeenth.notified()).await.is_err());
+
+    ts.release.add_permits(16);
+    wait_for_count(&ts.completed, 16).await;
+    let hello = Frame::Hello(splice_proto::Hello {
+        proto_min: splice_proto::PROTO_VERSION,
+        proto_max: splice_proto::PROTO_VERSION,
+        machine: MachineInfo {
+            build: splice_proto::BuildInfo::current(),
+            id: MachineId("bbb".into()),
+            hostname: "bbb".into(),
+            os: Os::Linux,
+            displays: vec![],
+        },
+        caps: [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].map(str::to_string).to_vec(),
+    });
+    write_frame(&mut sockets[0], &hello).await.expect("hello");
+    assert!(matches!(read_frame(&mut sockets[0]).await.expect("welcome"), Frame::Welcome(_)));
+    write_frame(&mut sockets[0], &Frame::Ready).await.expect("ready");
+    wait_for(&mut manager, Duration::from_secs(2), connected("bbb")).await;
+
+    ts.release.add_permits(1);
+    sockets.push(tokio::net::TcpStream::connect(manager.local_addr).await.expect("connect"));
+    wait_for_count(&ts.calls, 17).await;
 }
 
 #[tokio::test]

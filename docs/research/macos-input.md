@@ -12,12 +12,12 @@ the macOS 26 SDK on this machine or live-tested. Follow it.
 - Root is NOT required for HID-level taps anymore (header comment is stale); TCC is the gate.
 - Run loop: `CFMachPortCreateRunLoopSource` → `CFRunLoopAddSource` on a thread with a RUNNING
   CFRunLoop (dedicated thread). No run loop = zero callbacks, no error.
-- Callback discipline: do nothing but timestamp + enqueue to a lock-free/mpsc channel + return.
-  Active taps are SYNCHRONOUS — a slow callback lags the whole system's input. Budget ~1 s
-  before the watchdog kills the tap; target sub-millisecond.
-- Handle both disable events *differently*:
-  - `kCGEventTapDisabledByTimeout` (type 0xFFFFFFFE): call `CGEventTapEnable(port, true)`,
-    KEEP capture state.
+- Callback discipline: keep work short; serialize callbacks with capture begin/end so held-key
+  replay cannot race a physical key release. Do not perform network or clipboard work here.
+  Active taps are synchronous: a slow callback delays system input.
+- Both disable events invalidate remembered input and end the remote session:
+  - `kCGEventTapDisabledByTimeout` (type 0xFFFFFFFE): release capture and notify the engine
+    before re-enabling the tap. Key releases may have been missed during the interruption.
   - `kCGEventTapDisabledByUserInput` (0xFFFFFFFF): unrecoverable via re-enable (Secure Input,
     TCC revoked). Tear down capture cleanly (re-associate cursor! release keys!), recreate tap.
 - Health poll: every 5 s check `CGEventTapIsEnabled`; reinstall if re-enable doesn't stick.
@@ -56,8 +56,21 @@ the macOS 26 SDK on this machine or live-tested. Follow it.
 - While ANY process has SEI on, keyboard events vanish from ALL taps (mouse continues).
   Detect: `IsSecureEventInputEnabled()`; culprit PID via `ioreg -l -d 1 -k IOConsoleUsers`
   → `kCGSSessionSecureInputPID` (key absent = SEI off), then `ps -p <pid> -o comm=`.
-  Surface in UI: "keyboard paused: <app> has Secure Input". Also: when SEI ends, pressed-key
-  state may have changed — synthesize key-up for everything believed held.
+  Surface in UI: "keyboard paused: <app> has Secure Input". Poll every 250 ms, release capture
+  when it starts, and clear remembered keys on both transitions. Reject handoff while it is
+  active. Recovery permits a fresh session; it does not emit another capture failure.
+
+## Modifier capture and handoff
+
+- `FlagsChanged` is only a key edge for the eight left/right Shift, Control, Option and
+  Command virtual keycodes. Keycode zero is not an A press in this event type.
+- Derive pressed/released state from the corresponding device-side flag bit. Toggling a
+  software boolean on each notification invents presses after duplicated or missed events.
+- Before replaying held keys on a desktop handoff, check each key against
+  `CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, keycode)`.
+- Desktop capture excludes Caps Lock from its held-key ledger and replay. A lock-state
+  notification must not become a fresh Caps Lock press on every Linux crossing. Raw HID
+  mode forwards physical key edges, including Caps Lock, through its separate decoder.
 
 ## Capture strategy (freeze, not warp)
 
@@ -122,7 +135,7 @@ the macOS 26 SDK on this machine or live-tested. Follow it.
 - Key repeat: injected events do not auto-repeat. Synthesize: after system-reported initial
   delay (`NSEvent.keyRepeatDelay`), repeat at `NSEvent.keyRepeatInterval` with
   `kCGKeyboardEventAutorepeat=1`, for the last held non-modifier key only; cancel on any
-  key event, Leave, ReleaseAll, disconnect.
+  key event, Leave, ReleaseAll, disconnect, and injector destruction.
 - Scroll: `CGEventCreateScrollWheelEvent(src, units, wheelCount, v, h)`.
   Discrete lines: `kCGScrollEventUnitLine`, small ints (±1..±10 per event; chunk larger).
   Smooth: `kCGScrollEventUnitPixel` + set `kCGScrollWheelEventIsContinuous(88)=1`.
@@ -144,7 +157,9 @@ the macOS 26 SDK on this machine or live-tested. Follow it.
   bytes from the peer over TCP, blocking briefly (guard with ~2 s timeout, then provide empty).
 - TIFF-first: convert `public.tiff` → PNG before offering `image/png` on the wire.
 - Loop guard: when Splice sets the pasteboard from a remote offer, record the resulting
-  changeCount and skip it in the poller.
+  changeCount and skip it in the poller. Serialize pasteboard writes and ownership marking
+  with polling so a remote write cannot be mistaken for a local copy. Do not suppress later
+  local copies merely because their text matches an earlier remote offer.
 
 ## App shape
 

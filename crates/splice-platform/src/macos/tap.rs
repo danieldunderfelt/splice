@@ -5,10 +5,10 @@
 //! the callback does only four things: check the injected magic, keep the held-key ledger
 //! for the panic chord, test edges when idle, and swallow+enqueue when capturing.
 
-use crate::raw::shortcut::{Stream, SwitchShortcut};
 use super::ffi::{self, SPLICE_MAGIC};
 use super::{cursor, MacShared};
 use crate::keymap;
+use crate::raw::shortcut::{Stream, SwitchShortcut};
 use crate::{CaptureEvent, EdgeSide, EdgeSpec, PlatformEvent};
 use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPortRef;
@@ -32,7 +32,7 @@ const CORNER_DEAD_ZONE: f64 = 16.0;
 /// How close to the boundary coordinate counts as contact.
 const EDGE_TOLERANCE: f64 = 1.5;
 const HEALTH_POLL: Duration = Duration::from_secs(5);
-const SECURE_INPUT_POLL: Duration = Duration::from_secs(2);
+const SECURE_INPUT_POLL: Duration = Duration::from_millis(250);
 const PUMP_SLICE: Duration = Duration::from_millis(100);
 const ACTIVITY_DEBOUNCE_MS: u64 = 50;
 /// After handing the cursor back, the warp we post lands just inside the edge and
@@ -63,6 +63,7 @@ pub struct TapState {
     pub lifecycle: AtomicU64,
     available: AtomicBool,
     session_active: AtomicBool,
+    secure_input: AtomicBool,
     switch: Mutex<SwitchShortcut>,
     shared: Arc<MacShared>,
     edges: RwLock<Vec<EdgeSpec>>,
@@ -97,6 +98,7 @@ impl TapState {
             lifecycle: AtomicU64::new(0),
             available: AtomicBool::new(false),
             session_active: AtomicBool::new(true),
+            secure_input: AtomicBool::new(false),
             switch: Mutex::new(SwitchShortcut::default()),
             shared,
             edges: RwLock::new(Vec::new()),
@@ -127,23 +129,67 @@ impl TapState {
         *self.corners.write() = super::displays::corners(&self.shared.displays.read());
     }
 
-    pub fn begin(&self) {
+    pub fn begin(&self) -> crate::Result<()> {
         let _guard = self.capture_lock.lock();
+        if !self.available() || unsafe { ffi::IsSecureEventInputEnabled() } != 0 {
+            return Err(crate::PlatformError::Unavailable(
+                "macOS input capture is unavailable or Secure Input is active".into(),
+            ));
+        }
         self.raw_switching.store(false, Ordering::SeqCst);
         if self.capturing.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         *self.contact.lock() = None;
         cursor::begin();
+        self.emit_held_inputs(
+            |key| unsafe {
+                ffi::CGEventSourceKeyState(
+                    core_graphics::event_source::CGEventSourceStateID::HIDSystemState,
+                    key,
+                )
+            },
+            |button| unsafe {
+                ffi::CGEventSourceButtonState(
+                    core_graphics::event_source::CGEventSourceStateID::HIDSystemState,
+                    button,
+                )
+            },
+        );
+        Ok(())
+    }
+
+    fn emit_held_inputs(
+        &self,
+        mut key_down: impl FnMut(u16) -> bool,
+        mut button_down: impl FnMut(u32) -> bool,
+    ) {
+        let mut keys = self.keys.lock();
+        keys.held.retain(|code| {
+            *code != keymap::ev::KEY_CAPSLOCK
+                && keymap::evdev_to_mac(*code).is_some_and(&mut key_down)
+        });
+        keys.chord_active = !self.panic_chord.is_empty()
+            && self.panic_chord.iter().all(|code| keys.held.contains(code));
+        let shortcut = self.switch.lock();
         for event in crate::keymap::held_key_presses(
-            self.keys
-                .lock()
-                .held
+            keys.held
                 .iter()
                 .copied()
-                .filter(|code| !self.switch.lock().suppressed(Stream::Desktop, *code as u16)),
+                .filter(|code| !shortcut.suppressed(Stream::Desktop, *code as u16)),
         ) {
             self.emit(CaptureEvent::Input(event));
+        }
+        for number in (0..32).filter(|number| button_down(*number)) {
+            let button = match number {
+                0 => PointerButton::Left,
+                1 => PointerButton::Right,
+                number => other_button(i64::from(number)),
+            };
+            self.emit(CaptureEvent::Input(InputEvent::Button {
+                button,
+                pressed: true,
+            }));
         }
     }
 
@@ -153,6 +199,10 @@ impl TapState {
 
     fn finish(&self, warp_to: Option<CGPoint>, switching: bool) {
         let _guard = self.capture_lock.lock();
+        self.finish_locked(warp_to, switching);
+    }
+
+    fn finish_locked(&self, warp_to: Option<CGPoint>, switching: bool) {
         self.raw_switching.store(switching, Ordering::SeqCst);
         self.raw_enabled.store(false, Ordering::SeqCst);
         if !self.capturing.swap(false, Ordering::SeqCst) {
@@ -164,10 +214,15 @@ impl TapState {
     }
 
     pub fn switch_target(&self, stream: Stream) -> bool {
+        let _guard = self.capture_lock.lock();
+        self.switch_target_locked(stream)
+    }
+
+    fn switch_target_locked(&self, stream: Stream) -> bool {
         if !self.switch.lock().press(stream, cursor::now_ms()) {
             return false;
         }
-        self.finish(None, true);
+        self.finish_locked(None, true);
         self.shared.emit(PlatformEvent::SwitchTarget);
         true
     }
@@ -187,24 +242,44 @@ impl TapState {
     pub fn available(&self) -> bool {
         self.available.load(Ordering::SeqCst)
             && self.session_active.load(Ordering::SeqCst)
+            && !self.secure_input.load(Ordering::SeqCst)
             && !self.need_recreate.load(Ordering::SeqCst)
     }
 
     fn session_changed(&self, active: bool) {
+        let _guard = self.capture_lock.lock();
         self.session_active.store(active, Ordering::SeqCst);
         self.available.store(false, Ordering::SeqCst);
-        self.end(None);
+        self.invalidate_input_locked("macOS sleep or login session changed; input released");
+        self.need_recreate.store(true, Ordering::SeqCst);
+    }
+
+    fn invalidate_input_locked(&self, reason: &str) {
+        self.finish_locked(None, false);
         *self.keys.lock() = KeyState::default();
         self.lifecycle.fetch_add(1, Ordering::SeqCst);
-        self.need_recreate.store(true, Ordering::SeqCst);
         self.emit(CaptureEvent::Broken {
-            reason: "macOS sleep or login session changed; input released".into(),
+            reason: reason.into(),
         });
+    }
+
+    fn secure_input_changed(&self, active: bool) {
+        let _guard = self.capture_lock.lock();
+        if self.secure_input.swap(active, Ordering::SeqCst) != active {
+            if active {
+                self.invalidate_input_locked("macOS Secure Input enabled; input released");
+            } else {
+                *self.keys.lock() = KeyState::default();
+            }
+        }
     }
 
     pub fn panic_from_hid(&self, held: &std::collections::BTreeSet<u16>) -> bool {
         if self.panic_chord.is_empty()
-            || !self.panic_chord.iter().all(|code| held.contains(&(*code as u16)))
+            || !self
+                .panic_chord
+                .iter()
+                .all(|code| held.contains(&(*code as u16)))
         {
             return false;
         }
@@ -220,8 +295,7 @@ impl TapState {
     /// True for a short window after a capture ends, so the warp-back event that lands
     /// just inside the edge cannot immediately re-trigger a crossing.
     fn in_cross_cooldown(&self) -> bool {
-        cursor::now_ms().saturating_sub(self.last_end_ms.load(Ordering::SeqCst))
-            < CROSS_COOLDOWN_MS
+        cursor::now_ms().saturating_sub(self.last_end_ms.load(Ordering::SeqCst)) < CROSS_COOLDOWN_MS
     }
 
     fn emit(&self, ev: CaptureEvent) {
@@ -297,7 +371,7 @@ impl Drop for LiveTap {
 }
 
 fn run(st: Arc<TapState>) {
-    install_wake_observers(st.clone());
+    let _wake_observers = install_wake_observers(st.clone());
     let mut live: Option<LiveTap> = None;
     let mut last_health = Instant::now();
     // Report Secure Input on the first pass rather than 2 s in.
@@ -305,7 +379,7 @@ fn run(st: Arc<TapState>) {
         .checked_sub(SECURE_INPUT_POLL)
         .unwrap_or_else(Instant::now);
 
-    loop {
+    while !st.shared.tx.is_closed() {
         if live.is_none() || st.need_recreate.swap(false, Ordering::SeqCst) {
             st.available.store(false, Ordering::SeqCst);
             st.port.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -351,6 +425,9 @@ fn run(st: Arc<TapState>) {
             poll_secure_input(&st);
         }
     }
+    st.available.store(false, Ordering::SeqCst);
+    st.port.store(std::ptr::null_mut(), Ordering::SeqCst);
+    st.end(None);
 }
 
 fn create_tap(st: &Arc<TapState>) -> Option<LiveTap> {
@@ -370,18 +447,12 @@ fn create_tap(st: &Arc<TapState>) -> Option<LiveTap> {
 
 fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> CallbackResult {
     cursor::beat();
+    let _guard = st.capture_lock.lock();
 
     match etype {
-        // Our callback exceeded the system budget (or the machine hitched). Re-enabling is
-        // enough and capture state stays valid.
         CGEventType::TapDisabledByTimeout => {
             st.available.store(false, Ordering::SeqCst);
-            if st.raw_enabled.load(Ordering::SeqCst) {
-                st.end(None);
-                st.emit(CaptureEvent::Broken {
-                    reason: "Raw input stopped because local suppression timed out".into(),
-                });
-            }
+            st.invalidate_input_locked("macOS event tap timed out; input released");
             let port = st.port.load(Ordering::SeqCst) as CFMachPortRef;
             if !port.is_null() {
                 unsafe { ffi::CGEventTapEnable(port, true) };
@@ -393,12 +464,8 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         // must be re-associated NOW or the machine is unusable.
         CGEventType::TapDisabledByUserInput => {
             st.available.store(false, Ordering::SeqCst);
-            st.end(None);
+            st.invalidate_input_locked("event tap disabled by user input; input released");
             st.need_recreate.store(true, Ordering::SeqCst);
-            st.emit(CaptureEvent::Broken {
-                reason: "event tap disabled by user input (Secure Input or revoked permission)"
-                    .into(),
-            });
             return CallbackResult::Keep;
         }
         _ => {}
@@ -414,17 +481,21 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         st.note_physical_activity();
     }
 
-    let suppressed = matches!(etype, CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged)
-        && keymap::mac_to_evdev(event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16)
-            .is_some_and(|code| st.switch.lock().suppressed(Stream::Desktop, code as u16));
-    let key_edge = key_edge_of(st, etype, event);
+    let suppressed = matches!(
+        etype,
+        CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged
+    ) && keymap::mac_to_evdev(
+        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16,
+    )
+    .is_some_and(|code| st.switch.lock().suppressed(Stream::Desktop, code as u16));
+    let key_edge = key_edge_of(etype, event);
     if let Some((code, pressed)) = key_edge {
         if !pressed {
             st.switch.lock().release(Stream::Desktop, code as u16);
         }
         if st.track_key(code, pressed) {
             // Panic must work with the network wedged: restore locally first, report after.
-            st.end(None);
+            st.finish_locked(None, false);
             st.emit(CaptureEvent::Panic);
             return CallbackResult::Drop;
         }
@@ -435,7 +506,7 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
         let switch = keys.held.contains(&29) && keys.held.contains(&56);
         drop(keys);
         if switch {
-            st.switch_target(Stream::Desktop);
+            st.switch_target_locked(Stream::Desktop);
             return CallbackResult::Drop;
         }
     }
@@ -496,7 +567,7 @@ fn on_event(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Callback
 
 /// Key press/release edges, with autorepeat filtered (DESIGN 16: repeats are regenerated at
 /// the destination). `None` for non-keyboard events and for unmapped keycodes.
-fn key_edge_of(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Option<(u32, bool)> {
+fn key_edge_of(etype: CGEventType, event: &CGEvent) -> Option<(u32, bool)> {
     let vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
     match etype {
         CGEventType::KeyDown | CGEventType::KeyUp => {
@@ -512,11 +583,20 @@ fn key_edge_of(st: &Arc<TapState>, etype: CGEventType, event: &CGEvent) -> Optio
                 }
             }
         }
-        // FlagsChanged carries the keycode of the modifier that changed but no direction;
-        // the held ledger supplies it. Reading the flag mask instead would be wrong with
-        // both Shifts down — the mask stays set when only one of them is released.
-        CGEventType::FlagsChanged => keymap::mac_to_evdev(vk)
-            .map(|code| (code, !st.keys.lock().held.contains(&code))),
+        CGEventType::FlagsChanged => {
+            let (code, mask) = match vk {
+                54 => (keymap::ev::KEY_RIGHTMETA, 0x10),
+                55 => (keymap::ev::KEY_LEFTMETA, 0x08),
+                56 => (keymap::ev::KEY_LEFTSHIFT, 0x02),
+                58 => (keymap::ev::KEY_LEFTALT, 0x20),
+                59 => (keymap::ev::KEY_LEFTCTRL, 0x01),
+                60 => (keymap::ev::KEY_RIGHTSHIFT, 0x04),
+                61 => (keymap::ev::KEY_RIGHTALT, 0x40),
+                62 => (keymap::ev::KEY_RIGHTCTRL, 0x2000),
+                _ => return None,
+            };
+            Some((code, event.get_flags().bits() & mask != 0))
+        }
         _ => None,
     }
 }
@@ -540,11 +620,7 @@ impl Translated {
     }
 }
 
-fn translate(
-    etype: CGEventType,
-    event: &CGEvent,
-    key_edge: Option<(u32, bool)>,
-) -> Translated {
+fn translate(etype: CGEventType, event: &CGEvent, key_edge: Option<(u32, bool)>) -> Translated {
     match etype {
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
@@ -559,18 +635,20 @@ fn translate(
                 Translated::One(InputEvent::Motion { dx, dy })
             }
         }
-        CGEventType::LeftMouseDown => Translated::One(button(PointerButton::Left, true)),
-        CGEventType::LeftMouseUp => Translated::One(button(PointerButton::Left, false)),
-        CGEventType::RightMouseDown => Translated::One(button(PointerButton::Right, true)),
-        CGEventType::RightMouseUp => Translated::One(button(PointerButton::Right, false)),
-        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => {
-            let n = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
-            let pressed = matches!(etype, CGEventType::OtherMouseDown);
-            Translated::One(button(other_button(n), pressed))
+        CGEventType::LeftMouseDown
+        | CGEventType::LeftMouseUp
+        | CGEventType::RightMouseDown
+        | CGEventType::RightMouseUp
+        | CGEventType::OtherMouseDown
+        | CGEventType::OtherMouseUp => {
+            let (button, pressed) = button_edge(etype, event).expect("mouse button event");
+            Translated::One(InputEvent::Button { button, pressed })
         }
         CGEventType::ScrollWheel => scroll(event),
         CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
-            let Some((code, pressed)) = key_edge else { return Translated::None };
+            let Some((code, pressed)) = key_edge else {
+                return Translated::None;
+            };
             // DESIGN keymap note: CapsLock is a lock state, not an edge — never forwarded.
             if code == keymap::ev::KEY_CAPSLOCK {
                 return Translated::None;
@@ -581,8 +659,18 @@ fn translate(
     }
 }
 
-fn button(button: PointerButton, pressed: bool) -> InputEvent {
-    InputEvent::Button { button, pressed }
+fn button_edge(etype: CGEventType, event: &CGEvent) -> Option<(PointerButton, bool)> {
+    match etype {
+        CGEventType::LeftMouseDown => Some((PointerButton::Left, true)),
+        CGEventType::LeftMouseUp => Some((PointerButton::Left, false)),
+        CGEventType::RightMouseDown => Some((PointerButton::Right, true)),
+        CGEventType::RightMouseUp => Some((PointerButton::Right, false)),
+        CGEventType::OtherMouseDown | CGEventType::OtherMouseUp => Some((
+            other_button(event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER)),
+            matches!(etype, CGEventType::OtherMouseDown),
+        )),
+        _ => None,
+    }
 }
 
 fn other_button(n: i64) -> PointerButton {
@@ -641,7 +729,9 @@ fn poll_health(st: &Arc<TapState>, have_tap: bool) {
         // Revocation while disassociated wedges system input — restore before anything else.
         if st.is_capturing() {
             st.end(None);
-            st.emit(CaptureEvent::Broken { reason: "Accessibility permission revoked".into() });
+            st.emit(CaptureEvent::Broken {
+                reason: "Accessibility permission revoked".into(),
+            });
         }
         st.need_recreate.store(true, Ordering::SeqCst);
         st.shared.set_health(|h| {
@@ -666,32 +756,56 @@ fn preflight_tap_create() -> bool {
 
 fn poll_secure_input(st: &Arc<TapState>) {
     let status = super::secure_input_status();
+    st.secure_input_changed(status.is_some());
     st.shared.set_health(|h| h.secure_input = status.clone());
 }
 
 /// Taps die across sleep/wake and lock/unlock and never come back on their own.
-fn install_wake_observers(st: Arc<TapState>) {
+struct WakeObservers {
+    center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
+    tokens: Vec<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>,
+}
+
+impl Drop for WakeObservers {
+    fn drop(&mut self) {
+        for token in &self.tokens {
+            unsafe { self.center.removeObserver((**token).as_ref()) };
+        }
+    }
+}
+
+fn install_wake_observers(st: Arc<TapState>) -> WakeObservers {
     use objc2_app_kit::{
-        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
-        NSWorkspaceSessionDidBecomeActiveNotification, NSWorkspaceSessionDidResignActiveNotification,
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
+        NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
     };
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let mut tokens = Vec::new();
     for (name, active) in [
         (unsafe { NSWorkspaceDidWakeNotification }, true),
-        (unsafe { NSWorkspaceSessionDidBecomeActiveNotification }, true),
+        (
+            unsafe { NSWorkspaceSessionDidBecomeActiveNotification },
+            true,
+        ),
         (unsafe { NSWorkspaceWillSleepNotification }, false),
-        (unsafe { NSWorkspaceSessionDidResignActiveNotification }, false),
+        (
+            unsafe { NSWorkspaceSessionDidResignActiveNotification },
+            false,
+        ),
     ] {
         let st = st.clone();
-        let block = block2::RcBlock::new(move |_n: std::ptr::NonNull<objc2_foundation::NSNotification>| {
-            tracing::info!("system wake/session change; recreating the event tap");
-            st.session_changed(active);
-        });
-        // Leaked on purpose: the observer must outlive the process's capture stack.
-        let token =
-            unsafe { center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block) };
-        std::mem::forget(token);
+        let block = block2::RcBlock::new(
+            move |_n: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                tracing::info!("system wake/session change; recreating the event tap");
+                st.session_changed(active);
+            },
+        );
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+        };
+        tokens.push(token);
     }
+    WakeObservers { center, tokens }
 }
 
 /// `warp_to` in engine coords is already CG global points on macOS.
@@ -704,6 +818,125 @@ mod tests {
     use super::*;
     use crate::PlatformEvent;
 
+    fn flags_event(vk: u16, flags: u64) -> CGEvent {
+        let source = core_graphics::event_source::CGEventSource::new(
+            core_graphics::event_source::CGEventSourceStateID::Private,
+        ).unwrap();
+        let event = CGEvent::new_keyboard_event(source, vk, false).unwrap();
+        event.set_type(CGEventType::FlagsChanged);
+        event.set_flags(core_graphics::event::CGEventFlags::from_bits_retain(flags));
+        event
+    }
+
+    #[test]
+    fn modifier_notifications_cannot_invent_an_a_press() {
+        let st = state();
+        let event = flags_event(0, 0);
+        on_event(&st, CGEventType::FlagsChanged, &event);
+        assert!(st.keys.lock().held.is_empty());
+    }
+
+    #[test]
+    fn modifier_release_without_a_press_cannot_hold_shift() {
+        let st = state();
+        let event = flags_event(56, 0);
+        on_event(&st, CGEventType::FlagsChanged, &event);
+        on_event(&st, CGEventType::FlagsChanged, &event);
+        assert!(!st.keys.lock().held.contains(&42));
+        assert_eq!(key_edge_of(CGEventType::FlagsChanged, &event), Some((42, false)));
+    }
+
+    #[test]
+    fn releasing_one_shift_preserves_the_other_shift() {
+        let st = state();
+        for (vk, flags) in [(56, 0x20002), (60, 0x20006), (56, 0x20004)] {
+            on_event(&st, CGEventType::FlagsChanged, &flags_event(vk, flags));
+        }
+        assert_eq!(st.keys.lock().held, HashSet::from([54]));
+        on_event(&st, CGEventType::FlagsChanged, &flags_event(56, 0x20004));
+        assert_eq!(st.keys.lock().held, HashSet::from([54]));
+    }
+
+    #[test]
+    fn desktop_handoff_never_replays_caps_lock_as_a_press() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        let st = TapState::new(shared, Vec::new());
+        on_event(&st, CGEventType::FlagsChanged, &flags_event(57, 0x10000));
+        while rx.try_recv().is_ok() {}
+        st.emit_held_inputs(|_| true, |_| false);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tap_timeout_releases_desktop_input_and_clears_remembered_keys() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        let st = TapState::new(shared, Vec::new());
+        st.keys.lock().held.extend([30, 42]);
+        let event = flags_event(0, 0);
+        on_event(&st, CGEventType::TapDisabledByTimeout, &event);
+        assert!(st.keys.lock().held.is_empty());
+        assert!(matches!(rx.try_recv().unwrap(), PlatformEvent::Capture(CaptureEvent::Broken { .. })));
+    }
+
+    #[test]
+    fn secure_input_transitions_clear_keys_and_prevent_capture() {
+        let st = state();
+        st.available.store(true, Ordering::SeqCst);
+        st.keys.lock().held.extend([30, 42]);
+        st.secure_input_changed(true);
+        assert!(st.keys.lock().held.is_empty());
+        assert!(!st.available());
+        assert!(st.begin().is_err());
+        assert!(!st.is_capturing());
+        st.keys.lock().held.insert(54);
+        st.secure_input_changed(false);
+        assert!(st.keys.lock().held.is_empty());
+        assert!(st.available());
+    }
+
+    #[test]
+    fn unavailable_tap_cannot_capture_local_input() {
+        let st = state();
+        assert!(st.begin().is_err());
+        assert!(!st.is_capturing());
+    }
+
+    #[test]
+    fn desktop_handoff_prunes_keys_released_while_callbacks_were_unavailable() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        let st = TapState::new(shared, Vec::new());
+        st.keys.lock().held.extend([30, 42]);
+        st.emit_held_inputs(|_| false, |_| false);
+        assert!(st.keys.lock().held.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn all_modifier_edges_follow_their_device_flags() {
+        for (vk, code, mask) in [
+            (54, 126, 0x10), (55, 125, 0x08), (56, 42, 0x02), (58, 56, 0x20),
+            (59, 29, 0x01), (60, 54, 0x04), (61, 100, 0x40), (62, 97, 0x2000),
+        ] {
+            assert_eq!(key_edge_of(CGEventType::FlagsChanged, &flags_event(vk, mask)), Some((code, true)));
+            assert_eq!(key_edge_of(CGEventType::FlagsChanged, &flags_event(vk, 0)), Some((code, false)));
+        }
+    }
+
     fn state() -> Arc<TapState> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<PlatformEvent>();
         let shared = Arc::new(MacShared {
@@ -715,26 +948,98 @@ mod tests {
     }
 
     #[test]
+    fn closed_platform_stops_tap_thread_and_releases_notification_observers() {
+        let st = state();
+        let weak = Arc::downgrade(&st);
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run(st);
+            done.send(()).unwrap();
+        });
+        completed.recv_timeout(Duration::from_secs(2))
+            .expect("event tap survived the platform receiver");
+        worker.join().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn cross_cooldown_mutes_edges_only_briefly() {
         let st = state();
-        assert!(!st.in_cross_cooldown(), "a fresh tap must not mute edge tests");
+        assert!(
+            !st.in_cross_cooldown(),
+            "a fresh tap must not mute edge tests"
+        );
         st.last_end_ms.store(cursor::now_ms(), Ordering::SeqCst);
-        assert!(st.in_cross_cooldown(), "edges are muted right after a capture ends");
-        st.last_end_ms
-            .store(cursor::now_ms().saturating_sub(CROSS_COOLDOWN_MS + 5), Ordering::SeqCst);
-        assert!(!st.in_cross_cooldown(), "muting lifts once the cooldown elapses");
+        assert!(
+            st.in_cross_cooldown(),
+            "edges are muted right after a capture ends"
+        );
+        st.last_end_ms.store(
+            cursor::now_ms().saturating_sub(CROSS_COOLDOWN_MS + 5),
+            Ordering::SeqCst,
+        );
+        assert!(
+            !st.in_cross_cooldown(),
+            "muting lifts once the cooldown elapses"
+        );
     }
 
     #[test]
     fn set_edges_are_deduplicated() {
         let st = state();
-        let edge = EdgeSpec { id: 0, side: EdgeSide::Right, at: 1920, from: 0, to: 1080 };
+        let edge = EdgeSpec {
+            id: 0,
+            side: EdgeSide::Right,
+            at: 1920,
+            from: 0,
+            to: 1080,
+        };
         st.set_edges(vec![edge.clone()]);
         *st.contact.lock() = Some(0);
         st.set_edges(vec![edge]);
-        assert_eq!(*st.contact.lock(), Some(0), "an unchanged edge set keeps live contact");
-        st.set_edges(vec![EdgeSpec { id: 0, side: EdgeSide::Left, at: 0, from: 0, to: 1080 }]);
-        assert_eq!(*st.contact.lock(), None, "a real edge change resets contact");
+        assert_eq!(
+            *st.contact.lock(),
+            Some(0),
+            "an unchanged edge set keeps live contact"
+        );
+        st.set_edges(vec![EdgeSpec {
+            id: 0,
+            side: EdgeSide::Left,
+            at: 0,
+            from: 0,
+            to: 1080,
+        }]);
+        assert_eq!(
+            *st.contact.lock(),
+            None,
+            "a real edge change resets contact"
+        );
+    }
+
+    #[test]
+    fn desktop_handoff_queries_current_buttons_even_without_prior_callbacks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
+        let st = TapState::new(shared, Vec::new());
+        st.emit_held_inputs(|_| false, |number| matches!(number, 0 | 4));
+        let mut buttons = HashSet::new();
+        while let Ok(PlatformEvent::Capture(CaptureEvent::Input(InputEvent::Button {
+            button,
+            pressed: true,
+        }))) = rx.try_recv()
+        {
+            buttons.insert(button);
+        }
+        assert_eq!(
+            buttons,
+            [PointerButton::Left, PointerButton::Forward].into()
+        );
+        st.emit_held_inputs(|_| false, |_| false);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -756,13 +1061,20 @@ mod tests {
     #[test]
     fn hid_emergency_chord_releases_without_an_engine_or_desktop_callback() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Arc::new(MacShared { tx, displays: RwLock::new(Vec::new()), health: Mutex::new(Default::default()) });
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: RwLock::new(Vec::new()),
+            health: Mutex::new(Default::default()),
+        });
         let st = TapState::new(shared, vec![42, 54, 1]);
         st.raw_enabled.store(true, Ordering::SeqCst);
         assert!(!st.panic_from_hid(&[42, 54].into_iter().collect()));
         assert!(st.raw_enabled.load(Ordering::SeqCst));
         assert!(st.panic_from_hid(&[42, 54, 1].into_iter().collect()));
         assert!(!st.raw_enabled.load(Ordering::SeqCst));
-        assert!(matches!(rx.try_recv().unwrap(), PlatformEvent::Capture(CaptureEvent::Panic)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            PlatformEvent::Capture(CaptureEvent::Panic)
+        ));
     }
 }

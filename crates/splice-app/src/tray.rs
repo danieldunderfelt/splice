@@ -8,12 +8,12 @@
 
 #[cfg(not(target_os = "linux"))]
 use parking_lot::Mutex;
-use splice_core::UiState;
 use splice_core::ui_state::{UiConnection, UiMachine};
+use splice_core::UiState;
 use splice_proto::MachineId;
+use std::sync::mpsc;
 #[cfg(not(target_os = "linux"))]
 use std::sync::Arc;
-use std::sync::mpsc;
 
 use crate::runtime::Controller;
 
@@ -39,7 +39,7 @@ pub struct Tray {
 impl Tray {
     /// Create the platform tray. Never fails hard: problems become `hint()` text.
     #[cfg_attr(target_os = "linux", allow(unused_variables))]
-    pub fn new(ctrl: &Controller, tx: mpsc::Sender<AppAction>) -> Self {
+    pub fn new(ctrl: &Controller, tx: mpsc::Sender<AppAction>, ctx: egui::Context) -> Self {
         #[cfg(target_os = "linux")]
         {
             Tray { ctrl: ctrl.clone() }
@@ -48,7 +48,7 @@ impl Tray {
         {
             let hint = Arc::new(Mutex::new(None));
             #[cfg(target_os = "macos")]
-            let macos = match macos::MacTray::new(ctrl, tx.clone()) {
+            let macos = match macos::MacTray::new(ctrl, tx.clone(), ctx) {
                 Ok(tray) => Some(tray),
                 Err(err) => {
                     tracing::warn!("tray unavailable: {err}");
@@ -81,20 +81,15 @@ impl Tray {
         }
     }
 
-    /// Drain pending native menu events into the action channel (macOS). Per-frame.
-    pub fn poll(&self) {
-        #[cfg(target_os = "macos")]
-        if let Some(macos) = &self.macos {
-            macos.poll();
-        }
-    }
-
     /// Reflect the latest state in the tray menu/icon. Cheap when nothing changed.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn sync(&self, state: &UiState) {
         #[cfg(target_os = "macos")]
         if let Some(macos) = &self.macos {
-            macos.sync(state);
+            if let Err(error) = macos.sync(state) {
+                tracing::warn!(%error, "cannot update menu bar items");
+                *self.hint.lock() = Some(error);
+            }
         }
     }
 }
@@ -137,10 +132,7 @@ fn icon_rgba(size: u32) -> Vec<u8> {
             let bg = rounded(xf, yf, (s * 0.05, s * 0.05), (s * 0.95, s * 0.95), s * 0.24);
             let (mut r, mut g, mut b, a) = (0x5B as f32, 0x8D as f32, 0xEF as f32, bg);
 
-            for (min, max) in [
-                ((0.17, 0.40), (0.50, 0.80)),
-                ((0.50, 0.20), (0.83, 0.60)),
-            ] {
+            for (min, max) in [((0.17, 0.40), (0.50, 0.80)), ((0.50, 0.20), (0.83, 0.60))] {
                 let cov = rounded(
                     xf,
                     yf,
@@ -171,118 +163,18 @@ pub fn set_activation_policy_accessory() {
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
-    use super::{AppAction, icon_rgba, machine_menu_label};
-    use crate::runtime::Controller;
-    use splice_core::UiState;
-    use splice_proto::MachineId;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::{Mutex, mpsc};
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-
-    const OPEN_ID: &str = "splice.open";
-    const DISCONNECT_ID: &str = "splice.disconnect";
-    const QUIT_ID: &str = "splice.quit";
-    const MACHINE_PREFIX: &str = "splice.machine.";
-
-    pub struct MacTray {
-        tray: tray_icon::TrayIcon,
-        actions: mpsc::Sender<AppAction>,
-        menu_sig: Mutex<u64>,
-    }
-
-    impl MacTray {
-        pub fn new(ctrl: &Controller, actions: mpsc::Sender<AppAction>) -> Result<Self, String> {
-            let icon = tray_icon::Icon::from_rgba(icon_rgba(64), 64, 64)
-                .map_err(|err| format!("icon: {err}"))?;
-            let tray = tray_icon::TrayIconBuilder::new()
-                .with_menu(Box::new(build_menu(&ctrl.state())))
-                .with_tooltip("Splice")
-                .with_icon(icon)
-                .with_menu_on_left_click(true)
-                .build()
-                .map_err(|err| format!("{err}"))?;
-            Ok(MacTray {
-                tray,
-                actions,
-                menu_sig: Mutex::new(0),
-            })
-        }
-
-        /// Forward native menu events into the action channel.
-        pub fn poll(&self) {
-            while let Ok(event) = MenuEvent::receiver().try_recv() {
-                let id = event.id().0.clone();
-                let action = match id.as_str() {
-                    OPEN_ID => Some(AppAction::Open),
-                    DISCONNECT_ID => Some(AppAction::DisconnectAll),
-                    QUIT_ID => Some(AppAction::Quit),
-                    _ => id
-                        .strip_prefix(MACHINE_PREFIX)
-                        .map(|mid| AppAction::ToggleMachine(MachineId(mid.to_owned()))),
-                };
-                if let Some(action) = action {
-                    let _ = self.actions.send(action);
-                }
-            }
-        }
-
-        /// Rebuild the menu when the machine set or labels changed.
-        pub fn sync(&self, state: &UiState) {
-            let mut hasher = DefaultHasher::new();
-            state.master_enabled.hash(&mut hasher);
-            for machine in &state.machines {
-                machine.id.0.hash(&mut hasher);
-                machine.enabled.hash(&mut hasher);
-                machine_menu_label(machine).hash(&mut hasher);
-            }
-            let sig = hasher.finish();
-
-            let mut stored = self.menu_sig.lock().unwrap_or_else(|e| e.into_inner());
-            if *stored != sig {
-                *stored = sig;
-                drop(stored);
-                self.tray.set_menu(Some(Box::new(build_menu(state))));
-            }
-        }
-    }
-
-    fn build_menu(state: &UiState) -> Menu {
-        let menu = Menu::new();
-        let _ = menu.append(&MenuItem::with_id(OPEN_ID, "Open Splice", true, None));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        for machine in state.machines.iter().filter(|m| m.id != state.self_id) {
-            let _ = menu.append(&CheckMenuItem::with_id(
-                format!("{MACHINE_PREFIX}{}", machine.id.0),
-                machine_menu_label(machine),
-                true,
-                machine.enabled,
-                None,
-            ));
-        }
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(
-            DISCONNECT_ID,
-            "Disconnect all",
-            true,
-            None,
-        ));
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id(QUIT_ID, "Quit Splice", true, None));
-        menu
-    }
-}
+#[path = "tray/macos.rs"]
+pub(crate) mod macos;
 
 #[cfg(target_os = "linux")]
 pub mod linux {
-    use super::{AppAction, icon_rgba, machine_menu_label};
+    use super::{icon_rgba, machine_menu_label, AppAction};
     use parking_lot::{Mutex, RwLock};
     use splice_core::UiState;
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
     pub struct LinuxTray {
@@ -316,7 +208,12 @@ pub mod linux {
                 }
             }
         });
-        LinuxTray { slot, tokio, menu_sig: Mutex::new(0), available }
+        LinuxTray {
+            slot,
+            tokio,
+            menu_sig: Mutex::new(0),
+            available,
+        }
     }
 
     impl LinuxTray {

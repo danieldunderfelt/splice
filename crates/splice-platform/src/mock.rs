@@ -15,9 +15,10 @@ use tokio::sync::mpsc;
 #[derive(Default)]
 pub struct MockState {
     pub raw_operation: Option<Arc<crate::raw::RawOperation>>,
-    pub raw_output: Option<mpsc::Sender<splice_proto::raw::RawReport>>,
+    pub raw_output: Option<mpsc::Sender<crate::raw::CapturedReport>>,
     pub raw_session: Option<u64>,
     pub raw_reports: Vec<splice_proto::raw::RawReport>,
+    pub raw_timestamps: Vec<u64>,
     pub raw_events: Vec<splice_proto::raw::RawEvent>,
     pub raw_error: Option<String>,
     pub raw_ledger: splice_proto::raw::RawLedger,
@@ -30,6 +31,9 @@ pub struct MockState {
     pub left: usize,
     pub release_all_calls: usize,
     pub remote_offers: Vec<ClipboardOffer>,
+    pub clipboard_offer_gate: Option<Arc<tokio::sync::Semaphore>>,
+    pub clipboard_offers_started: usize,
+    pub clipboard_offer_error: Option<String>,
     pub local_clip: std::collections::HashMap<String, Vec<u8>>,
 }
 
@@ -94,6 +98,18 @@ impl Clipboard for MockClipboard {
         offer: ClipboardOffer,
         fetch: Arc<dyn ClipFetch>,
     ) -> Result<()> {
+        let gate = {
+            let mut state = self.0.state.lock();
+            state.clipboard_offers_started += 1;
+            state.clipboard_offer_gate.clone()
+        };
+        if let Some(gate) = gate {
+            gate.acquire_owned().await
+                .map_err(|error| crate::PlatformError::Other(error.into()))?.forget();
+        }
+        if let Some(error) = &self.0.state.lock().clipboard_offer_error {
+            return Err(crate::PlatformError::Unavailable(error.clone()));
+        }
         self.0.state.lock().remote_offers.push(offer);
         *self.0.last_fetch.lock() = Some(fetch);
         Ok(())
@@ -155,7 +171,7 @@ impl crate::raw::RawCapture for MockRaw {
     }
     fn begin(
         &self,
-        output: mpsc::Sender<splice_proto::raw::RawReport>,
+        output: mpsc::Sender<crate::raw::CapturedReport>,
         _edge: Option<u32>,
         operation: Arc<crate::raw::RawOperation>,
     ) -> Result<()> {
@@ -194,7 +210,12 @@ impl crate::raw::RawEmulate for MockRaw {
         state.raw_ledger = Default::default();
         Ok(())
     }
-    fn inject(&self, session: u64, report: &splice_proto::raw::RawReport) -> Result<()> {
+    fn inject(
+        &self,
+        session: u64,
+        report: &splice_proto::raw::RawReport,
+        captured_local_us: u64,
+    ) -> Result<()> {
         let mut state = self.0.state.lock();
         if state.raw_session != Some(session) {
             return Err(crate::PlatformError::Unavailable(
@@ -210,6 +231,7 @@ impl crate::raw::RawEmulate for MockRaw {
             .map_err(|e| crate::PlatformError::Other(anyhow::anyhow!(e)))?;
         state.raw_events.extend(events);
         state.raw_reports.push(report.clone());
+        state.raw_timestamps.push(captured_local_us);
         Ok(())
     }
     fn end(&self, session: u64) -> Result<()> {

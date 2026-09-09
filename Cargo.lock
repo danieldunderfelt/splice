@@ -3970,6 +3970,7 @@ name = "splice-app"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "block2 0.6.2",
  "eframe",
  "egui",
  "image",

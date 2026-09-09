@@ -201,7 +201,7 @@ peer is online. Splice does not use MagicDNS for peer connections.
 
 ## Send and receive raw input
 
-Use the same protocol 4 build on every computer. Raw input requires `/dev/uinput` access even if
+Use the same protocol 5 build on every computer. Raw input requires `/dev/uinput` access even if
 the Desktop injection backend uses the Remote Desktop portal. Install the udev rule above; a
 missing permission produces a preparation error and restores local control.
 
@@ -210,8 +210,8 @@ The receiver creates `Splice Virtual Raw Mouse` and `Splice Virtual Raw Keyboard
 them alive across handoffs. The devices use relative mouse axes and preserve physical key codes.
 The destination desktop or game applies its own acceleration, keyboard layout, and repeat settings.
 
-To send raw input from Linux, choose **Raw input** for a Linux destination and enable
-**Stay on selected computer**. Cross a screen edge to begin, then press **Ctrl+Alt+F12** to
+To send raw input from Linux, choose **Raw input** for a Linux destination.
+Cross a screen edge to begin, then press **Ctrl+Alt+F12** to
 switch computers or return here. Source device access uses the same udev rule. USB cables, USB
 receivers, and Bluetooth devices that expose relative evdev mouse reports use the same capture path.
 Touchpads, tablets, and exclusive device grabs by remappers are unsupported in Raw mode.

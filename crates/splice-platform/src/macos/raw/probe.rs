@@ -22,6 +22,11 @@ struct CallbackReport {
     byte_lengths: std::collections::BTreeSet<isize>,
     invalid_reports: u64,
     last_error: Option<String>,
+    invalid_timestamps: u64,
+    max_callback_delay_us: u64,
+    max_native_interval_us: u64,
+    #[serde(skip)]
+    last_native_us: Option<u64>,
 }
 
 struct ProbeDevice {
@@ -128,6 +133,7 @@ unsafe extern "C" fn input(
     id: u32,
     bytes: *mut u8,
     length: isize,
+    timestamp: u64,
 ) {
     let probe = &mut *(context as *mut Probe);
     if id > 255 {
@@ -139,6 +145,19 @@ unsafe extern "C" fn input(
     };
     let stats = device.report.callbacks.entry(id).or_default();
     stats.count += 1;
+    let native_us = crate::raw::clock::mach_us(timestamp);
+    let now_us = crate::raw::clock::now_us();
+    if native_us == 0 || native_us > now_us {
+        stats.invalid_timestamps += 1;
+    } else {
+        stats.max_callback_delay_us = stats.max_callback_delay_us.max(now_us - native_us);
+        if let Some(last) = stats.last_native_us {
+            stats.max_native_interval_us = stats
+                .max_native_interval_us
+                .max(native_us.saturating_sub(last));
+        }
+        stats.last_native_us = Some(native_us);
+    }
     if stats.byte_lengths.len() < 32 {
         stats.byte_lengths.insert(length);
     }

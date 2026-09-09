@@ -163,7 +163,7 @@ fn main() -> eframe::Result<()> {
             tray::set_activation_policy_accessory();
             let ctrl = runtime::start(preview, cc.egui_ctx.clone());
             let (actions_tx, actions_rx) = std::sync::mpsc::channel();
-            let tray = tray::Tray::new(&ctrl, actions_tx);
+            let tray = tray::Tray::new(&ctrl, actions_tx, cc.egui_ctx.clone());
             Ok(Box::new(app::SpliceApp::new(
                 ctrl,
                 tray,

@@ -116,11 +116,11 @@ pub struct Inner {
 
     clip_lamport: u64,
     clip_seen: Option<Stamp>,
-    last_applied_inline: Option<String>,
     offer_id: u64,
     live_offer: Option<(u64, Vec<String>)>,
     pending_fetches: crate::clipboard::Transfers,
     clipboard_jobs: tokio::task::JoinSet<()>,
+    clipboard_offers: crate::clipboard::Offers,
 }
 
 impl Inner {
@@ -168,6 +168,7 @@ impl Inner {
             initial_displays: displays,
             capture,
             emulate,
+            clipboard_offers: crate::clipboard::Offers::new(clipboard.clone()),
             clipboard,
             platform_events: events,
             ts,
@@ -212,7 +213,6 @@ impl Inner {
             driven_grace_until: None,
             clip_lamport: 0,
             clip_seen: None,
-            last_applied_inline: None,
             offer_id: 0,
             live_offer: None,
             pending_fetches: crate::clipboard::Transfers::default(),
@@ -347,6 +347,7 @@ impl Inner {
         }
         self.stop_raw().await;
         self.pending_fetches.clear();
+        self.clipboard_offers.clear();
         self.clipboard_jobs.abort_all();
         if self.cfg_deadline.is_some() {
             self.save_config();
@@ -529,7 +530,6 @@ impl Inner {
                     self.raw_capture_failed(operation.error().expect("capture failure includes its reason")).await;
                 }
             }
-            PlatformEvent::RawError(reason) => self.raw_capture_failed(reason).await,
             PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id, along }) => {
                 self.on_edge_hit(edge_id, along).await;
             }
@@ -1086,6 +1086,7 @@ impl Inner {
                     self.stop_raw().await;
                 }
                 self.pending_fetches.disconnect(&id);
+                self.clipboard_offers.disconnect(&id);
                 tracing::debug!(peer = %id, reason, "peer disconnected");
                 let peer = self.peers.entry(id.clone()).or_default();
                 peer.error = Some(reason);
@@ -1538,6 +1539,7 @@ impl Inner {
                 if !on {
                     self.live_offer = None;
                     self.pending_fetches.clear();
+                    self.clipboard_offers.clear();
                     self.clipboard_jobs.abort_all();
                 }
                 self.mark_cfg_dirty();
@@ -1565,10 +1567,7 @@ impl Inner {
         if !self.cfg.clipboard_sync {
             return;
         }
-        // Loop guard: don't re-offer what we just applied from a remote offer.
-        if inline_text.is_some() && inline_text == self.last_applied_inline {
-            return;
-        }
+        self.clipboard_offers.clear();
         self.clip_lamport += 1;
         let stamp = Stamp { lamport: self.clip_lamport, writer: self.self_info.id.clone() };
         self.clip_seen = Some(stamp.clone());
@@ -1599,10 +1598,9 @@ impl Inner {
             return;
         }
         self.clip_seen = Some(stamp);
-        self.last_applied_inline = inline_text.clone();
         if let Some(net) = &self.net {
-            let fetch = self.pending_fetches.offer(net.clone(), from, id, mimes.clone());
-            let _ = self.clipboard.set_remote_offer(ClipboardOffer { id, mimes, inline_text }, fetch).await;
+            let fetch = self.pending_fetches.offer(net.clone(), from.clone(), id, mimes.clone());
+            self.clipboard_offers.set(from, ClipboardOffer { id, mimes, inline_text }, fetch);
         }
     }
 

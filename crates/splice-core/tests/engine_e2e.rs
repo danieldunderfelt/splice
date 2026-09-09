@@ -1145,12 +1145,81 @@ async fn enable_raw(a: &Rig, targets: &[&str]) {
             .iter()
             .map(|id| (mid(id), splice_proto::raw::InputMode::Raw))
             .collect(),
-        focus_lock: true,
         ..Default::default()
     };
-    a.handle.send(Command::SetInputSettings(settings));
+    a.handle.send(Command::SetInputSettings(settings.clone()));
     wait_until("raw settings applied", || {
-        a.handle.state().borrow().input_settings.focus_lock
+        a.handle.state().borrow().input_settings == settings
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_input_starts_without_enabling_desktop_focus_lock() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, c) = spawn_trio().await;
+    let settings = splice_core::input_settings::InputSettings {
+        destinations: [(mid("bbb"), splice_proto::raw::InputMode::Raw)].into(),
+        ..Default::default()
+    };
+    a.handle.send(Command::SetInputSettings(settings.clone()));
+    wait_until("raw selection applied with focus lock off", || {
+        a.handle.state().borrow().input_settings == settings
+    })
+    .await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw activation succeeds or reports an error", || {
+        let state = a.handle.state();
+        let state = state.borrow();
+        state.raw_active || state.input_error.is_some()
+    })
+    .await;
+    assert_eq!(a.handle.state().borrow().input_error, None);
+    assert!(a.handle.state().borrow().raw_active);
+    assert_eq!(a.handle.state().borrow().input_settings, settings);
+    assert_eq!(
+        splice_core::input_settings::InputSettings::load(&a.data_dir, 0).unwrap(),
+        settings
+    );
+
+    push_motion(&a, 10000.0, 0.0);
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(RawReport {
+            device: 1,
+            sequence: 0,
+            captured_us: splice_platform::raw::clock::now_us(),
+            events: vec![RawEvent::Motion { x: 10000, y: 0 }],
+        }.into())
+        .await
+        .unwrap();
+    wait_until("raw motion stays on the selected computer", || {
+        b.mock.state.lock().raw_reports.len() == 1
+    })
+    .await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert!(b.mock.state.lock().injected.is_empty());
+    assert!(c.mock.state.lock().entered.is_empty());
+
+    a.mock.events.send(PlatformEvent::SwitchTarget).unwrap();
+    wait_until("shortcut switches from raw to desktop", || {
+        focus_of(&a) == UiFocus::Remote(mid("ccc"))
+            && !a.handle.state().borrow().raw_active
+            && !c.mock.state.lock().entered.is_empty()
+    })
+    .await;
+    push_motion(&a, -3000.0, 0.0);
+    wait_until("desktop can cross back to raw with focus lock off", || {
+        focus_of(&a) == UiFocus::Remote(mid("bbb"))
+            && a.handle.state().borrow().raw_active
+    })
+    .await;
+    assert_eq!(a.handle.state().borrow().input_settings, settings);
+    a.handle.send(Command::SelectTarget(mid("aaa")));
+    wait_until("explicit return restores local control", || {
+        focus_of(&a) == UiFocus::Local
+            && !a.mock.state.lock().capturing
+            && b.mock.state.lock().raw_session.is_none()
     })
     .await;
 }
@@ -1170,7 +1239,7 @@ async fn raw_reports_cross_three_machine_sessions_without_desktop_motion_convers
         .send(RawReport {
             device: 1,
             sequence: 0,
-            captured_us: 1000,
+            captured_us: splice_platform::raw::clock::now_us(),
             events: vec![
                 RawEvent::Motion {
                     x: -10001,
@@ -1181,7 +1250,7 @@ async fn raw_reports_cross_three_machine_sessions_without_desktop_motion_convers
                     pressed: true,
                 },
             ],
-        })
+        }.into())
         .await
         .unwrap();
     wait_until("raw report injected", || {
@@ -1212,9 +1281,9 @@ async fn raw_reports_cross_three_machine_sessions_without_desktop_motion_convers
         .send(RawReport {
             device: 1,
             sequence: 1,
-            captured_us: 2000,
+            captured_us: splice_platform::raw::clock::now_us(),
             events: vec![RawEvent::Motion { x: 999, y: 999 }]
-        })
+        }.into())
         .await
         .is_err());
     a.handle.send(Command::SelectTarget(mid("aaa")));
@@ -1236,12 +1305,12 @@ async fn raw_target_failure_releases_source_and_every_held_key() {
         .send(RawReport {
             device: 1,
             sequence: 0,
-            captured_us: 0,
+            captured_us: splice_platform::raw::clock::now_us(),
             events: vec![RawEvent::Key {
                 code: 30,
                 pressed: true,
             }],
-        })
+        }.into())
         .await
         .unwrap();
     wait_until("raw key pressed", || {
@@ -1252,9 +1321,9 @@ async fn raw_target_failure_releases_source_and_every_held_key() {
         .send(RawReport {
             device: 1,
             sequence: 0,
-            captured_us: 1,
+            captured_us: splice_platform::raw::clock::now_us(),
             events: vec![RawEvent::Motion { x: 1, y: 2 }],
-        })
+        }.into())
         .await
         .unwrap();
     wait_until("duplicate report ends both sides", || {
@@ -1470,22 +1539,20 @@ async fn raw_polling_rates_preserve_reports_while_clipboard_is_busy() {
     let clipboard = tokio::spawn(async move { fetch.fetch("image/png").await });
     let mut expected = Vec::new();
     let mut sequence = 0;
-    let mut timestamp = 0;
     for hz in [125, 500, 1000] {
         let mut interval = tokio::time::interval(Duration::from_micros(1_000_000 / hz));
         for index in 0..hz / 4 {
             interval.tick().await;
-            timestamp += 1_000_000 / hz;
             let report = RawReport {
                 device: 1,
                 sequence,
-                captured_us: timestamp,
+                captured_us: splice_platform::raw::clock::now_us(),
                 events: vec![RawEvent::Motion {
                     x: -(index as i32) - 1,
                     y: index as i32 * 2 + 1,
                 }],
             };
-            output.try_send(report.clone()).unwrap();
+            output.try_send(report.clone().into()).unwrap();
             expected.push(report);
             sequence += 1;
         }
@@ -1513,12 +1580,12 @@ async fn raw_source_restart_reuses_wire_generation_without_retaining_keys_or_old
     old.send(RawReport {
         device: 1,
         sequence: 0,
-        captured_us: 0,
+        captured_us: splice_platform::raw::clock::now_us(),
         events: vec![RawEvent::Key {
             code: 42,
             pressed: true,
         }],
-    })
+    }.into())
     .await
     .unwrap();
     wait_until("key held before restart", || {
@@ -1576,9 +1643,9 @@ async fn raw_source_restart_reuses_wire_generation_without_retaining_keys_or_old
         .send(RawReport {
             device: 1,
             sequence: 0,
-            captured_us: 0,
+            captured_us: splice_platform::raw::clock::now_us(),
             events: vec![RawEvent::Motion { x: 7, y: -9 }],
-        })
+        }.into())
         .await
         .unwrap();
     wait_until("new stream injects after session reuse", || {
@@ -1634,13 +1701,13 @@ async fn linux_raw_switches_three_machines_and_reverses_direction_without_releas
     enter_linux_raw(&a, &b, EdgeSide::Right).await;
     let output = a.mock.state.lock().raw_output.clone().unwrap();
     let old_operation = a.mock.state.lock().raw_operation.clone().unwrap();
-    let report = RawReport { device: 1, sequence: 0, captured_us: 10, events: vec![
+    let report = RawReport { device: 1, sequence: 0, captured_us: splice_platform::raw::clock::now_us(), events: vec![
         RawEvent::Motion { x: -12345, y: 6789 },
         RawEvent::Key { code: 42, pressed: true },
         RawEvent::Button { number: 1, pressed: true },
         RawEvent::Wheel { x120: 15, y120: -30 },
     ] };
-    output.send(report.clone()).await.unwrap();
+    output.send(report.clone().into()).await.unwrap();
     push_motion(&a, 999.0, 777.0);
     wait_until("Linux report retains counts and button/key order", || b.mock.state.lock().raw_reports == [report.clone()]).await;
     assert!(b.mock.state.lock().injected.is_empty());
@@ -1653,17 +1720,17 @@ async fn linux_raw_switches_three_machines_and_reverses_direction_without_releas
     old_operation.fail("stale device failure".into());
     a.mock.events.send(PlatformEvent::RawCaptureFailed(old_operation)).unwrap();
     let current = a.mock.state.lock().raw_output.clone().unwrap();
-    let next = RawReport { device: 1, sequence: 0, captured_us: 20, events: vec![RawEvent::Motion { x: 7, y: -11 }] };
-    current.send(next.clone()).await.unwrap();
+    let next = RawReport { device: 1, sequence: 0, captured_us: splice_platform::raw::clock::now_us(), events: vec![RawEvent::Motion { x: 7, y: -11 }] };
+    current.send(next.clone().into()).await.unwrap();
     wait_until("old failure cannot stop the new raw session", || c.mock.state.lock().raw_reports == [next.clone()]).await;
-    assert!(output.send(report).await.is_err());
+    assert!(output.send(report.into()).await.is_err());
     a.mock.events.send(PlatformEvent::SwitchTarget).unwrap();
     wait_until("Linux shortcut returns home", || matches!(focus_of(&a), UiFocus::Local) && c.mock.state.lock().raw_session.is_none()).await;
     assert_eq!(a.mock.state.lock().capture_ends.len(), ends + 1);
     enable_raw(&b, &["aaa"]).await;
     enter_linux_raw(&b, &a, EdgeSide::Left).await;
     let reverse = b.mock.state.lock().raw_output.clone().unwrap();
-    reverse.send(RawReport { device: 7, sequence: 0, captured_us: 1, events: vec![RawEvent::Motion { x: 31, y: -47 }] }).await.unwrap();
+    reverse.send(RawReport { device: 7, sequence: 0, captured_us: splice_platform::raw::clock::now_us(), events: vec![RawEvent::Motion { x: 31, y: -47 }] }.into()).await.unwrap();
     wait_until("Linux raw works in reverse", || a.mock.state.lock().raw_reports.len() == 1).await;
     let operation = b.mock.state.lock().raw_operation.clone().unwrap();
     operation.fail("device permission revoked".into());
@@ -1730,7 +1797,7 @@ async fn linux_raw_stream_failure_keeps_its_reason_without_a_platform_notificati
     enter_linux_raw(&a, &b, EdgeSide::Right).await;
     let output = a.mock.state.lock().raw_output.take().unwrap();
     let operation = a.mock.state.lock().raw_operation.clone().unwrap();
-    output.send(RawReport { device: 1, sequence: 0, captured_us: 1, events: vec![RawEvent::Key { code: 42, pressed: true }] }).await.unwrap();
+    output.send(RawReport { device: 1, sequence: 0, captured_us: splice_platform::raw::clock::now_us(), events: vec![RawEvent::Key { code: 42, pressed: true }] }.into()).await.unwrap();
     wait_until("target receives held Shift", || b.mock.state.lock().raw_reports.len() == 1).await;
     operation.fail("kernel input queue overflowed".into());
     drop(output);
@@ -1754,4 +1821,156 @@ async fn desktop_snapshot_and_callback_duplicates_produce_one_transition() {
     }
     wait_until("keyboard and button releases arrive", || b.mock.state.lock().injected.contains(&button_up)).await;
     assert_eq!(b.mock.state.lock().injected, [press, button, release, button_up]);
+}
+
+#[tokio::test]
+async fn expired_raw_capture_releases_held_input_without_replaying_a_stale_queue() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw source active", || {
+        a.handle.state().borrow().raw_active && a.mock.state.lock().raw_output.is_some()
+    })
+    .await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(
+            RawReport {
+                device: 1,
+                sequence: 0,
+                captured_us: splice_platform::raw::clock::now_us(),
+                events: vec![RawEvent::Key {
+                    code: 42,
+                    pressed: true,
+                }],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    wait_until("target key held", || {
+        !b.mock.state.lock().raw_reports.is_empty()
+    })
+    .await;
+    output
+        .send(
+            RawReport {
+                device: 1,
+                sequence: 1,
+                captured_us: splice_platform::raw::clock::now_us() - 751_000,
+                events: vec![RawEvent::Motion { x: 100, y: 200 }],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    wait_until("expired capture released", || {
+        matches!(focus_of(&a), UiFocus::Local) && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert_eq!(b.mock.state.lock().raw_reports.len(), 1);
+    assert!(b.mock.state.lock().raw_events.contains(&RawEvent::Key {
+        code: 42,
+        pressed: false
+    }));
+    assert!(a
+        .handle
+        .state()
+        .borrow()
+        .input_error
+        .as_deref()
+        .is_some_and(|error| error.contains("750 ms capture age")), "{:?}", a.handle.state().borrow().input_error);
+}
+
+#[tokio::test]
+async fn stalled_clipboard_offer_cannot_block_input_or_emergency_release() {
+    let (a, b) = spawn_pair().await;
+    drive_a_to_b(&a, &b).await;
+    push_key(&a, 42, true);
+    wait_until("remote shift held", || injected(&b).contains(&InputEvent::Key { code: 42, pressed: true })).await;
+    let releases_before = b.mock.state.lock().release_all_calls;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    b.mock.state.lock().clipboard_offer_gate = Some(gate);
+    a.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("pending clipboard".into()),
+    }).unwrap();
+    wait_until("clipboard backend entered", || b.mock.state.lock().clipboard_offers_started == 1).await;
+    push_key(&a, 42, false);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while !injected(&b).contains(&InputEvent::Key { code: 42, pressed: false }) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("a clipboard backend stall blocked a remote key release");
+    b.handle.send(Command::Panic);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while b.mock.state.lock().release_all_calls <= releases_before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("a clipboard backend stall blocked emergency key release");
+    b.handle.send(Command::SetClipboardSync(false));
+    wait_until("clipboard disabled while backend blocked", || !b.handle.state().borrow().clipboard_sync).await;
+}
+
+#[tokio::test]
+async fn blocked_clipboard_offers_keep_only_the_latest_and_cancel_on_disable() {
+    let (a, b) = spawn_pair().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    b.mock.state.lock().clipboard_offer_gate = Some(gate.clone());
+    for (count, text) in [(1, "first"), (2, "latest")] {
+        a.mock.events.send(PlatformEvent::ClipboardChanged {
+            mimes: vec![TEXT_MIME.into()], inline_text: Some(text.into()),
+        }).unwrap();
+        wait_until("clipboard offer started", || b.mock.state.lock().clipboard_offers_started == count).await;
+    }
+    gate.add_permits(1);
+    wait_until("latest clipboard offer applied", || b.mock.state.lock().remote_offers.len() == 1).await;
+    assert_eq!(b.mock.state.lock().remote_offers[0].inline_text.as_deref(), Some("latest"));
+    a.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("canceled".into()),
+    }).unwrap();
+    wait_until("next clipboard offer stalled", || b.mock.state.lock().clipboard_offers_started == 3).await;
+    b.handle.send(Command::SetClipboardSync(false));
+    wait_until("sync disabled", || !b.handle.state().borrow().clipboard_sync).await;
+    gate.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(b.mock.state.lock().remote_offers.len(), 1);
+}
+
+#[tokio::test]
+async fn recopying_an_earlier_remote_clipboard_value_is_broadcast() {
+    let (a, b) = spawn_pair().await;
+    a.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("original".into()),
+    }).unwrap();
+    wait_until("original applied on B", || b.mock.state.lock().remote_offers.len() == 1).await;
+    b.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("replacement".into()),
+    }).unwrap();
+    wait_until("replacement applied on A", || a.mock.state.lock().remote_offers.len() == 1).await;
+    b.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("original".into()),
+    }).unwrap();
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while a.mock.state.lock().remote_offers.len() != 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("recopying the earlier remote value was mistaken for an echo");
+    assert_eq!(a.mock.state.lock().remote_offers[1].inline_text.as_deref(), Some("original"));
+}
+
+#[tokio::test]
+async fn failed_remote_offer_cannot_suppress_a_local_copy_of_the_same_text() {
+    let (a, b) = spawn_pair().await;
+    b.mock.state.lock().clipboard_offer_error = Some("clipboard portal unavailable".into());
+    a.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("same text".into()),
+    }).unwrap();
+    wait_until("remote offer attempted", || b.mock.state.lock().clipboard_offers_started == 1).await;
+    assert!(b.mock.state.lock().remote_offers.is_empty());
+    b.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into()], inline_text: Some("same text".into()),
+    }).unwrap();
+    wait_until("local copy delivered", || a.mock.state.lock().remote_offers.len() == 1).await;
+    assert_eq!(a.mock.state.lock().remote_offers[0].inline_text.as_deref(), Some("same text"));
 }

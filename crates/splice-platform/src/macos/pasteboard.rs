@@ -12,7 +12,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSString};
 use splice_proto::CLIP_INLINE_TEXT_MAX;
-use std::sync::atomic::{AtomicI64, Ordering};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,13 +65,13 @@ pub fn normalize(utis: &[String]) -> Vec<String> {
 pub struct PasteboardClip {
     shared: Arc<MacShared>,
     /// changeCount produced by our own writes, skipped by the poller (loop guard).
-    own_change: Arc<AtomicI64>,
+    own_change: Arc<Mutex<i64>>,
     runtime: tokio::runtime::Handle,
 }
 
 impl PasteboardClip {
     pub fn new(shared: Arc<MacShared>) -> Self {
-        let own_change = Arc::new(AtomicI64::new(-1));
+        let own_change = Arc::new(Mutex::new(-1));
         let this = Self {
             shared: shared.clone(),
             own_change: own_change.clone(),
@@ -87,12 +87,13 @@ impl PasteboardClip {
 
 /// NSPasteboard has no change notification; polling changeCount is cheap and is what every
 /// macOS clipboard manager does.
-fn poll_loop(shared: Arc<MacShared>, own_change: Arc<AtomicI64>) {
+fn poll_loop(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>) {
     let mut last = pasteboard_change_count();
-    loop {
+    while !shared.tx.is_closed() {
         std::thread::sleep(POLL_INTERVAL);
+        let own_change = own_change.lock();
         let count = pasteboard_change_count();
-        if count == last || count == own_change.load(Ordering::SeqCst) {
+        if count == last || count == *own_change {
             last = count;
             continue;
         }
@@ -162,6 +163,7 @@ impl Clipboard for PasteboardClip {
             inline_text: offer.inline_text.clone(),
             runtime: self.runtime.clone(),
         });
+        let mut own_change = self.own_change.lock();
         let count = objc2::rc::autoreleasepool(|_| {
             let pb = NSPasteboard::generalPasteboard();
             pb.clearContents();
@@ -175,7 +177,8 @@ impl Clipboard for PasteboardClip {
             pb.writeObjects(&NSArray::from_slice(&[writable]));
             pb.changeCount() as i64
         });
-        self.own_change.store(count, Ordering::SeqCst);
+        *own_change = count;
+        drop(own_change);
         self.shared.set_health(|h| h.clipboard = None);
         Ok(())
     }

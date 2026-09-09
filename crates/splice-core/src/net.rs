@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
+
+const INBOUND_ADMISSION_LIMIT: usize = 16;
 
 /// Session → engine notifications.
 #[derive(Debug)]
@@ -179,6 +181,7 @@ impl NetManager {
             ts,
             opts,
             status_cache: tokio::sync::Mutex::new(None),
+            inbound_admission: Arc::new(Semaphore::new(INBOUND_ADMISSION_LIMIT)),
             next_seq: AtomicU64::new(1),
             diagnostics: RwLock::new(Default::default()),
         });
@@ -209,6 +212,7 @@ pub(crate) struct NetControlInner {
     opts: NetOpts,
     /// Last tailscale status + fetch time, for inbound WhoIs authorization.
     status_cache: tokio::sync::Mutex<Option<(Instant, splice_tailscale::Status)>>,
+    inbound_admission: Arc<Semaphore>,
     next_seq: AtomicU64,
     diagnostics: RwLock<std::collections::BTreeMap<MachineId, PeerDiagnostics>>,
 }
@@ -330,6 +334,13 @@ async fn accept_loop(inner: Arc<NetControlInner>, listener: TcpListener) {
         };
         match accepted {
             Ok((sock, remote)) => {
+                let permit = match inner.inbound_admission.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        drop(sock);
+                        continue;
+                    }
+                };
                 let inner = inner.clone();
                 tokio::spawn(async move {
                     let authorized = tokio::select! {
@@ -342,7 +353,7 @@ async fn accept_loop(inner: Arc<NetControlInner>, listener: TcpListener) {
                         // another node.
                         tokio::select! {
                             _ = inner.events.closed() => {}
-                            _ = session::run(inner.clone(), sock, session::Role::Listener, Some(peer_id)) => {}
+                            _ = session::run(inner.clone(), sock, session::Role::Listener, Some(peer_id), Some(permit)) => {}
                         }
                     } else {
                         tracing::warn!(%remote, "peer authorization failed or timed out");
@@ -412,7 +423,7 @@ async fn dial_loop(inner: Arc<NetControlInner>, id: MachineId) {
             Ok(Ok(sock)) => {
                 let connected = tokio::select! {
                     _ = inner.events.closed() => break,
-                    connected = session::run(inner.clone(), sock, session::Role::Dialer, Some(id.clone())) => connected,
+                    connected = session::run(inner.clone(), sock, session::Role::Dialer, Some(id.clone()), None) => connected,
                 };
                 if connected {
                     backoff = inner.opts.backoff_min;

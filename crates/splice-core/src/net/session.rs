@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit};
 
 #[derive(Default)]
 pub(crate) struct Liveness {
@@ -220,6 +220,7 @@ pub(crate) async fn run(
     mut sock: TcpStream,
     role: Role,
     expected: Option<MachineId>,
+    admission: Option<OwnedSemaphorePermit>,
 ) -> bool {
     let _ = sock.set_nodelay(true);
     let peer_addr = sock
@@ -299,6 +300,7 @@ pub(crate) async fn run(
                 caps: welcome.caps,
                 addr: peer_addr,
             });
+            drop(admission);
             session_loop(inner, sock, peer, cmd_rx, active, seq).await
         }
         Role::Listener => {
@@ -362,6 +364,7 @@ pub(crate) async fn run(
                 caps,
                 addr: peer_addr,
             });
+            drop(admission);
             session_loop(inner, sock, peer, cmd_rx, active, seq).await
         }
     }
@@ -373,6 +376,24 @@ fn cadence(inner: &NetControlInner, active: &Liveness) -> Duration {
     } else {
         inner.opts.idle_hb
     }
+}
+
+fn heartbeat_wake(
+    inner: &NetControlInner,
+    active: &Liveness,
+    next_ping: Instant,
+    outstanding: &Option<(u64, u64, Instant)>,
+    degraded_since: Option<Instant>,
+) -> Instant {
+    let cad = cadence(inner, active);
+    let mut wake = next_ping;
+    if let Some((_, _, sent)) = outstanding {
+        wake = wake.min(*sent + cad.mul_f64(MISS_WINDOW));
+    }
+    if let Some(since) = degraded_since {
+        wake = wake.min(since + inner.opts.degraded_timeout);
+    }
+    wake
 }
 
 /// Frame pump + heartbeat until the socket, the reader, or NetControl ends the session.
@@ -499,37 +520,41 @@ async fn session_loop(
                 Some(Err(e)) => break format!("read: {e}"),
                 None => break "reader stopped".to_string(),
             },
-            _ = tokio::time::sleep_until(next_ping.into()) => {
+            _ = tokio::time::sleep_until(heartbeat_wake(&inner, &active, next_ping, &outstanding, degraded_since).into()) => {
+                let now = Instant::now();
                 let cad = cadence(&inner, &active);
-                if let Some((_, _, sent)) = &outstanding {
-                    if sent.elapsed() > cad.mul_f64(MISS_WINDOW) {
-                        misses += 1;
-                        outstanding = None;
-                        if misses >= inner.opts.max_misses && !degraded {
-                            { let mut entries = inner.diagnostics.write(); let entry = entries.entry(peer.clone()).or_default(); entry.phase = ConnectionPhase::Degraded; entry.phase_changed_ms = unix_ms(); }
-                            degraded = true;
-                            degraded_since = Some(Instant::now());
-                            let _ = inner.events.send(PeerEvent::Degraded(peer.clone()));
-                        }
+                let expired = outstanding
+                    .as_ref()
+                    .is_some_and(|(_, _, sent)| now >= *sent + cad.mul_f64(MISS_WINDOW));
+                if expired {
+                    misses += 1;
+                    outstanding = None;
+                    if misses >= inner.opts.max_misses && !degraded {
+                        { let mut entries = inner.diagnostics.write(); let entry = entries.entry(peer.clone()).or_default(); entry.phase = ConnectionPhase::Degraded; entry.phase_changed_ms = unix_ms(); }
+                        degraded = true;
+                        degraded_since = Some(now);
+                        let _ = inner.events.send(PeerEvent::Degraded(peer.clone()));
                     }
                 }
                 if degraded_since
-                    .is_some_and(|since| since.elapsed() >= inner.opts.degraded_timeout)
+                    .is_some_and(|since| now >= since + inner.opts.degraded_timeout)
                 {
                     break "heartbeat timeout".to_string();
                 }
-                if outstanding.is_none() {
-                    nonce += 1;
-                    let t_us = epoch.elapsed().as_micros() as u64;
-                    let ping = Frame::Ping { nonce, t_us };
-                    if let Err(e) =
-                        write_with_timeout(inner.opts.write_timeout, &mut wr, &ping, &mut write_buf).await
-                    {
-                        break format!("write: {e}");
+                if next_ping <= now || expired {
+                    if outstanding.is_none() {
+                        nonce += 1;
+                        let t_us = epoch.elapsed().as_micros() as u64;
+                        let ping = Frame::Ping { nonce, t_us };
+                        if let Err(e) =
+                            write_with_timeout(inner.opts.write_timeout, &mut wr, &ping, &mut write_buf).await
+                        {
+                            break format!("write: {e}");
+                        }
+                        outstanding = Some((nonce, t_us, Instant::now()));
                     }
-                    outstanding = Some((nonce, t_us, Instant::now()));
+                    next_ping = Instant::now() + cad;
                 }
-                next_ping = Instant::now() + cad;
             }
         }
     };

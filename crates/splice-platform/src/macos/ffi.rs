@@ -38,6 +38,8 @@ pub const kIOPMUserActiveLocal: c_int = 0;
 #[cfg_attr(target_os = "macos", link(name = "CoreGraphics", kind = "framework"))]
 extern "C" {
     pub fn CGEventSourceCreate(state_id: CGEventSourceStateID) -> CGEventSourceRef;
+    pub fn CGEventSourceButtonState(state_id: CGEventSourceStateID, button: u32) -> bool;
+    pub fn CGEventSourceKeyState(state_id: CGEventSourceStateID, key: CGKeyCode) -> bool;
     pub fn CGEventSourceCounterForEventType(state_id: CGEventSourceStateID, event_type: u32)
         -> u32;
     pub fn CGEventCreateMouseEvent(

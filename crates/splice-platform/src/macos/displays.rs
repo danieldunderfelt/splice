@@ -5,11 +5,17 @@ use super::MacShared;
 use crate::PlatformEvent;
 use core_graphics::display::{
     CGDisplay, CGDisplayChangeSummaryFlags, CGDisplayRegisterReconfigurationCallback,
-    CGDirectDisplayID,
+    CGDisplayRemoveReconfigurationCallback, CGDirectDisplayID,
 };
 use splice_proto::DisplayRect;
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+
+static NEXT_REGISTRATION: AtomicUsize = AtomicUsize::new(1);
+static REGISTRATIONS: LazyLock<parking_lot::Mutex<HashMap<usize, Arc<MacShared>>>> =
+    LazyLock::new(Default::default);
 
 /// Current active displays, in CG global points.
 pub fn snapshot() -> Vec<DisplayRect> {
@@ -49,11 +55,32 @@ pub fn corners(displays: &[DisplayRect]) -> Vec<(f64, f64)> {
     out
 }
 
-/// Registers the reconfiguration callback. The `Arc` is leaked deliberately: CG has no
-/// unregister-on-drop story and the platform lives for the whole process.
-pub fn register(shared: Arc<MacShared>) {
-    let raw = Arc::into_raw(shared) as *const c_void;
-    unsafe { CGDisplayRegisterReconfigurationCallback(on_reconfigure, raw) };
+pub struct Registration(usize);
+
+pub fn register(shared: Arc<MacShared>) -> crate::Result<Registration> {
+    let id = NEXT_REGISTRATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| crate::PlatformError::Unavailable("display registration IDs exhausted".into()))?;
+    REGISTRATIONS.lock().insert(id, shared);
+    let result = unsafe {
+        CGDisplayRegisterReconfigurationCallback(on_reconfigure, id as *const c_void)
+    };
+    if result != 0 {
+        REGISTRATIONS.lock().remove(&id);
+        return Err(crate::PlatformError::Unavailable(format!(
+            "cannot monitor macOS display changes: CoreGraphics error {result}"
+        )));
+    }
+    Ok(Registration(id))
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        REGISTRATIONS.lock().remove(&self.0);
+        unsafe {
+            CGDisplayRemoveReconfigurationCallback(on_reconfigure, self.0 as *const c_void);
+        }
+    }
 }
 
 unsafe extern "C" fn on_reconfigure(_display: CGDirectDisplayID, flags: u32, user_info: *const c_void) {
@@ -63,8 +90,31 @@ unsafe extern "C" fn on_reconfigure(_display: CGDirectDisplayID, flags: u32, use
     {
         return;
     }
-    let shared = &*(user_info as *const MacShared);
+    let Some(shared) = REGISTRATIONS.lock().get(&(user_info as usize)).cloned() else {
+        return;
+    };
     let displays = snapshot();
     *shared.displays.write() = displays.clone();
     shared.emit(PlatformEvent::DisplaysChanged { displays });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unregistering_releases_display_observer_state() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Arc::new(MacShared {
+            tx,
+            displays: parking_lot::RwLock::new(Vec::new()),
+            health: parking_lot::Mutex::new(Default::default()),
+        });
+        let weak = Arc::downgrade(&shared);
+        let registration = register(shared).unwrap();
+        let id = registration.0;
+        drop(registration);
+        unsafe { on_reconfigure(0, 0, id as *const c_void) };
+        assert!(weak.upgrade().is_none());
+    }
 }
