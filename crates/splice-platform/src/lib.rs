@@ -141,6 +141,7 @@ pub struct ClipboardOffer {
 /// Events flowing from platform monitors to the engine.
 #[derive(Clone, Debug)]
 pub enum PlatformEvent {
+    RawBoundary { session: u64, edge: EdgeSpec, along: f64 },
     SwitchTarget,
     RawCaptureFailed(Arc<raw::RawOperation>),
     Capture(CaptureEvent),

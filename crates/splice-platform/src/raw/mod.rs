@@ -54,6 +54,7 @@ pub trait RawCapture: Send + Sync {
 pub trait RawEmulate: Send + Sync {
     async fn prepare(&self) -> Result<()>;
     fn begin(&self, session: u64) -> Result<()>;
+    fn boundary_policy(&self, session: u64, boundary: bool) -> Result<()>;
     fn inject(&self, session: u64, report: &RawReport, captured_local_us: u64) -> Result<()>;
     fn end(&self, session: u64) -> Result<()>;
 }

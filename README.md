@@ -146,11 +146,13 @@ failures, fixes, and remaining live verification.
 
 Splice supports selectable raw input from Linux and Mac sources to Linux destinations through a
 relative virtual mouse and keyboard. Desktop mode remains the default in every existing direction.
-Raw mode stays on the selected computer automatically. Use **Ctrl+Alt+F12** to cycle through computers,
+Raw mode uses the destination's screen boundaries to return or move onward. Enable **Stay on selected
+computer** to disable automatic switching during games. Use **Ctrl+Alt+F12** to cycle through computers,
 or use the **Control** buttons during capture. On Linux, start capture by crossing a screen edge.
 Mac sources also have Immediate, Dwell, and Resistance crossing.
 
 See [Linux raw input setup and validation](docs/raw-input-linux.md) for device requirements and checks.
 Native Mac capture and gaming validation are pending. See the [implementation status](docs/raw-input-design.md)
 and [Mac build and validation handoff](docs/raw-input-macos-handoff.md) before releasing raw mode.
-Raw input uses TCP 41719 on the Tailscale interface, in addition to KVM port 41717 and updater port 41718.
+Input uses UDP 41717 (Desktop) and UDP 41719 (Raw) on the Tailscale interface.
+Keep TCP 41717 for control and clipboard, and TCP 41718 for updates. Every computer must use protocol 6.

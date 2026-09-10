@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTO_VERSION: u16 = 5;
+pub const PROTO_VERSION: u16 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
@@ -217,9 +217,23 @@ impl LayoutDoc {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Frame {
+    InputOffer { port: u16, token: [u8; 16] },
+    RawBoundary {
+        session: u64,
+        target: MachineId,
+        pos: Vec2,
+    },
+    RawBoundaryAck {
+        session: u64,
+    },
+    RawBoundaryPolicy {
+        session: u64,
+        boundary: bool,
+    },
     RawPrepare {
         session: u64,
         pos: Vec2,
+        boundary: bool,
     },
     RawReady {
         session: u64,

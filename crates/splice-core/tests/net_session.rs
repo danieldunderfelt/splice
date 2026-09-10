@@ -435,7 +435,9 @@ async fn inbound_admission_releases_after_handshake_success() {
     write_frame(&mut sockets[0], &hello).await.expect("hello");
     assert!(matches!(read_frame(&mut sockets[0]).await.expect("welcome"), Frame::Welcome(_)));
     write_frame(&mut sockets[0], &Frame::Ready).await.expect("ready");
+    let udp = answer_input_offer(&mut sockets[0]).await;
     wait_for(&mut manager, Duration::from_secs(2), connected("bbb")).await;
+    udp.abort();
 
     ts.release.add_permits(1);
     sockets.push(tokio::net::TcpStream::connect(manager.local_addr).await.expect("connect"));
@@ -632,4 +634,25 @@ async fn an_unmatched_pong_cannot_recover_a_degraded_peer() {
     })
     .await;
     assert!(matches!(event, PeerEvent::Disconnected(..)), "unmatched pong falsely restored health: {event:?}");
+}
+
+async fn answer_input_offer(socket: &mut tokio::net::TcpStream) -> tokio::task::JoinHandle<()> {
+    use splice_proto::framing::{read_frame, write_frame};
+    let Frame::InputOffer { port, token } = read_frame(socket).await.unwrap() else { panic!("missing UDP offer") };
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let remote = SocketAddr::new(LOCAL, port);
+    write_frame(socket, &Frame::InputOffer { port: udp.local_addr().unwrap().port(), token: [9; 16] }).await.unwrap();
+    tokio::spawn(async move {
+        let mut bytes = [0; 1200];
+        while let Ok((count, address)) = udp.recv_from(&mut bytes).await {
+            assert_eq!(address, remote);
+            assert_eq!(&bytes[..4], b"SPI6");
+            assert_eq!(&bytes[4..20], &[9; 16]);
+            if bytes[20] == 0 {
+                bytes[4..20].copy_from_slice(&token);
+                bytes[20] = 1;
+                udp.send_to(&bytes[..count], remote).await.unwrap();
+            }
+        }
+    })
 }

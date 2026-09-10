@@ -17,6 +17,7 @@ pub struct MockState {
     pub raw_operation: Option<Arc<crate::raw::RawOperation>>,
     pub raw_output: Option<mpsc::Sender<crate::raw::CapturedReport>>,
     pub raw_session: Option<u64>,
+    pub raw_boundary_policies: Vec<(u64, bool)>,
     pub raw_reports: Vec<splice_proto::raw::RawReport>,
     pub raw_timestamps: Vec<u64>,
     pub raw_events: Vec<splice_proto::raw::RawEvent>,
@@ -208,6 +209,16 @@ impl crate::raw::RawEmulate for MockRaw {
         }
         state.raw_session = Some(session);
         state.raw_ledger = Default::default();
+        Ok(())
+    }
+    fn boundary_policy(&self, session: u64, boundary: bool) -> Result<()> {
+        let mut state = self.0.state.lock();
+        if state.raw_session != Some(session) {
+            return Err(crate::PlatformError::Unavailable(
+                "stale raw boundary policy".into(),
+            ));
+        }
+        state.raw_boundary_policies.push((session, boundary));
         Ok(())
     }
     fn inject(

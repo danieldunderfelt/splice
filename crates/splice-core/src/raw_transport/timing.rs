@@ -1,14 +1,14 @@
 const WINDOW_US: u64 = 10_000_000;
 
 #[derive(Default)]
-pub(super) struct ClockMap {
+pub(crate) struct ClockMap {
     start_us: Option<u64>,
     current: Option<i128>,
     previous: Option<i128>,
 }
 
 impl ClockMap {
-    pub(super) fn observe(&mut self, sent_us: u64, received_us: u64) {
+    pub(crate) fn observe(&mut self, sent_us: u64, received_us: u64) {
         let start = *self.start_us.get_or_insert(received_us);
         let elapsed = received_us.saturating_sub(start);
         if elapsed >= WINDOW_US {
@@ -24,7 +24,7 @@ impl ClockMap {
         self.current = Some(self.current.map_or(offset, |old| old.min(offset)));
     }
 
-    pub(super) fn map(&self, native_us: u64) -> u64 {
+    pub(crate) fn map(&self, native_us: u64) -> u64 {
         let offset = self
             .current
             .into_iter()

@@ -266,7 +266,7 @@ async fn held_modifiers_follow_the_pointer_across_three_machines() {
     a.mock.events.send(PlatformEvent::Capture(CaptureEvent::Input(release))).unwrap();
     wait_until("third machine receives Shift release", || c.mock.state.lock().injected.contains(&release)).await;
     push_motion(&a, -2200.0, 0.0);
-    wait_until("pointer returns to the middle", || matches!(focus_of(&b), UiFocus::Driven(id) if id == mid("aaa")))
+    wait_until("pointer returns to the middle", || b.mock.state.lock().entered.len() >= 2 && matches!(focus_of(&b), UiFocus::Driven(id) if id == mid("aaa")))
         .await;
     push_motion(&a, -2200.0, 0.0);
     wait_until("pointer returns home", || matches!(focus_of(&a), UiFocus::Local) && !a.mock.state.lock().capturing)
@@ -641,6 +641,11 @@ async fn source_claim_ends_remote_capture() {
     })
     .await;
     wait_until("A back to Local", || matches!(focus_of(&a), UiFocus::Local)).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(connected_to(&a, "bbb") && connected_to(&b, "aaa"));
+    for rig in [&a, &b] {
+        assert!(rig.handle.state().borrow().diagnostics.peers.values().all(|peer| peer.disconnects == 0));
+    }
 }
 
 #[tokio::test]
@@ -1152,6 +1157,29 @@ async fn enable_raw(a: &Rig, targets: &[&str]) {
         a.handle.state().borrow().input_settings == settings
     })
     .await;
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_returns_control_to_mac() {
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw session is active", || a.handle.state().borrow().raw_active).await;
+    let edge = b.mock.state.lock().edges.iter().find(|edge| edge.side == EdgeSide::Left).cloned().unwrap();
+    b.mock.events.send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+        edge_id: edge.id,
+        along: 500.0,
+    })).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    let session = b.mock.state.lock().raw_session.unwrap();
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    tokio::time::timeout(Duration::from_millis(750), async {
+        while focus_of(&a) != UiFocus::Local || b.mock.state.lock().raw_session.is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("the actual destination boundary must return control to the Mac");
+    assert!(!a.mock.state.lock().capturing);
 }
 
 #[tokio::test]
@@ -1973,4 +2001,437 @@ async fn failed_remote_offer_cannot_suppress_a_local_copy_of_the_same_text() {
     }).unwrap();
     wait_until("local copy delivered", || a.mock.state.lock().remote_offers.len() == 1).await;
     assert_eq!(a.mock.state.lock().remote_offers[0].inline_text.as_deref(), Some("same text"));
+}
+
+fn raw_boundary_edge(rig: &Rig, side: EdgeSide) -> (u64, EdgeSpec) {
+    let state = rig.mock.state.lock();
+    let session = state.raw_session.expect("raw destination session active");
+    let edge = state
+        .edges
+        .iter()
+        .find(|edge| edge.side == side)
+        .unwrap_or_else(|| panic!("destination edge {side:?} armed"))
+        .clone();
+    (session, edge)
+}
+
+fn hit_raw_boundary(rig: &Rig, session: u64, edge: &EdgeSpec, along: f64) {
+    rig.mock
+        .events
+        .send(PlatformEvent::RawBoundary {
+            session,
+            edge: edge.clone(),
+            along,
+        })
+        .unwrap();
+}
+
+async fn spawn_vertical_pair(b_offset: Vec2I) -> (Rig, Rig) {
+    let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    na.os = "macos".into();
+    let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let a = spawn_rig_with(na.clone(), vec![nb.clone()]).await;
+    let b = spawn_rig_with(nb.clone(), vec![na.clone()]).await;
+    a.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
+    b.dial_ports.write().unwrap().insert(mid("aaa"), a.addr.port());
+    wait_until("vertical pair connects", || {
+        connected_to(&a, "bbb") && connected_to(&b, "aaa")
+    })
+    .await;
+    a.handle.send(Command::SetArrangement(vec![
+        (mid("aaa"), Vec2I { x: 0, y: 0 }),
+        (mid("bbb"), b_offset),
+    ]));
+    wait_until("vertical layout converges", || {
+        [&a, &b].iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 1 && state.edges.iter().all(|edge| edge.crossable)
+        })
+    })
+    .await;
+    (a, b)
+}
+
+async fn spawn_rig_displays(self_node: Node, peers: Vec<Node>, displays: Vec<DisplayRect>) -> Rig {
+    let (platform, mock) = mock::create(displays);
+    let whois = peers
+        .iter()
+        .filter_map(|peer| peer.ips.first().map(|ip| (*ip, (peer.stable_id.clone(), USER))))
+        .collect();
+    let ts = FakeTs {
+        self_node: self_node.clone(),
+        peers,
+        whois: Arc::new(whois),
+    };
+    let opts = test_opts();
+    let dial_ports = opts.dial_ports.clone();
+    let dir = temp_dir(&self_node.stable_id);
+    splice_core::config::save(&dir, &splice_core::config::Config::default()).unwrap();
+    let handle = Engine::spawn_with(platform, Arc::new(ts), dir.clone(), opts, Duration::from_millis(50))
+        .await
+        .expect("spawn engine");
+    let addr = handle.bound_addr().await.expect("bootstrap binds a listener");
+    Rig { handle, mock, dial_ports, addr, data_dir: dir }
+}
+
+async fn spawn_trio_with_a_config(config: splice_core::config::Config) -> (Rig, Rig, Rig) {
+    let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    na.os = "macos".into();
+    let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let nc = node_at("ccc", Ipv4Addr::new(127, 0, 0, 3));
+    let a = spawn_rig_configured(na.clone(), vec![nb.clone(), nc.clone()], config).await;
+    let b = spawn_rig_with(nb.clone(), vec![na.clone(), nc.clone()]).await;
+    let c = spawn_rig_with(nc, vec![na, nb]).await;
+    for (rig, peers) in [
+        (&a, [(&mid("bbb"), &b), (&mid("ccc"), &c)]),
+        (&b, [(&mid("aaa"), &a), (&mid("ccc"), &c)]),
+        (&c, [(&mid("aaa"), &a), (&mid("bbb"), &b)]),
+    ] {
+        let mut ports = rig.dial_ports.write().unwrap();
+        for (id, peer) in peers {
+            ports.insert(id.clone(), peer.addr.port());
+        }
+    }
+    wait_until("all three machines connect to each other", || {
+        connected_to(&a, "bbb")
+            && connected_to(&a, "ccc")
+            && connected_to(&b, "aaa")
+            && connected_to(&b, "ccc")
+            && connected_to(&c, "aaa")
+            && connected_to(&c, "bbb")
+    })
+    .await;
+    a.handle.send(Command::SetArrangement(vec![
+        (mid("aaa"), Vec2I { x: 0, y: 0 }),
+        (mid("bbb"), Vec2I { x: 1920, y: 0 }),
+        (mid("ccc"), Vec2I { x: 3840, y: 0 }),
+    ]));
+    wait_until("trio layout converges", || {
+        [&a, &b, &c].iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 2 && state.edges.iter().all(|edge| edge.crossable)
+        })
+    })
+    .await;
+    (a, b, c)
+}
+
+async fn start_mac_raw(a: &Rig, b: &Rig) {
+    enable_raw(a, &["bbb"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw session active on both ends", || {
+        a.handle.state().borrow().raw_active && b.mock.state.lock().raw_session.is_some()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_releases_held_keys_and_buttons() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    output
+        .send(
+            RawReport {
+                device: 1,
+                sequence: 0,
+                captured_us: splice_platform::raw::clock::now_us(),
+                events: vec![
+                    RawEvent::Key { code: 42, pressed: true },
+                    RawEvent::Button { number: 1, pressed: true },
+                ],
+            }
+            .into(),
+        )
+        .await
+        .unwrap();
+    wait_until("target holds key and button", || {
+        let state = b.mock.state.lock();
+        state.raw_events.contains(&RawEvent::Key { code: 42, pressed: true })
+            && state.raw_events.contains(&RawEvent::Button { number: 1, pressed: true })
+    })
+    .await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("boundary returns control home", || {
+        focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    let events = b.mock.state.lock().raw_events.clone();
+    assert!(events.contains(&RawEvent::Key { code: 42, pressed: false }));
+    assert!(events.contains(&RawEvent::Button { number: 1, pressed: false }));
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_hands_off_to_a_desktop_third_machine() {
+    let (a, b, c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Right);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("handoff reaches the desktop third machine", || {
+        focus_of(&a) == UiFocus::Remote(mid("ccc"))
+            && !c.mock.state.lock().entered.is_empty()
+            && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert!(!a.handle.state().borrow().raw_active);
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_hands_off_to_a_raw_third_machine() {
+    let (a, b, c) = spawn_trio().await;
+    enable_raw(&a, &["bbb", "ccc"]).await;
+    a.handle.send(Command::SelectTarget(mid("bbb")));
+    wait_until("raw session active on both ends", || {
+        a.handle.state().borrow().raw_active && b.mock.state.lock().raw_session.is_some()
+    })
+    .await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Right);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("handoff reaches the raw third machine", || {
+        focus_of(&a) == UiFocus::Remote(mid("ccc"))
+            && c.mock.state.lock().raw_session.is_some()
+            && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert!(a.handle.state().borrow().raw_active);
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_returns_home_vertically() {
+    for (offset, side) in [
+        (Vec2I { x: 0, y: 1080 }, EdgeSide::Top),
+        (Vec2I { x: 0, y: -1080 }, EdgeSide::Bottom),
+    ] {
+        let (a, b) = spawn_vertical_pair(offset).await;
+        start_mac_raw(&a, &b).await;
+        let (session, edge) = raw_boundary_edge(&b, side);
+        hit_raw_boundary(&b, session, &edge, 500.0);
+        wait_until("vertical boundary returns control home", || {
+            focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_returns_home_across_a_multi_display_destination() {
+    let mut na = node_at("aaa", Ipv4Addr::new(127, 0, 0, 1));
+    na.os = "macos".into();
+    let nb = node_at("bbb", Ipv4Addr::new(127, 0, 0, 2));
+    let a = spawn_rig_with(na.clone(), vec![nb.clone()]).await;
+    let b = spawn_rig_displays(
+        nb.clone(),
+        vec![na.clone()],
+        vec![
+            DisplayRect { id: "1".into(), x: 0, y: 0, w: 1920, h: 1080, scale: 1.0 },
+            DisplayRect { id: "2".into(), x: 1920, y: 0, w: 1920, h: 1080, scale: 1.0 },
+        ],
+    )
+    .await;
+    a.dial_ports.write().unwrap().insert(mid("bbb"), b.addr.port());
+    b.dial_ports.write().unwrap().insert(mid("aaa"), a.addr.port());
+    wait_until("multi-display pair connects", || {
+        connected_to(&a, "bbb") && connected_to(&b, "aaa")
+    })
+    .await;
+    a.handle.send(Command::SetArrangement(vec![
+        (mid("aaa"), Vec2I { x: 0, y: 0 }),
+        (mid("bbb"), Vec2I { x: 1920, y: 0 }),
+    ]));
+    wait_until("multi-display layout converges", || {
+        [&a, &b].iter().all(|rig| {
+            let state = rig.handle.state();
+            let state = state.borrow();
+            state.edges.len() == 1 && state.edges.iter().all(|edge| edge.crossable)
+        })
+    })
+    .await;
+    start_mac_raw(&a, &b).await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("multi-display boundary returns control home", || {
+        focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn raw_entry_places_the_pointer_inside_the_destination_display() {
+    let (a, b, _c) = spawn_trio().await;
+    enable_raw(&a, &["bbb"]).await;
+    wait_until("source edge armed", || {
+        a.mock.state.lock().edges.iter().any(|edge| edge.side == EdgeSide::Right)
+    })
+    .await;
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    let edge = a
+        .mock
+        .state
+        .lock()
+        .edges
+        .iter()
+        .find(|edge| edge.side == EdgeSide::Right)
+        .unwrap()
+        .clone();
+    a.mock
+        .events
+        .send(PlatformEvent::Capture(CaptureEvent::EdgeHit {
+            edge_id: edge.id,
+            along: f64::from(edge.from + edge.to) / 2.0,
+        }))
+        .unwrap();
+    wait_until("edge crossing starts the raw session", || {
+        a.handle.state().borrow().raw_active && b.mock.state.lock().raw_session.is_some()
+    })
+    .await;
+    let entered = b.mock.state.lock().entered.clone();
+    assert_eq!(entered.len(), 1);
+    assert_eq!(entered[0].x, 8.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert_eq!(b.mock.state.lock().entered.len(), 1);
+}
+
+#[tokio::test]
+async fn raw_destination_boundary_follows_focus_lock_toggles_during_a_session() {
+    let (a, b, _c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let session = b.mock.state.lock().raw_session.unwrap();
+    a.handle.send(Command::SetInputSettings(splice_core::input_settings::InputSettings {
+        destinations: [(mid("bbb"), splice_proto::raw::InputMode::Raw)].into(),
+        focus_lock: true,
+        ..Default::default()
+    }));
+    wait_until("destination boundary disabled while locked", || {
+        b.mock.state.lock().raw_boundary_policies.contains(&(session, false))
+    })
+    .await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert!(a.handle.state().borrow().raw_active);
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert!(b.mock.state.lock().raw_session.is_some());
+    a.handle.send(Command::SetInputSettings(splice_core::input_settings::InputSettings {
+        destinations: [(mid("bbb"), splice_proto::raw::InputMode::Raw)].into(),
+        focus_lock: false,
+        ..Default::default()
+    }));
+    wait_until("destination boundary re-enabled", || {
+        b.mock.state.lock().raw_boundary_policies.last() == Some(&(session, true))
+    })
+    .await;
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    tokio::time::timeout(Duration::from_millis(2000), async {
+        loop {
+            let done = focus_of(&a) == UiFocus::Local
+                && b.mock.state.try_lock().is_some_and(|state| state.raw_session.is_none());
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let a_focus = focus_of(&a);
+        let a_raw = a.handle.state().borrow().raw_active;
+        let b_probe = b
+            .mock
+            .state
+            .try_lock()
+            .map(|state| format!("session={:?} policies={:?}", state.raw_session, state.raw_boundary_policies));
+        panic!("no return after unlock: a.focus={a_focus:?} a.raw_active={a_raw} b={b_probe:?}");
+    });
+}
+
+#[tokio::test]
+async fn stale_and_duplicate_raw_boundary_frames_cannot_double_return() {
+    let (a, b, _c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    hit_raw_boundary(&b, session + 999, &edge, 500.0);
+    let mut previous_geometry = edge.clone();
+    previous_geometry.at += 1;
+    hit_raw_boundary(&b, session, &previous_geometry, 500.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert!(b.mock.state.lock().raw_session.is_some());
+    let ends = a.mock.state.lock().capture_ends.len();
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("one valid boundary returns control home", || {
+        focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    assert_eq!(a.mock.state.lock().capture_ends.len(), ends + 1);
+}
+
+#[tokio::test]
+async fn a_raw_boundary_racing_a_physical_claim_is_inert() {
+    let (a, b, _c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    b.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("physical claim returns both sides", || {
+        focus_of(&a) == UiFocus::Local
+            && focus_of(&b) == UiFocus::Local
+            && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(focus_of(&a), UiFocus::Local);
+    assert_eq!(focus_of(&b), UiFocus::Local);
+}
+
+#[tokio::test]
+async fn a_rejected_raw_boundary_crossing_does_not_latch_the_edge() {
+    let (a, b, _c) = spawn_trio_with_a_config(splice_core::config::Config {
+        corner_dead_zone: 200,
+        ..Default::default()
+    })
+    .await;
+    start_mac_raw(&a, &b).await;
+    let (session, edge) = raw_boundary_edge(&b, EdgeSide::Left);
+    hit_raw_boundary(&b, session, &edge, 50.0);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(focus_of(&a), UiFocus::Remote(mid("bbb")));
+    assert!(a.handle.state().borrow().raw_active);
+    hit_raw_boundary(&b, session, &edge, 500.0);
+    wait_until("a retry inside the dead zone boundary returns control home", || {
+        focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn manual_raw_handoff_delivers_every_captured_click_before_leaving() {
+    use splice_proto::raw::{RawEvent, RawReport};
+    let (a, b, _c) = spawn_trio().await;
+    start_mac_raw(&a, &b).await;
+    let output = a.mock.state.lock().raw_output.clone().unwrap();
+    let expected: Vec<_> = (0..100).map(|index| RawEvent::Button { number: 1, pressed: index % 2 == 0 }).collect();
+    for (sequence, event) in expected.iter().enumerate() {
+        output.try_send(RawReport {
+            device: 1,
+            sequence: sequence as u64,
+            captured_us: splice_platform::raw::clock::now_us(),
+            events: vec![*event],
+        }.into()).unwrap();
+    }
+    a.handle.send(Command::SelectTarget(mid("aaa")));
+    wait_until("queued clicks drain before manual return", || {
+        focus_of(&a) == UiFocus::Local && b.mock.state.lock().raw_session.is_none()
+    }).await;
+    assert_eq!(b.mock.state.lock().raw_events, expected);
+    assert!(a.handle.state().borrow().input_error.is_none());
+    assert!(b.handle.state().borrow().input_error.is_none());
+    assert!(output.is_closed());
 }

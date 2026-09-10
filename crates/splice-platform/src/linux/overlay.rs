@@ -597,7 +597,7 @@ fn run(
         WaylandSource::new(conn.clone(), queue)
             .insert(event_loop.handle())
             .map_err(|e| unavailable("event source", &e))?;
-        let state = State {
+        let mut state = State {
             shared: shared.clone(),
             panic_chord,
             driven,
@@ -624,6 +624,9 @@ fn run(
             rearm: None,
             running: true,
         };
+        for seat in state.seats.seats().collect::<Vec<_>>() {
+            state.new_seat(&conn, &qh, seat);
+        }
         Ok((event_loop, state, conn, qh))
     })();
     let (mut event_loop, mut state, conn, qh) = match setup {
@@ -856,6 +859,23 @@ impl RelativePointerHandler for State {
             }
             return;
         }
+        if self.shared.raw_destination.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            if let Some(session) = self.shared.raw_boundary_session() {
+                if let Some(focus) = &self.focus {
+                    if let Some(strip) = self.strip_for(&focus.surface) {
+                        if strip.geom.outward(event.delta)
+                        {
+                            self.shared.emit(PlatformEvent::RawBoundary {
+                                session,
+                                edge: strip.geom.edge.clone(),
+                                along: strip.geom.along(focus.position),
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if let Some((geom, layer, local)) = self.armed_strip() {
             if geom.outward(event.delta) {
                 self.lock(qh, geom, layer, local);
@@ -967,6 +987,8 @@ mod tests {
     async fn live_overlay_arms_both_edges_after_startup() {
         let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
+            raw_destination: Default::default(),
+            raw_boundary: Default::default(),
             capture_control: Default::default(),
             emission: parking_lot::Mutex::new(()),
             tx,
@@ -1061,3 +1083,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_boundary_fixture;

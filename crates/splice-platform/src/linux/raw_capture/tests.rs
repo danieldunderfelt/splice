@@ -6,6 +6,8 @@ fn shared() -> (Arc<Shared>, mpsc::UnboundedReceiver<PlatformEvent>) {
     let (tx, events) = mpsc::unbounded_channel();
     (
         Arc::new(Shared {
+            raw_destination: Default::default(),
+            raw_boundary: Default::default(),
             capture_control: Default::default(),
             emission: Mutex::new(()),
             tx,
@@ -434,6 +436,49 @@ fn native_raw_source_descriptors() {
         mouse && keyboard,
         "a readable relative mouse and keyboard are required"
     );
+}
+
+#[test]
+fn raw_boundary_marker_arms_only_after_real_motion_and_follows_policy() {
+    let (shared, _events) = shared();
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_begin(7);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(false);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), Some(7));
+    shared.raw_boundary_policy(false);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_policy(true);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), Some(7));
+    shared.raw_boundary_end();
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_policy(true);
+    assert_eq!(shared.raw_boundary_session(), None);
+}
+
+#[test]
+fn raw_boundary_marker_restart_disarms_until_fresh_motion() {
+    let (shared, _events) = shared();
+    shared.raw_boundary_begin(3);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), Some(3));
+    shared.raw_boundary_begin(4);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), Some(4));
+    shared.raw_boundary_policy(false);
+    shared.raw_boundary_policy(true);
+    assert_eq!(shared.raw_boundary_session(), None);
+    shared.raw_boundary_motion(true);
+    assert_eq!(shared.raw_boundary_session(), Some(4));
 }
 
 #[test]

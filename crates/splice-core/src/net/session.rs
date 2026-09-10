@@ -44,6 +44,7 @@ async fn write_with_timeout<W: AsyncWrite + Unpin>(
 
 #[derive(Clone)]
 pub(crate) struct SessionControl {
+    pub(crate) input: crate::input_transport::desktop::Control,
     frames: mpsc::Sender<QueuedFrame>,
     bulk: mpsc::Sender<QueuedFrame>,
     traffic: Arc<Traffic>,
@@ -57,6 +58,9 @@ struct QueuedFrame {
 
 impl SessionControl {
     pub async fn send_wait(&self, frame: Frame, timeout: Duration) -> bool {
+        if matches!(frame, Frame::Input { .. } | Frame::Enter { .. }) {
+            return self.send(frame);
+        }
         let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
         match tokio::time::timeout(timeout, sender.reserve()).await {
             Ok(Ok(permit)) => {
@@ -69,6 +73,14 @@ impl SessionControl {
     }
 
     pub fn send(&self, frame: Frame) -> bool {
+        if let Frame::Input { session, ev } = frame {
+            let sent = self.input.push(session, ev);
+            if !sent { self.close("UDP input queue exceeded its limit"); }
+            return sent;
+        }
+        if let Frame::Enter { session, .. } = &frame {
+            if !self.input.start(*session) { self.close("UDP session queue exceeded its limit"); return false; }
+        }
         let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
         let depth = self.frames.max_capacity() - self.frames.capacity() + self.bulk.max_capacity() - self.bulk.capacity() + 1;
         match sender.try_send(QueuedFrame { frame, queued: Instant::now() }) {
@@ -102,6 +114,7 @@ impl OutgoingFrames {
 }
 
 struct SessionCommands {
+    input: crate::input_transport::desktop::Control,
     frames: OutgoingFrames,
     traffic: Arc<Traffic>,
     shutdown: watch::Receiver<Option<String>>,
@@ -194,18 +207,20 @@ fn register(
     self_id: &MachineId,
     peer: &MachineId,
     role: Role,
+    input: crate::input_transport::Connection,
 ) -> (Registration, u64, SessionCommands, Arc<Liveness>) {
     let (frames, frame_rx) = mpsc::channel(128);
     let (bulk, bulk_rx) = mpsc::channel(4);
     let (shutdown, shutdown_rx) = watch::channel(None);
     let traffic = Arc::new(Traffic::default());
-    let cmd_rx = SessionCommands { frames: OutgoingFrames { priority: frame_rx, bulk: bulk_rx }, shutdown: shutdown_rx, traffic: traffic.clone() };
-    let active = Arc::new(Liveness::default());
     let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
+    let input = crate::input_transport::desktop::Control::spawn(input, peer.clone(), seq, inner.events.clone(), shutdown.clone(), traffic.clone());
+    let cmd_rx = SessionCommands { input: input.clone(), frames: OutgoingFrames { priority: frame_rx, bulk: bulk_rx }, shutdown: shutdown_rx, traffic: traffic.clone() };
+    let active = Arc::new(Liveness::default());
     let slot = PeerSlot {
         seq,
         traffic: traffic.clone(),
-        control: SessionControl { frames, bulk, shutdown, traffic },
+        control: SessionControl { input, frames, bulk, shutdown, traffic },
         rule_following: matches!(role, Role::Dialer) == (self_id < peer),
         active: active.clone(),
     };
@@ -281,7 +296,11 @@ pub(crate) async fn run(
                 reject(&inner, &peer, "cannot confirm the peer handshake".into());
                 return false;
             }
-            let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role);
+            let input = match input_handshake(&inner, &mut sock, peer_addr, deadline).await {
+                Ok(input) => input,
+                Err(error) => { reject(&inner, &peer, format!("UDP input handshake failed: {error}")); return false; }
+            };
+            let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role, input);
             match reg {
                 Registration::Lose => {
                     let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason: "dup".into() }).await;
@@ -345,7 +364,11 @@ pub(crate) async fn run(
                 reject(&inner, &peer, "peer did not confirm the handshake; check Tailnet connectivity".into());
                 return false;
             }
-            let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role);
+            let input = match input_handshake(&inner, &mut sock, peer_addr, deadline).await {
+                Ok(input) => input,
+                Err(error) => { reject(&inner, &peer, format!("UDP input handshake failed: {error}")); return false; }
+            };
+            let (reg, seq, cmd_rx, active) = register(&inner, &self_info.id, &peer, role, input);
             match reg {
                 Registration::Lose => {
                     let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason: "dup".into() }).await;
@@ -368,6 +391,23 @@ pub(crate) async fn run(
             session_loop(inner, sock, peer, cmd_rx, active, seq).await
         }
     }
+}
+
+async fn input_handshake(
+    inner: &NetControlInner,
+    sock: &mut TcpStream,
+    peer: SocketAddr,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<crate::input_transport::Connection> {
+    tokio::time::timeout_at(deadline, async {
+        let local = crate::input_transport::token()?;
+        write_frame(inner, sock, &Frame::InputOffer { port: inner.input_endpoint.address()?.port(), token: local }).await?;
+        let Frame::InputOffer { port, token } = read_frame(sock).await? else { anyhow::bail!("peer did not offer UDP input"); };
+        anyhow::ensure!(port != 0 && token != [0; 16], "invalid UDP input authorization");
+        let mut input = inner.input_endpoint.subscribe(SocketAddr::new(peer.ip(), port), local, token)?;
+        input.probe().await?;
+        Ok(input)
+    }).await.map_err(|_| anyhow::anyhow!("UDP input handshake expired"))?
 }
 
 fn cadence(inner: &NetControlInner, active: &Liveness) -> Duration {
@@ -442,6 +482,7 @@ async fn session_loop(
     let mut next_ping = Instant::now() + cadence(&inner, &active);
     let mut write_buf = Vec::with_capacity(256);
     let event_peer = Arc::new(peer.clone());
+    let mut pending_leave: Option<futures::future::BoxFuture<'static, (QueuedFrame, bool)>> = None;
 
     let reason: String = loop {
         tokio::select! {
@@ -459,8 +500,24 @@ async fn session_loop(
                     break "session control closed".to_string();
                 }
             }
-            frame = cmd_rx.frames.recv() => match frame {
+            completed = async { pending_leave.as_mut().expect("departure is pending").await }, if pending_leave.is_some() => {
+                let (queued, delivered) = completed;
+                pending_leave = None;
+                if !delivered { break "UDP input did not finish before session departure".into(); }
+                let queue_time = queued.queued.elapsed();
+                let started = Instant::now();
+                if let Err(error) = write_with_timeout(inner.opts.write_timeout, &mut wr, &queued.frame, &mut write_buf).await {
+                    break format!("write: {error}");
+                }
+                cmd_rx.traffic.sent(false, write_buf.len(), queue_time, started.elapsed());
+            }
+            frame = cmd_rx.frames.recv(), if pending_leave.is_none() => match frame {
                 Some(queued) => {
+                    if let Frame::Leave { session, .. } = queued.frame {
+                        let input = cmd_rx.input.clone();
+                        pending_leave = Some(Box::pin(async move { let delivered = input.finish(session).await; (queued, delivered) }));
+                        continue;
+                    }
                     let queue_time = queued.queued.elapsed();
                     let started = Instant::now();
                     if let Err(error) = write_with_timeout(inner.opts.write_timeout, &mut wr, &queued.frame, &mut write_buf).await {
@@ -513,9 +570,13 @@ async fn session_loop(
                     }
                 }
                 Some(Ok(Frame::Bye { reason })) => break reason,
-                Some(Ok(Frame::Hello(_) | Frame::Welcome(_) | Frame::Ready)) => break "unexpected handshake frame".into(),
+                Some(Ok(Frame::Hello(_) | Frame::Welcome(_) | Frame::Ready | Frame::InputOffer { .. })) => break "unexpected handshake frame".into(),
+                Some(Ok(Frame::Input { .. })) => break "input requires the authenticated UDP channel".into(),
                 Some(Ok(f)) => {
-                    let _ = inner.events.send(PeerEvent::Frame(event_peer.clone(), f));
+                    let peers = inner.peers.read();
+                    if peers.get(&peer).is_some_and(|slot| slot.seq == seq) {
+                        let _ = inner.events.send(PeerEvent::Frame(event_peer.clone(), f));
+                    }
                 }
                 Some(Err(e)) => break format!("read: {e}"),
                 None => break "reader stopped".to_string(),
@@ -572,66 +633,53 @@ async fn session_loop(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn clipboard_backpressure_does_not_fill_the_input_queue_or_reorder_keys() {
-        let (frames, priority) = mpsc::channel(4);
+    async fn controls() -> (SessionControl, OutgoingFrames, watch::Receiver<Option<String>>, mpsc::UnboundedReceiver<PeerEvent>, crate::input_transport::desktop::Control) {
+        use crate::input_transport::{Endpoint, desktop::Control};
+        let left = Endpoint::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let right = Endpoint::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let a = left.subscribe(right.address().unwrap(), [1; 16], [2; 16]).unwrap();
+        let b = right.subscribe(left.address().unwrap(), [2; 16], [1; 16]).unwrap();
+        let (frames, priority) = mpsc::channel(2);
         let (bulk, bulk_rx) = mpsc::channel(2);
         let (shutdown, reason) = watch::channel(None);
-        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
-        let mut receiver = OutgoingFrames { priority, bulk: bulk_rx };
-        for request in [1, 2] {
-            assert!(control.send_wait(Frame::ClipChunk { request, data: vec![7; 32], last: true }, Duration::from_secs(1)).await);
-        }
-        let down = Frame::Input { session: 1, ev: splice_proto::InputEvent::Key { code: 42, pressed: true } };
-        let motion = Frame::Input { session: 1, ev: splice_proto::InputEvent::Motion { dx: 0.5, dy: 1.25 } };
-        let up = Frame::Input { session: 1, ev: splice_proto::InputEvent::Key { code: 42, pressed: false } };
-        for event in [&down, &motion, &up] { assert!(control.send(event.clone())); }
-        for expected in [down, motion, up] { assert_eq!(receiver.recv().await.unwrap().frame, expected); }
-        for request in [1, 2] { assert!(matches!(receiver.recv().await.unwrap().frame, Frame::ClipChunk { request: actual, .. } if actual == request)); }
-        assert!(reason.borrow().is_none());
+        let (events, received) = mpsc::unbounded_channel();
+        let traffic = Arc::new(Traffic::default());
+        let input = Control::spawn(a, MachineId("b".into()), 1, events.clone(), shutdown.clone(), traffic.clone());
+        let destination = Control::spawn(b, MachineId("a".into()), 1, events, shutdown.clone(), Arc::new(Traffic::default()));
+        let control = SessionControl { input, frames, bulk, shutdown, traffic };
+        (control, OutgoingFrames { priority, bulk: bulk_rx }, reason, received, destination)
     }
 
     #[tokio::test]
-    async fn one_clipboard_frame_cannot_hold_input_for_a_second_on_a_one_megabit_writer() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (mut writer, mut link) = tokio::io::duplex(1280);
-        let (mut delivered, mut reader) = tokio::io::duplex(65536);
-        let (started, beginning) = tokio::sync::oneshot::channel();
-        let relay = tokio::spawn(async move {
-            let mut started = Some(started);
-            let mut buffer = [0; 1280];
-            loop {
-                let count = link.read(&mut buffer).await.unwrap();
-                if count == 0 { return; }
-                if let Some(started) = started.take() { started.send(()).unwrap(); }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                delivered.write_all(&buffer[..count]).await.unwrap();
+    async fn clipboard_backpressure_cannot_delay_udp_clicks_or_fractional_motion() {
+        let (control, mut tcp, reason, mut events, destination) = controls().await;
+        for request in [1, 2] {
+            assert!(control.send_wait(Frame::ClipChunk { request, data: vec![7; splice_proto::CLIP_CHUNK], last: true }, Duration::from_secs(1)).await);
+        }
+        assert!(control.send(Frame::Enter { session: 1, pos: splice_proto::Vec2 { x: 40.0, y: 40.0 } }));
+        assert!(matches!(tcp.recv().await.unwrap().frame, Frame::Enter { .. }));
+        destination.allow(Some(1));
+        let expected = vec![
+            splice_proto::InputEvent::Key { code: 42, pressed: true },
+            splice_proto::InputEvent::Motion { dx: 0.5, dy: 1.25 },
+            splice_proto::InputEvent::Key { code: 42, pressed: false },
+        ];
+        for ev in &expected { assert!(control.send(Frame::Input { session: 1, ev: *ev })); }
+        let received = tokio::time::timeout(Duration::from_millis(500), async {
+            let mut received = Vec::new();
+            while received.len() < expected.len() {
+                match events.recv().await.unwrap() {
+                    PeerEvent::Input { events, .. } => received.extend(events),
+                    other => panic!("unexpected event: {other:?}"),
+                }
             }
-        });
-        let (frames, priority) = mpsc::channel(4);
-        let (bulk, bulk_rx) = mpsc::channel(4);
-        let (shutdown, _) = watch::channel(None);
-        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
-        let mut receiver = OutgoingFrames { priority, bulk: bulk_rx };
-        assert!(control.send_wait(Frame::ClipChunk { request: 1, data: vec![7; splice_proto::CLIP_CHUNK], last: true }, Duration::from_secs(1)).await);
-        let sender = tokio::spawn(async move {
-            let mut buffer = Vec::new();
-            for _ in 0..2 {
-                let frame = receiver.recv().await.unwrap().frame;
-                write_with_timeout(Duration::from_secs(2), &mut writer, &frame, &mut buffer).await.unwrap();
-            }
-        });
-        beginning.await.unwrap();
-        let queued = Instant::now();
-        let motion = Frame::Input { session: 1, ev: splice_proto::InputEvent::Motion { dx: 0.5, dy: 1.25 } };
-        assert!(control.send(motion.clone()));
-        tokio::time::timeout(Duration::from_millis(750), async {
-            assert!(matches!(read_frame(&mut reader).await.unwrap(), Frame::ClipChunk { .. }));
-            assert_eq!(read_frame(&mut reader).await.unwrap(), motion);
-        }).await.expect("clipboard frame delayed input beyond the bounded writer budget");
-        assert!(queued.elapsed() < Duration::from_millis(350), "input waited {:?}", queued.elapsed());
-        sender.await.unwrap();
-        relay.await.unwrap();
+            received
+        }).await.unwrap();
+        assert_eq!(received, expected);
+        assert!(control.input.finish(1).await);
+        for request in [1, 2] { assert!(matches!(tcp.recv().await.unwrap().frame, Frame::ClipChunk { request: actual, .. } if actual == request)); }
+        assert!(reason.borrow().is_none());
+        assert!(tcp.priority.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -647,12 +695,36 @@ mod tests {
         assert!(matches!(result, Err(ProtoError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut));
     }
 
-    #[test]
-    fn input_queue_overflow_closes_the_session_explicitly() {
-        let (frames, _receiver) = mpsc::channel(2);
-        let (shutdown, reason) = watch::channel(None);
-        let (bulk, _bulk_rx) = mpsc::channel(4);
-        let control = SessionControl { frames, bulk, shutdown, traffic: Arc::new(Traffic::default()) };
+    #[tokio::test]
+    async fn rejected_desktop_session_abandons_its_journal_without_disconnect() {
+        let (control, _tcp, reason, mut events, _destination) = controls().await;
+        assert!(control.input.start(1));
+        assert!(control.input.push(1, splice_proto::InputEvent::Key { code: 42, pressed: true }));
+        let finishing = control.input.clone();
+        let finished = tokio::spawn(async move { finishing.finish(1).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(control.input.abandon(1));
+        assert!(tokio::time::timeout(Duration::from_millis(200), finished).await.unwrap().unwrap());
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(reason.borrow().is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_finished_source_keeps_the_target_live_until_the_control_leave_arrives() {
+        let (control, _tcp, reason, mut events, destination) = controls().await;
+        destination.allow(Some(1));
+        assert!(control.input.start(1));
+        assert!(control.input.finish(1).await);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(reason.borrow().is_none());
+        assert!(events.try_recv().is_err());
+        destination.allow(None);
+    }
+
+    #[tokio::test]
+    async fn control_queue_overflow_closes_the_session_explicitly() {
+        let (control, _receiver, reason, _events, _destination) = controls().await;
         assert!(control.send(Frame::Panic));
         assert!(control.send(Frame::Panic));
         assert!(!control.send(Frame::Panic));

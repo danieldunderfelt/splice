@@ -13,10 +13,14 @@ pub(super) struct RawState {
     pub error: Option<String>,
     pub preparing: Option<MachineId>,
     pub active: bool,
+    pub boundary: bool,
+    pub pending_policy: bool,
+    pub pending_boundary: Option<(u64, u32)>,
     pub pending_target: Option<(MachineId, u64)>,
     pub connecting: bool,
     pub edge: Option<u32>,
     pub job: Option<tokio::task::JoinHandle<()>>,
+    pub finish: Option<tokio::sync::oneshot::Sender<()>>,
     pub events: mpsc::UnboundedReceiver<Event>,
     pub tx: mpsc::UnboundedSender<Event>,
 }
@@ -36,10 +40,14 @@ impl RawState {
             error: None,
             preparing: None,
             active: false,
+            boundary: false,
+            pending_policy: false,
+            pending_boundary: None,
             pending_target: None,
             connecting: false,
             edge: None,
             job: None,
+            finish: None,
             events,
             tx,
         }
@@ -47,6 +55,116 @@ impl RawState {
 }
 
 impl Inner {
+    pub(super) async fn raw_boundary_hit(&mut self, session: u64, edge: u32, along: f64) {
+        let Focus::Driven(source) = self.focus.clone() else { return };
+        if !self.raw.active
+            || !self.raw.boundary
+            || session != self.active_session
+            || !along.is_finite()
+            || self.raw.pending_boundary == Some((session, edge))
+            || !self.raw_source_allowed(&source)
+        {
+            return;
+        }
+        let Some(link) = self.armed.get(edge as usize) else { return };
+        if !self.links.contains(link) {
+            return;
+        }
+        let margin = f64::from(self.cfg.corner_dead_zone)
+            .min(f64::from(link.from_range.1 - link.from_range.0) / 4.0);
+        if along <= f64::from(link.from_range.0) + margin
+            || along >= f64::from(link.from_range.1) - margin
+        {
+            return;
+        }
+        let pos = match link.side {
+            EdgeSide::Left | EdgeSide::Right => Vec2 { x: f64::from(link.at), y: along },
+            EdgeSide::Top | EdgeSide::Bottom => Vec2 { x: along, y: f64::from(link.at) },
+        };
+        if let Some(net) = &self.net {
+            if net.send_to(&source, Frame::RawBoundary { session, target: link.to.clone(), pos }) {
+                self.raw.pending_boundary = Some((session, edge));
+            }
+        }
+    }
+
+    pub(super) async fn cross_raw_boundary(
+        &mut self,
+        from: &MachineId,
+        session: u64,
+        target: MachineId,
+        pos: Vec2,
+    ) {
+        if self.focus != Focus::Remote(from.clone()) || !self.raw.active
+            || session != self.active_session
+        {
+            return;
+        }
+        let link = (!self.raw.settings.focus_lock && pos.x.is_finite() && pos.y.is_finite())
+            .then(|| {
+                self.links.iter().find(|link| {
+                    if &link.from != from || link.to != target { return false; }
+                    let (cross, along) = match link.side {
+                        EdgeSide::Left | EdgeSide::Right => (pos.x, pos.y),
+                        EdgeSide::Top | EdgeSide::Bottom => (pos.y, pos.x),
+                    };
+                    let margin = f64::from(self.cfg.corner_dead_zone)
+                        .min(f64::from(link.from_range.1 - link.from_range.0) / 4.0);
+                    cross == f64::from(link.at)
+                        && along > f64::from(link.from_range.0) + margin
+                        && along < f64::from(link.from_range.1) - margin
+                }).cloned()
+            })
+            .flatten();
+        let Some(link) = link else {
+            if let Some(net) = &self.net {
+                net.send_to(from, Frame::RawBoundaryAck { session });
+            }
+            return;
+        };
+        let landing = layout::clamp_into_displays(self.display_slice_of(&target), position_inside_to_edge(&link, pos));
+        if target == self.self_info.id {
+            self.end_remote(from, LeaveReason::Crossed, Some(landing), true).await;
+        } else {
+            self.handoff_remote(target, landing).await;
+        }
+    }
+
+    pub(super) async fn raw_boundary_policy(&mut self, from: &MachineId, session: u64, boundary: bool) {
+        if !self.raw.active
+            || session != self.active_session
+            || self.focus != Focus::Driven(from.clone())
+        {
+            return;
+        }
+        self.raw.boundary = boundary;
+        self.raw.pending_boundary = None;
+        let Some(target) = self.raw.emulate.clone() else { return };
+        if let Err(error) = target.boundary_policy(session, boundary) {
+            self.raw.error = Some(format!("Cannot update the raw boundary: {error}"));
+            self.end_driven(from, Some(LeaveReason::CaptureLost)).await;
+        }
+        self.touch_ui();
+    }
+
+    pub(super) async fn finish_raw(&mut self) {
+        let Some(finish) = self.raw.finish.take() else { return };
+        if let Some(capture) = &self.raw.capture {
+            capture.end();
+        }
+        let _ = finish.send(());
+        if let Some(mut job) = self.raw.job.take() {
+            if tokio::time::timeout(crate::input_transport::INPUT_TIMEOUT, &mut job).await.is_err() {
+                job.abort();
+                let _ = job.await;
+                self.raw.error = Some("Raw input could not finish delivery before the handoff deadline".into());
+            }
+        }
+        if let Some(error) = self.raw.operation.error() {
+            self.raw.error = Some(error);
+        }
+    }
+
     pub(super) async fn stop_raw(&mut self) {
         self.raw.operation = Arc::default();
         if let Some(capture) = &self.raw.capture {
@@ -61,7 +179,11 @@ impl Inner {
                 self.raw.error = Some(format!("Cannot release raw input: {error}"));
             }
         }
+        self.raw.finish = None;
         self.raw.active = false;
+        self.raw.boundary = false;
+        self.raw.pending_policy = false;
+        self.raw.pending_boundary = None;
         self.raw.pending_target = None;
         self.raw.connecting = false;
         self.raw.edge = None;
@@ -118,6 +240,7 @@ impl Inner {
                 Frame::RawPrepare {
                     session: self.active_session,
                     pos,
+                    boundary: !self.raw.settings.focus_lock,
                 },
             )
         }) {
@@ -162,7 +285,7 @@ impl Inner {
         self.touch_ui();
     }
 
-    pub(super) async fn prepare_raw_target(&mut self, from: MachineId, session: u64, pos: Vec2) {
+    pub(super) async fn prepare_raw_target(&mut self, from: MachineId, session: u64, pos: Vec2, boundary: bool) {
         if session == 0
             || !self.raw_source_allowed(&from)
             || self.focus != Focus::Local
@@ -196,14 +319,15 @@ impl Inner {
         let Some(net) = &self.net else {
             return;
         };
-        let bind = net.bind_ip();
+        let net = net.clone();
         self.stop_raw().await;
+        self.raw.pending_policy = boundary;
         self.raw.pending_target = Some((from.clone(), session));
         let tx = self.raw.tx.clone();
         let operation = self.raw.operation.clone();
         self.raw.job = Some(tokio::spawn(async move {
             let prepare = async {
-                let reservation = raw_transport::Reservation::bind(bind).await?;
+                let reservation = raw_transport::Reservation::from_endpoint(net.raw_endpoint().await?)?;
                 target.prepare().await?;
                 Ok::<_, anyhow::Error>(reservation)
             };
@@ -252,12 +376,9 @@ impl Inner {
             .emulate
             .clone()
             .expect("preparation checked injection backend");
-        if let Err(error) = self.emulate.enter(pos).await {
-            self.reject_raw(&from, session, format!("Cannot place raw pointer: {error}"));
-            return;
-        }
+        let _ = self.capture.end_capture(None).await;
+        self.crossing = None;
         if let Err(error) = target.begin(session) {
-            self.emulate.leave().await.ok();
             self.reject_raw(
                 &from,
                 session,
@@ -265,9 +386,26 @@ impl Inner {
             );
             return;
         }
+        if let Err(error) = target.boundary_policy(session, self.raw.pending_policy) {
+            target.end(session).ok();
+            self.reject_raw(
+                &from,
+                session,
+                format!("Cannot arm the raw boundary: {error}"),
+            );
+            return;
+        }
+        let pos = raw_landing(&self.self_info.displays, pos);
+        if let Err(error) = self.emulate.enter(pos).await {
+            target.end(session).ok();
+            self.reject_raw(&from, session, format!("Cannot place raw pointer: {error}"));
+            return;
+        }
         self.focus = Focus::Driven(from.clone());
         self.active_session = session;
         self.raw.active = true;
+        self.raw.boundary = self.raw.pending_policy;
+        self.raw.pending_boundary = None;
         let port = reservation.port;
         let ticket = reservation.ticket;
         let ts = self.ts.clone();
@@ -418,9 +556,16 @@ impl Inner {
                 if let Some(net) = &self.net {
                     net.set_active(&peer, true);
                 }
+                let (finish, finished) = tokio::sync::oneshot::channel();
+                self.raw.finish = Some(finish);
                 self.raw.job = Some(tokio::spawn(async move {
-                    let result = raw_transport::send(stream, session, reports).await;
+                    let result = raw_transport::send(stream, session, reports, finished).await;
                     capture.end();
+                    if let Err(error) = &result {
+                        if operation.error().is_none() {
+                            operation.fail(format!("Raw input ended: {error:#}"));
+                        }
+                    }
                     let error = match operation.error() {
                         Some(reason) => reason,
                         None => match result {
@@ -568,6 +713,34 @@ impl Inner {
     }
 }
 
+fn raw_landing(displays: &[DisplayRect], pos: Vec2) -> Vec2 {
+    let pos = layout::clamp_into_displays(displays, pos);
+    let Some(display) = displays
+        .iter()
+        .filter(|display| display.w > 0 && display.h > 0)
+        .find(|display| {
+            pos.x >= f64::from(display.x)
+                && pos.x < f64::from(display.x) + f64::from(display.w)
+                && pos.y >= f64::from(display.y)
+                && pos.y < f64::from(display.y) + f64::from(display.h)
+        })
+    else {
+        return pos;
+    };
+    let pad_x = (f64::from(display.w) / 2.0).min(8.0);
+    let pad_y = (f64::from(display.h) / 2.0).min(8.0);
+    Vec2 {
+        x: pos.x.clamp(
+            f64::from(display.x) + pad_x,
+            f64::from(display.x) + f64::from(display.w) - pad_x,
+        ),
+        y: pos.y.clamp(
+            f64::from(display.y) + pad_y,
+            f64::from(display.y) + f64::from(display.h) - pad_y,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +824,39 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test]
+    async fn a_replacement_control_connection_ends_both_desktop_roles() {
+        for source in [true, false] {
+            let (_dir, mut inner, mock) = fixture();
+            let peer = MachineId("a".into());
+            inner.active_session = 1;
+            if source {
+                inner.focus = Focus::Remote(peer.clone());
+                inner.capture.begin_capture().await.unwrap();
+                inner.source_ledger.observe(&InputEvent::Key { code: 42, pressed: true });
+            } else {
+                inner.focus = Focus::Driven(peer.clone());
+                inner.target_ledger.observe(&InputEvent::Key { code: 42, pressed: true });
+                inner.emulate.enter(Vec2 { x: 40.0, y: 40.0 }).await.unwrap();
+            }
+            inner.on_peer_event(crate::net::PeerEvent::Connected {
+                id: peer.clone(),
+                hello: splice_proto::MachineInfo { id: peer, hostname: "a".into(), os: Os::Linux, displays: splice_platform::mock::one_display(), build: splice_proto::BuildInfo::current() },
+                caps: Vec::new(),
+                addr: "127.0.0.1:41717".parse().unwrap(),
+            }).await;
+            assert!(inner.focus == Focus::Local);
+            assert!(!mock.state.lock().capturing);
+            if source {
+                assert!(inner.source_ledger.presses().is_empty());
+            } else {
+                assert!(inner.target_ledger.presses().is_empty());
+                assert!(mock.state.lock().release_all_calls > 0);
+                assert!(mock.state.lock().left > 0);
+            }
+        }
+    }
     #[tokio::test]
     async fn cancellation_and_panic_invalidate_uncommitted_preparation() {
         for frame in [
@@ -680,5 +886,113 @@ mod tests {
             assert!(mock.state.lock().entered.is_empty());
             assert!(mock.state.lock().raw_session.is_none());
         }
+    }
+
+    fn boundary_fixture(focus_lock: bool) -> (tempfile::TempDir, Inner, splice_platform::mock::MockHandle, MachineId) {
+        let (dir, mut inner, mock) = fixture();
+        let source = MachineId("a".into());
+        inner.self_info.id = MachineId("b".into());
+        inner.focus = Focus::Remote(source.clone());
+        inner.raw.active = true;
+        inner.active_session = 1;
+        inner.raw.settings.focus_lock = focus_lock;
+        inner.links = vec![EdgeLink {
+            from: source.clone(),
+            to: MachineId("b".into()),
+            side: EdgeSide::Right,
+            at: 1920,
+            from_range: (0, 1080),
+            to_range: (0, 1080),
+            to_at: 0,
+        }];
+        (dir, inner, mock, source)
+    }
+
+    #[tokio::test]
+    async fn a_valid_raw_boundary_crossing_returns_control_home() {
+        let (_dir, mut inner, mock, source) = boundary_fixture(false);
+        inner
+            .cross_raw_boundary(&source, 1, MachineId("b".into()), Vec2 { x: 1920.0, y: 500.0 })
+            .await;
+        assert!(inner.focus == Focus::Local);
+        assert_eq!(mock.state.lock().capture_ends.len(), 1);
+        assert!(!inner.raw.active);
+    }
+
+    #[tokio::test]
+    async fn rejected_raw_boundary_crossings_keep_the_session() {
+        for (focus_lock, session, x, y) in [
+            (true, 1, 1920.0, 500.0),
+            (false, 2, 1920.0, 500.0),
+            (false, 1, f64::NAN, 500.0),
+            (false, 1, 1920.0, 4.0),
+            (false, 1, 1920.0, 1076.0),
+        ] {
+            let (_dir, mut inner, mock, source) = boundary_fixture(focus_lock);
+            inner
+                .cross_raw_boundary(&source, session, MachineId("b".into()), Vec2 { x, y })
+                .await;
+            assert!(inner.focus == Focus::Remote(source.clone()));
+            assert!(inner.raw.active);
+            assert!(mock.state.lock().capture_ends.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_boundary_target_keeps_the_session() {
+        let (_dir, mut inner, mock, source) = boundary_fixture(false);
+        inner
+            .cross_raw_boundary(&source, 1, MachineId("c".into()), Vec2 { x: 1920.0, y: 500.0 })
+            .await;
+        assert!(inner.focus == Focus::Remote(source.clone()));
+        assert!(mock.state.lock().capture_ends.is_empty());
+    }
+
+    #[test]
+    fn raw_landing_insets_the_pointer_from_display_edges() {
+        let display = DisplayRect {
+            id: "1".into(),
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            scale: 1.0,
+        };
+        assert_eq!(
+            raw_landing(std::slice::from_ref(&display), Vec2 { x: 1.0, y: 500.0 }),
+            Vec2 { x: 8.0, y: 500.0 }
+        );
+        assert_eq!(
+            raw_landing(std::slice::from_ref(&display), Vec2 { x: 1919.0, y: 500.0 }),
+            Vec2 { x: 1912.0, y: 500.0 }
+        );
+        assert_eq!(
+            raw_landing(std::slice::from_ref(&display), Vec2 { x: 900.0, y: 500.0 }),
+            Vec2 { x: 900.0, y: 500.0 }
+        );
+        let small = DisplayRect {
+            id: "2".into(),
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+            scale: 1.0,
+        };
+        assert_eq!(
+            raw_landing(std::slice::from_ref(&small), Vec2 { x: 0.0, y: 0.0 }),
+            Vec2 { x: 5.0, y: 5.0 }
+        );
+        let right = DisplayRect {
+            id: "3".into(),
+            x: 1920,
+            y: 0,
+            w: 1920,
+            h: 1080,
+            scale: 1.0,
+        };
+        assert_eq!(
+            raw_landing(&[display, right], Vec2 { x: 1920.0, y: 500.0 }),
+            Vec2 { x: 1928.0, y: 500.0 }
+        );
     }
 }

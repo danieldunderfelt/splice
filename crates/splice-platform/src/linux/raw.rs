@@ -82,6 +82,17 @@ impl RawEmulate for RelativeInput {
         for clock in &mut state.devices.as_mut().expect("prepared devices").timestamps {
             clock.native_us = None;
         }
+        self.shared.raw_boundary_begin(session);
+        Ok(())
+    }
+
+    fn boundary_policy(&self, session: u64, boundary: bool) -> Result<()> {
+        if self.state.lock().session != Some(session) {
+            return Err(PlatformError::Unavailable(
+                "stale raw boundary policy".into(),
+            ));
+        }
+        self.shared.raw_boundary_policy(boundary);
         Ok(())
     }
 
@@ -100,6 +111,11 @@ impl RawEmulate for RelativeInput {
                 self.shared.note_injected_key(code, pressed);
             }
         }
+        self.shared.raw_boundary_motion(
+            events
+                .iter()
+                .any(|event| matches!(event, RawEvent::Motion { x, y } if *x != 0 || *y != 0)),
+        );
         let result = state
             .devices
             .as_mut()
@@ -108,6 +124,7 @@ impl RawEmulate for RelativeInput {
             })?
             .emit(&events, captured_local_us, Some(report.captured_us));
         if result.is_err() {
+            self.shared.raw_boundary_end();
             state.devices = None;
             state.session = None;
             state.ledger.release();
@@ -121,6 +138,7 @@ impl RawEmulate for RelativeInput {
             return Ok(());
         }
         state.session = None;
+        self.shared.raw_boundary_end();
         let releases = state.ledger.release();
         let result = match &mut state.devices {
             Some(devices) => {
@@ -401,6 +419,8 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
+            raw_destination: Default::default(),
+            raw_boundary: Default::default(),
             capture_control: Default::default(),
             emission: Mutex::new(()),
             tx,

@@ -84,9 +84,18 @@ impl Frame {
             Frame::SourceClaim { stamp: value } | Frame::ClipOffer { stamp: value, .. } => {
                 stamp(value)
             }
-            Frame::RawPrepare { pos, .. } | Frame::Enter { pos, .. } => {
-                pos.x.is_finite() && pos.y.is_finite()
+            Frame::RawBoundary {
+                session,
+                target,
+                pos,
+            } => *session > 0 && identity(target) && pos.x.is_finite() && pos.y.is_finite(),
+            Frame::RawBoundaryAck { session } | Frame::RawBoundaryPolicy { session, .. } => {
+                *session > 0
             }
+            Frame::RawPrepare { session, pos, .. } => {
+                *session > 0 && pos.x.is_finite() && pos.y.is_finite()
+            }
+            Frame::Enter { pos, .. } => pos.x.is_finite() && pos.y.is_finite(),
             Frame::Input {
                 ev: InputEvent::Motion { dx, dy } | InputEvent::ScrollPixels { dx, dy },
                 ..
@@ -110,8 +119,59 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MachinePlacement, Os, Vec2I};
+    use crate::{MachinePlacement, Os, Vec2, Vec2I};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn raw_boundary_frames_require_live_session_identity_and_finite_position() {
+        let pos = Vec2 { x: 1.0, y: 2.0 };
+        let valid = Frame::RawBoundary {
+            session: 1,
+            target: MachineId("peer".into()),
+            pos,
+        };
+        assert!(valid.validate().is_ok());
+        assert!(Frame::RawBoundary {
+            session: 0,
+            target: MachineId("peer".into()),
+            pos,
+        }
+        .validate()
+        .is_err());
+        assert!(Frame::RawBoundary {
+            session: 1,
+            target: MachineId(String::new()),
+            pos,
+        }
+        .validate()
+        .is_err());
+        assert!(Frame::RawBoundary {
+            session: 1,
+            target: MachineId("peer".into()),
+            pos: Vec2 {
+                x: f64::NAN,
+                y: 0.0
+            },
+        }
+        .validate()
+        .is_err());
+        assert!(Frame::RawBoundaryAck { session: 1 }.validate().is_ok());
+        assert!(Frame::RawBoundaryAck { session: 0 }.validate().is_err());
+        assert!(Frame::RawBoundaryPolicy { session: 2, boundary: true }.validate().is_ok());
+        assert!(Frame::RawBoundaryPolicy { session: 0, boundary: false }.validate().is_err());
+        assert!(Frame::RawPrepare { session: 1, pos, boundary: true }.validate().is_ok());
+        assert!(Frame::RawPrepare { session: 0, pos, boundary: true }.validate().is_err());
+        assert!(Frame::RawPrepare {
+            session: 1,
+            pos: Vec2 {
+                x: 0.0,
+                y: f64::INFINITY
+            },
+            boundary: false,
+        }
+        .validate()
+        .is_err());
+    }
 
     #[test]
     fn build_metadata_must_be_valid_and_match_the_handshake() {

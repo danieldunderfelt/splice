@@ -201,11 +201,12 @@ peer is online. Splice does not use MagicDNS for peer connections.
 
 ## Send and receive raw input
 
-Use the same protocol 5 build on every computer. Raw input requires `/dev/uinput` access even if
+Use the same protocol 6 build on every computer. Raw input requires `/dev/uinput` access even if
 the Desktop injection backend uses the Remote Desktop portal. Install the udev rule above; a
 missing permission produces a preparation error and restores local control.
 
-Allow TCP 41719 on the Tailscale interface alongside KVM port 41717 and updater port 41718.
+Allow UDP 41717 and 41719 on the Tailscale interface, alongside TCP 41717 for control and clipboard
+and TCP 41718 for updates.
 The receiver creates `Splice Virtual Raw Mouse` and `Splice Virtual Raw Keyboard`, then keeps
 them alive across handoffs. The devices use relative mouse axes and preserve physical key codes.
 The destination desktop or game applies its own acceleration, keyboard layout, and repeat settings.

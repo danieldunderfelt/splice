@@ -34,6 +34,8 @@ const INBOUND_ADMISSION_LIMIT: usize = 16;
 /// Session → engine notifications.
 #[derive(Debug)]
 pub enum PeerEvent {
+    Input { from: Arc<MachineId>, connection: u64, session: u64, captured_us: u64, events: Vec<splice_proto::InputEvent> },
+    InputFailed { id: MachineId, connection: u64, reason: String },
     /// Handshake complete; peer identity + negotiated caps.
     Connected {
         id: MachineId,
@@ -169,9 +171,12 @@ impl NetManager {
     ) -> anyhow::Result<(NetManager, NetControl)> {
         let listener = TcpListener::bind(bind).await?;
         let local_addr = listener.local_addr()?;
+        let input_endpoint = crate::input_transport::Endpoint::bind(local_addr).await?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(NetControlInner {
             bind_ip: local_addr.ip(),
+            input_endpoint,
+            raw_endpoint: tokio::sync::OnceCell::new(),
             self_info: RwLock::new(self_info),
             targets: RwLock::new(HashMap::new()),
             peers: RwLock::new(HashMap::new()),
@@ -199,6 +204,8 @@ pub struct NetControl {
 }
 
 pub(crate) struct NetControlInner {
+    raw_endpoint: tokio::sync::OnceCell<crate::input_transport::Endpoint>,
+    input_endpoint: crate::input_transport::Endpoint,
     bind_ip: IpAddr,
     self_info: RwLock<splice_proto::MachineInfo>,
     targets: RwLock<HashMap<MachineId, IpAddr>>,
@@ -234,6 +241,28 @@ impl NetControlInner {
 }
 
 impl NetControl {
+    pub(crate) async fn raw_endpoint(&self) -> anyhow::Result<crate::input_transport::Endpoint> {
+        let endpoint = self.inner.raw_endpoint.get_or_try_init(|| async {
+            let ip = self.inner.bind_ip;
+            crate::input_transport::Endpoint::bind(SocketAddr::new(ip, if ip.is_loopback() { 0 } else { crate::raw_transport::RAW_PORT })).await
+        }).await?;
+        Ok(endpoint.clone())
+    }
+
+    pub(crate) fn abandon_input(&self, peer: &MachineId, session: u64) {
+        if let Some(slot) = self.inner.peers.read().get(peer) {
+            if !slot.control.input.abandon(session) { slot.control.close("UDP input queue exceeded its limit"); }
+        }
+    }
+    pub(crate) fn allow_input(&self, peer: &MachineId, session: Option<u64>) {
+        if let Some(slot) = self.inner.peers.read().get(peer) {
+            slot.control.input.allow(session);
+        }
+    }
+
+    pub(crate) fn current_connection(&self, peer: &MachineId, connection: u64) -> bool {
+        self.inner.peers.read().get(peer).is_some_and(|slot| slot.seq == connection)
+    }
     pub(crate) fn bind_ip(&self) -> IpAddr {
         self.inner.bind_ip
     }

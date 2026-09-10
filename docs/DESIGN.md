@@ -43,13 +43,13 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
 
 ## Core decisions (each one kills a known failure mode)
 
-1. **Source-authoritative cursor.** The machine that currently has physical input (the *source*)
-   tracks a virtual cursor position for the machine it is driving (the *target*) and decides all
-   transitions (back to source, onward to a third machine). Getting the cursor back NEVER depends
-   on the remote machine's capture stack working. (Kills: lan-mouse's stuck-cursor class.)
-2. **TCP with TCP_NODELAY, one connection per peer pair.** Guaranteed delivery for
-   Enter/Leave/key-up. Motion is sent immediately and coalesced only when capture events are
-   already queued. (Kills: stuck keys from lost UDP key-ups.)
+1. **Source-authoritative ownership.** The physical source decides all transitions. Desktop
+   mode tracks a virtual cursor at the source. Raw mode preserves device counts and uses
+   destination boundary observations because destination acceleration determines cursor position.
+2. **Separate input and control transport.** UDP carries input in both modes. Cumulative
+   movement recovers displacement after loss; acknowledged transition journals preserve keys,
+   buttons and scroll stops at their recorded positions. Authenticated TCP with TCP_NODELAY
+   carries ownership, layout and clipboard messages. Input failures release held state.
 3. **Physical evdev scancodes on the wire, never characters, never layout groups.** Each machine
    applies its own keyboard layout. (Kills: Deskflow's 11-year AltGr bug class; lan-mouse's
    layout-group leak.)
@@ -89,7 +89,7 @@ docs/research/      verified platform research — READ THE RELEVANT FILE BEFORE
     (default 0 ms — user wants effortless; keep the knob) → activate → transmit entry offset
     along the shared edge so the cursor lands exactly where it left. Per-corner dead zones to
     avoid hot-corner fights (default 16 px).
-12. **One current protocol.** Every client runs protocol 5 and advertises all required capabilities.
+12. **One current protocol.** Every client runs protocol 6 and advertises all required capabilities.
     A mismatch rejects the connection with an upgrade message. There is no compatibility mode.
 13. **Keep the target awake**: injection declares user activity; while a session is entered the
     target takes a display-sleep inhibition (macOS IOPMAssertion; Linux D-Bus
@@ -343,13 +343,13 @@ tokens), atomic writes (tmp + rename). Machine-local; layout replicates via Layo
 - Unit tests: proto roundtrips, layout/edge math (property-ish cases incl. non-rectangular
   arrangements), FSM transitions (source claims, stale seq, degrade → release), held-key ledger.
 - `splice-core` must be fully testable without platform backends (trait objects + a `MockPlatform`).
-- Integration tests: two-, three-, and five-machine full meshes over loopback TCP with mock platforms,
+- Integration tests: two-, three-, and five-machine full meshes over loopback TCP and UDP with mock platforms,
   asserting an end-to-end enter → input → leave → clipboard flow.
 
 ## Raw input and crossing policy
 
 See [Raw input and deliberate edge crossing](raw-input-design.md) for scope and native validation status.
-Raw input has distinct report types, a separate authenticated TCP connection on port 41719, and a
+Raw input has distinct report types, an authenticated UDP channel on port 41719, and a
 Linux relative uinput backend. Desktop sensitivity and cursor prediction do not process raw reports.
 
 A target prepares persistent virtual devices before source capture begins. Each stream requires
@@ -357,7 +357,8 @@ the control owner's Tailscale identity, address, session number, and a random si
 Local operation identities distinguish async completions even when a peer restarts and reuses a
 wire session number. Disconnect, timeout, bad reports, and capture errors release held state.
 
-Raw mode stays on the selected computer automatically until destination edge observations are
-implemented. The source chooses input mode per destination. Crossing policy and Desktop focus lock
-are separate local settings in input.json; Raw activation does not require or change the Desktop
-focus setting. The shared gesture state consumes the outward movement used for crossing.
+The source chooses input mode per destination. Crossing policy and focus lock are separate settings
+in input.json. Focus lock applies to both modes. Linux destinations report actual Raw boundary hits,
+and the source validates the session, ownership and current link before returning or moving onward.
+The native observer carries edge geometry so queued callbacks cannot be remapped to a changed edge.
+Entry places the pointer inside the display before subsequent Raw motion arms boundary observation.

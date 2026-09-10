@@ -684,6 +684,15 @@ async fn run_session_inner(
                     .unwrap_or(0.0)
                     .clamp(edge.from as f64, (edge.to - 1).max(edge.from) as f64);
                 pressed.clear();
+                let session_id = shared.raw_destination.load(Ordering::Acquire);
+                if session_id != 0 {
+                    release(session, &mut capture, None).await;
+                    active_flag.store(false, Ordering::Release);
+                    if shared.raw_boundary_session() == Some(session_id) {
+                        shared.emit(PlatformEvent::RawBoundary { session: session_id, edge: edge.clone(), along });
+                    }
+                    continue;
+                }
                 shared.emit(PlatformEvent::Capture(CaptureEvent::EdgeHit { edge_id: edge.id, along }));
             }
             msg = session.deactivated.next() => {

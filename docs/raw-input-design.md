@@ -1,6 +1,6 @@
 # Raw input and deliberate edge crossing
 
-Status: Splice 1.2.0, protocol 5 supports raw capture from Linux and macOS, with relative injection
+Status: Splice 1.2.0, protocol 6 supports raw capture from Linux and macOS, with relative injection
 on Linux. Automated Linux checks pass. Native Mac workspace tests, Clippy, release engine tests,
 and Developer ID signing have passed. The Mac screen-edge indicator was exercised on all four edges
 without taking focus, and captured Mac device descriptors have portable regression tests.
@@ -9,8 +9,8 @@ Physical forwarding, local suppression, and gaming acceptance remain unverified.
 [Linux acceptance checks](raw-input-linux.md#complete-native-acceptance) and the
 [Mac handoff](raw-input-macos-handoff.md) before releasing raw mode.
 
-Raw input stays on the selected computer automatically. Destination edge observations are not
-implemented. Dwell and resistance work with a Mac source, including
+Raw input uses Linux destination boundary observations for return and onward switching. Native
+protocol 6 validation is recorded in [UDP validation](raw-input-udp-validation.md). Dwell and resistance work with a Mac source, including
 its desktop sessions across Linux destinations. Linux source edges retain Immediate crossing;
 selecting a delayed policy there produces an error. Progress appears in the Splice window and in
 a Mac panel beside the physical screen edge, including while the Splice window is hidden.
@@ -73,17 +73,18 @@ Input settings:
 |---|---|---|
 | Input mode for a destination | Desktop, Raw input | Desktop remains the default |
 | Edge crossing | Immediate, Dwell, Resistance | Existing immediate behavior remains the default |
-| Stay on selected computer in Desktop mode | Off, On | Off by default; switch shortcut and emergency release remain available |
+| Stay on selected computer | Off, On | Off by default; switch shortcut and emergency release remain available |
 
 Raw input can be selected for Linux-to-Linux and Mac-to-Linux routes. Device permissions, target readiness,
 and mode capabilities must be checked before raw forwarding begins. Linux edge capture is already
 active during preparation, so any failure explicitly restores local control. An unsupported
 selection reports the missing capability. Splice never silently substitutes desktop mode.
 
-Raw sessions stay on the selected computer automatically because destination edge observations are
-not available. Selecting Raw is sufficient; it does not require or change the Desktop focus setting.
-Use the switch shortcut, Control buttons, or emergency release to change computers during Raw input.
-Returning to Desktop restores its configured edge-crossing behavior.
+Focus lock disables automatic switching in both modes. The source sends this policy during Raw
+preparation and updates it during the session. Linux reports actual boundary hits to the source;
+the source checks ownership, session and current layout before accepting a transition. Raw entry
+places the cursor eight logical pixels inside the target and arms observations on subsequent motion.
+Use the switch shortcut, Control buttons, or emergency release while focus lock is enabled.
 
 Desktop link sensitivity continues to apply only to desktop mode. Raw mode preserves device counts.
 The receiving desktop or game applies its own settings, as with a locally attached relative device.
@@ -175,18 +176,22 @@ The existing desktop backends remain available and independently tested.
 
 ## Transport and module ownership
 
-Use a dedicated ordered input connection per peer so clipboard bytes cannot block behind or ahead of
-raw reports on that socket. Reuse tailnet authentication and bind the connection to the authenticated
-peer, negotiated input mode, and control-session generation. Creating a raw socket alone does not
-grant ownership or permission to inject input.
+Both input modes use UDP channels separate from TCP control and clipboard traffic. Desktop uses
+UDP 41717 and Raw uses UDP 41719. Control remains on TCP 41717. Directional random tokens are
+exchanged over the authenticated control connection. The receiver checks the token, peer address
+and pinned port; Raw also verifies the control owner's Tailscale identity. A socket alone grants
+no ownership. Reconnecting rotates authorizations. UDP readiness is required before activation.
 
-The stream uses TCP port 41719 and `TCP_NODELAY`, preserving report order. VirtualHere's successful local-network
-behavior makes an ordered transport a reasonable first candidate. TCP still stalls on packet loss;
-measure this explicitly. A datagram transport is a separate decision only if measurements justify
-its loss-recovery and ordering complexity.
+Packets fit within 1,200 bytes. Cumulative motion and wheel totals recover displacement from a lost
+packet. Keys, buttons and scroll stops stay in a bounded journal until acknowledged. Each transition
+includes its native capture time and cumulative position before the transition. Missing transitions
+hold subsequent movement until repaired, preserving click and drag ordering. Pending input is
+retried every 20 ms. Datagrams are deduplicated and reordered before injection. There is no TCP input
+substitution. See [protocol 6 validation](raw-input-udp-validation.md) for loss tests and measurements.
 
-Each report carries device identity, session generation, sequence, native capture time, send time,
-and input data. Sequence is the sole global ordering check. Device timestamps may interleave.
+Source reports retain device identity and native capture timestamps. Sequence is the source ordering
+check; device timestamps may interleave. The source merges per-device held state into aggregate
+transitions. The target reconstructs ordered reports from the accepted datagrams.
 The receiver maps source time into its monotonic clock using the minimum receive-minus-send offset
 from the current and previous ten-second windows. Heartbeats update the estimate while idle;
 four initial samples precede capture. These windows bound drift without assuming symmetric paths.

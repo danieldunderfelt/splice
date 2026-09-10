@@ -502,6 +502,11 @@ impl Inner {
 
     async fn on_platform_event(&mut self, ev: PlatformEvent) {
         match ev {
+            PlatformEvent::RawBoundary { session, edge, along } => {
+                if self.armed_specs.contains(&edge) {
+                    self.raw_boundary_hit(session, edge.id, along).await;
+                }
+            }
             PlatformEvent::Capture(CaptureEvent::EdgeMotion {
                 edge_id,
                 along,
@@ -908,6 +913,9 @@ impl Inner {
 
     async fn leave_remote(&mut self, target: &MachineId, reason: LeaveReason, release_all: bool) {
         self.crossing = None;
+        if reason == LeaveReason::Crossed && self.raw.active {
+            self.finish_raw().await;
+        }
         self.stop_raw().await;
         self.send_leave(target, reason, release_all);
         self.focus = Focus::Local;
@@ -923,6 +931,7 @@ impl Inner {
     }
 
     async fn end_driven(&mut self, src: &MachineId, notify: Option<LeaveReason>) {
+        if let Some(net) = &self.net { net.allow_input(src, None); }
         self.stop_raw().await;
         tracing::debug!(source = %src, ?notify, "driven session ended");
         self.release_target_side().await;
@@ -1003,18 +1012,11 @@ impl Inner {
             PeerEvent::Connected {
                 id, hello, caps, ..
             } => {
-                if self.raw.active || self.raw.preparing.is_some() {
-                    if self.focus == Focus::Remote(id.clone()) {
-                        self.end_remote(
-                            &id,
-                            LeaveReason::Reconfigured,
-                            Some(self.last_local_pos),
-                            false,
-                        )
-                        .await;
-                    } else if self.focus == Focus::Driven(id.clone()) {
-                        self.end_driven(&id, None).await;
-                    }
+                if self.focus == Focus::Remote(id.clone()) {
+                    self.source_ledger.drain_releases();
+                    self.end_remote(&id, LeaveReason::Reconfigured, Some(self.last_local_pos), false).await;
+                } else if self.focus == Focus::Driven(id.clone()) {
+                    self.end_driven(&id, None).await;
                 }
                 if self
                     .raw
@@ -1052,6 +1054,26 @@ impl Inner {
                 self.touch_ui();
             }
             PeerEvent::Frame(from, frame) => self.on_frame(from, frame).await,
+            PeerEvent::Input { from, connection, session, captured_us, events } => {
+                if !self.net.as_ref().is_some_and(|net| net.current_connection(&from, connection)) { return; }
+                if splice_platform::raw::clock::now_us().saturating_sub(captured_us) >= 750_000 {
+                    if self.focus == Focus::Driven((*from).clone()) && self.active_session == session {
+                        self.end_driven(&from, Some(LeaveReason::CaptureLost)).await;
+                    }
+                    return;
+                }
+                for ev in events { self.on_frame(from.clone(), Frame::Input { session, ev }).await; }
+            }
+            PeerEvent::InputFailed { id, connection, reason } => {
+                if !self.net.as_ref().is_some_and(|net| net.current_connection(&id, connection)) { return; }
+                self.raw.error = Some(reason);
+                if self.focus == Focus::Remote(id.clone()) {
+                    self.end_remote(&id, LeaveReason::CaptureLost, Some(self.last_local_pos), true).await;
+                } else if self.focus == Focus::Driven(id.clone()) {
+                    self.end_driven(&id, Some(LeaveReason::CaptureLost)).await;
+                }
+                self.touch_ui();
+            }
             PeerEvent::Degraded(id) => {
                 if self
                     .raw
@@ -1116,8 +1138,21 @@ impl Inner {
 
     async fn on_frame(&mut self, from: Arc<MachineId>, frame: Frame) {
         match frame {
-            Frame::RawPrepare { session, pos } => {
-                self.prepare_raw_target((*from).clone(), session, pos).await
+            Frame::RawBoundary { session, target, pos } => {
+                self.cross_raw_boundary(from.as_ref(), session, target, pos).await;
+            }
+            Frame::RawBoundaryAck { session } => {
+                if self.focus == Focus::Driven((*from).clone())
+                    && self.raw.pending_boundary.is_some_and(|(pending, _)| pending == session)
+                {
+                    self.raw.pending_boundary = None;
+                }
+            }
+            Frame::RawBoundaryPolicy { session, boundary } => {
+                self.raw_boundary_policy(from.as_ref(), session, boundary).await;
+            }
+            Frame::RawPrepare { session, pos, boundary } => {
+                self.prepare_raw_target((*from).clone(), session, pos, boundary).await
             }
             Frame::RawReady {
                 session,
@@ -1199,6 +1234,7 @@ impl Inner {
                 }
             }
             Frame::Leave { session, reason } => {
+                if let Some(net) = &self.net { net.abandon_input(&from, session); }
                 if self.raw.pending_target.as_ref() == Some(&(from.as_ref().clone(), session)) {
                     self.stop_raw().await;
                 }
@@ -1286,6 +1322,7 @@ impl Inner {
         self.active_session = session;
         self.target_ledger = HeldLedger::default();
         if let Some(net) = &self.net {
+            net.allow_input(&from, Some(session));
             net.set_active(&from, true);
         }
         self.touch_ui();
@@ -1429,13 +1466,28 @@ impl Inner {
                 match settings.save(&self.data_dir) {
                     Ok(()) => {
                         if let Focus::Remote(target) = self.focus.clone() {
-                            self.end_remote(
-                                &target,
-                                LeaveReason::Reconfigured,
-                                Some(self.last_local_pos),
-                                true,
-                            )
-                            .await;
+                            if self.raw.active
+                                && settings.mode(&target)
+                                    == splice_proto::raw::InputMode::Raw
+                            {
+                                if let Some(net) = &self.net {
+                                    net.send_to(
+                                        &target,
+                                        Frame::RawBoundaryPolicy {
+                                            session: self.active_session,
+                                            boundary: !settings.focus_lock,
+                                        },
+                                    );
+                                }
+                            } else {
+                                self.end_remote(
+                                    &target,
+                                    LeaveReason::Reconfigured,
+                                    Some(self.last_local_pos),
+                                    true,
+                                )
+                                .await;
+                            }
                         }
                         self.cfg.edge_dwell_ms = match settings.crossing {
                             crate::input_settings::CrossingPolicy::Dwell { milliseconds } => {
@@ -1704,6 +1756,17 @@ impl Inner {
             .filter(|link| link.from == self.self_info.id)
             .cloned()
             .collect();
+        if let Some((session, edge)) = self.raw.pending_boundary {
+            if session != self.active_session
+                || !self.raw.active
+                || self
+                    .armed
+                    .get(edge as usize)
+                    .is_none_or(|link| !self.links.contains(link))
+            {
+                self.raw.pending_boundary = None;
+            }
+        }
         // Barrier geometry follows physical placement only. Focus, enable toggles and
         // peer liveness are enforced above/on EdgeHit and must not recreate a portal
         // session (v1 portals prompt again for every new session).

@@ -9,7 +9,8 @@ Linux-to-Mac control uses Desktop mode.
 1. Build the same current Splice checkout on both computers with `cargo build --release -p splice-app`.
 2. Install the permissions described in [Linux setup](linux-setup.md). The source needs read access
    to its physical `/dev/input/event*` devices. The destination needs `/dev/uinput` access.
-3. Allow TCP 41719 on the Tailscale interface. Keep KVM TCP 41717 and updater TCP 41718 available.
+3. Allow UDP 41717 and 41719 on the Tailscale interface. Keep TCP 41717 for control and clipboard,
+   and TCP 41718 for updates available. Both computers must use protocol 6.
 4. Arrange the computers in the workspace.
 5. On the source, choose **Raw input** for the Linux destination.
 6. Cross the arranged screen edge to start capture.
@@ -27,9 +28,9 @@ buttons and cross the edge again before retrying. This can happen when a button 
 before Wayland capture started. This presence check preserves compositor button mappings; it cannot
 prove that every simultaneously held physical button has a corresponding compositor report.
 
-Raw mode stays on the selected computer automatically because device counts cannot predict where a
-game puts its pointer. The **Stay on selected computer in Desktop mode** setting only affects Desktop
-sessions; it can remain off when using Raw input.
+Raw mode uses actual destination boundary observations for return and onward switching. The
+**Stay on selected computer** setting disables automatic switching in both modes; enable it for
+games that capture the pointer. Device counts are never used to predict the Raw destination cursor.
 Linux starts with Immediate crossing. Dwell and Resistance remain Mac source features.
 
 ## Supported devices and settings

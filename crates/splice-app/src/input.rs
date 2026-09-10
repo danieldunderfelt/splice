@@ -111,7 +111,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             }
         }
         changed |= ui
-            .checkbox(&mut settings.focus_lock, "Stay on selected computer in Desktop mode")
+            .checkbox(&mut settings.focus_lock, "Stay on selected computer")
             .changed();
         ui.label(RichText::new("Ctrl+Alt+F12 switches computers in workspace order. The emergency chord returns control here.").small().weak());
         if settings
@@ -120,7 +120,7 @@ pub fn panel(ui: &mut Ui, state: &UiState, controller: &Controller) {
             .any(|mode| *mode == InputMode::Raw)
         {
             ui.label(
-                RichText::new("Raw input stays on the selected Linux computer. Use Ctrl+Alt+F12 or the Control buttons to switch.").small(),
+                RichText::new("Raw input returns at the screen edge unless Stay on selected computer is on. Ctrl+Alt+F12 always switches.").small(),
             );
             ui.label(RichText::new(if source_mac {
                 "Grant Input Monitoring access on this Mac."

@@ -33,7 +33,7 @@ mod uinput;
 mod raw;
 mod raw_capture;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,6 +52,8 @@ pub const VIRTUAL_DEVICE_PREFIX: &str = "Splice Virtual";
 /// State every Linux submodule needs: the event sink, the health report (published on
 /// transitions only) and the current display geometry.
 pub struct Shared {
+    raw_destination: AtomicU64,
+    raw_boundary: AtomicU8,
     capture_control: raw_capture::control::Control,
     emission: Mutex<()>,
     tx: UnboundedSender<PlatformEvent>,
@@ -68,7 +70,54 @@ pub struct Shared {
 
 const INJECTED_KEYS_KEPT: usize = 64;
 
+pub(crate) const RAW_BOUNDARY_DISABLED: u8 = 0;
+pub(crate) const RAW_BOUNDARY_PLACING: u8 = 1;
+pub(crate) const RAW_BOUNDARY_ARMED: u8 = 2;
+
 impl Shared {
+    pub fn raw_boundary_begin(&self, session: u64) {
+        self.raw_boundary.store(RAW_BOUNDARY_PLACING, Ordering::SeqCst);
+        self.raw_destination.store(session, Ordering::SeqCst);
+    }
+
+    pub fn raw_boundary_end(&self) {
+        self.raw_boundary.store(RAW_BOUNDARY_DISABLED, Ordering::SeqCst);
+        self.raw_destination.store(0, Ordering::SeqCst);
+    }
+
+    pub fn raw_boundary_policy(&self, enabled: bool) {
+        if enabled {
+            let _ = self.raw_boundary.compare_exchange(
+                RAW_BOUNDARY_DISABLED,
+                RAW_BOUNDARY_PLACING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        } else {
+            self.raw_boundary.store(RAW_BOUNDARY_DISABLED, Ordering::SeqCst);
+        }
+    }
+
+    pub fn raw_boundary_motion(&self, moved: bool) {
+        if moved {
+            let _ = self.raw_boundary.compare_exchange(
+                RAW_BOUNDARY_PLACING,
+                RAW_BOUNDARY_ARMED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    pub fn raw_boundary_session(&self) -> Option<u64> {
+        let session = self.raw_destination.load(Ordering::SeqCst);
+        if session != 0 && self.raw_boundary.load(Ordering::SeqCst) == RAW_BOUNDARY_ARMED {
+            Some(session)
+        } else {
+            None
+        }
+    }
+
     pub fn note_injection(&self) {
         self.last_injection
             .store(self.epoch.elapsed().as_micros() as u64, Ordering::Release);
@@ -194,6 +243,8 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
 
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
+        raw_destination: AtomicU64::new(0),
+        raw_boundary: AtomicU8::new(0),
         capture_control: Default::default(),
         emission: Mutex::new(()),
         tx,

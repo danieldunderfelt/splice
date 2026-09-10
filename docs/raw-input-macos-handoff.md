@@ -1,6 +1,6 @@
 # Build and validate raw input on macOS
 
-Continue physical acceptance testing of Splice 1.2.0, KVM protocol 5. The native Mac implementation,
+Continue physical acceptance testing of Splice 1.2.0, KVM protocol 6. The native Mac implementation,
 builds, signing, descriptor fixtures, and screen-edge indicator checks are recorded in
 [Mac validation](raw-input-macos-validation.md). The earlier signed test app was installed at
 `/Applications/Splice.app`. The protocol 5 timing repair is built separately; see
@@ -19,15 +19,15 @@ also prohibits adding code comments. Read [the design](raw-input-design.md),
 | Physical input | IOHIDManager report callbacks, descriptor-driven relative axes, buttons 1–8, keyboard arrays and NKRO bitmaps, standard consumer keys |
 | Mac suppression | Existing session event tap for mouse/keyboard plus a media-key event tap for type 14 |
 | Linux injection | Persistent relative uinput mouse and keyboard; per-device held state; high-resolution wheels |
-| Transport | Dedicated TCP 41719, TCP_NODELAY, control ownership, Tailscale identity and IP checks, random ticket, strict sequence and session checks |
+| Transport | UDP 41719 for Raw and UDP 41717 for Desktop; authenticated TCP control; cumulative motion and acknowledged transitions; native capture timing |
 | Recovery | Bounded report queue; explicit overload/error; heartbeat; release on socket loss; independent local emergency release |
 | Selection | Per-destination Desktop/Raw; manual Control buttons; Ctrl+Alt+F12 cycles workspace order |
 | Crossing | Immediate, Dwell, Resistance on Mac sources; current Desktop return and onward crossings share the gesture policy |
 | Diagnostics | Input settings, active/preparing state, progress, and errors are included in the existing exported UiState |
 
-Raw mode stays on the selected computer automatically. The Desktop focus setting can remain off.
-Use Ctrl+Alt+F12 or the Control buttons to switch during Raw input. There is no destination edge
-observer in this implementation. Raw counts never predict Linux pointer coordinates.
+Raw mode uses Linux boundary observations for automatic return and onward switching. Focus lock
+applies to both modes. Use Ctrl+Alt+F12 or the Control buttons while locked. Raw counts never predict
+Linux pointer coordinates. See [protocol 6 validation](raw-input-udp-validation.md) for current evidence.
 Linux source edges continue using Immediate crossing. The Splice panel and a native Mac panel beside
 the physical screen edge show gesture progress. The native panel works without the app window open.
 
@@ -100,7 +100,7 @@ cargo build -p splice-app --release --locked
 ./target/release/splice --version-json
 ```
 
-The reported version must be 1.2.0 and protocol 5. A dirty source checkout must report itself as dirty.
+The reported version must be 1.2.0 and protocol 6. A dirty source checkout must report itself as dirty.
 Linux cross-checks of the platform crate do not replace this native build and link step.
 
 4. Build the app with the signing identity used by the current installation. Inspect it with
@@ -119,8 +119,8 @@ identities between tests. Follow [release signing and notarization](releasing.md
 5. Quit the running Mac instance, install the test bundle at its normal stable path, and launch it.
    Grant Accessibility and Input Monitoring to that installed bundle, then restart it. Keep the
    working release available for restoration. Do not run two Splice instances during capture checks.
-6. Build/install protocol 5 on both Linux destinations. Verify `/dev/uinput` access using
-   [Linux setup](linux-setup.md). Allow TCP 41717, 41718, and 41719 on the Tailscale interface.
+6. Build/install protocol 6 on both Linux destinations. Verify `/dev/uinput` access using
+   [Linux setup](linux-setup.md). Allow TCP 41717 and 41718, plus UDP 41717 and 41719 on the Tailscale interface.
 7. On the Mac, select Raw for one Linux destination and click its **Control** button, or cross its
    arranged screen edge. Preparation must finish before the Mac begins suppressing local input.
 
@@ -178,8 +178,8 @@ clocks explicit and do not log keystrokes or clipboard contents in ordinary diag
 Compare direct attachment, VirtualHere, Desktop mode, and Raw mode on the same local network.
 Keep DPI, polling rate, destination sensitivity, acceleration, and test application unchanged.
 Measure report count/sign preservation and cadence separately from input-to-display latency.
-Exercise 125, 500, and 1000 Hz; measure higher rates on suitable hardware. TCP packet loss can still
-stall an ordered stream. Include clipboard transfer, direct versus relayed Tailscale paths, and
+Exercise 125, 500, and 1000 Hz; measure higher rates on suitable hardware. UDP loss must recover
+distance and retain key/button ordering. Include clipboard transfer, direct versus relayed Tailscale paths, and
 network impairment. Do not call loopback results a hardware latency benchmark.
 
 Run native Wayland, XWayland, and Proton games on both GNOME and KDE. Confirm relative camera input,

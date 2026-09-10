@@ -26,6 +26,7 @@ pub use engine::{Command, Engine, EngineHandle};
 pub use ui_state::*;
 
 mod raw_transport;
+mod input_transport;
 
 pub mod input_settings;
 
