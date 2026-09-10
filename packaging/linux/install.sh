@@ -27,7 +27,7 @@ modules_conf="${script_directory}/splice-modules.conf"
 modules_target="/etc/modules-load.d/splice.conf"
 
 if [[ ! -x "$binary_path" ]]; then
-    printf 'Build the release binary first: cargo build -p splice-app --release\n' >&2
+    printf 'Build the release binary first: cargo build -p splice-app --release --locked\n' >&2
     printf 'Expected to find it at %s.\n' "$binary_path" >&2
     exit 1
 fi

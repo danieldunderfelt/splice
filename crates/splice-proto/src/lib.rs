@@ -4,6 +4,7 @@
 //! tailnet peers. WireGuard provides transport encryption; Tailscale WhoIs provides
 //! authentication — there is no crypto at this layer.
 //!
+pub mod files;
 pub mod framing;
 pub mod raw;
 pub mod validation;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const PROTO_VERSION: u16 = 6;
+pub const PROTO_VERSION: u16 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildInfo {
@@ -47,6 +48,8 @@ pub const CLIP_INLINE_TEXT_MAX: usize = 64 * 1024;
 
 /// Capability strings advertised in `Hello`. Constants so call sites can't typo them.
 pub mod caps {
+    pub const FILES_V1: &str = "files-v1";
+    pub const FILES_V2: &str = "files-v2";
     /// Base input relay (motion/button/scroll/key, enter/leave, source claims).
     pub const INPUT_V1: &str = "input-v1";
     /// Clipboard offers + lazy fetch.
@@ -284,6 +287,9 @@ pub enum Frame {
     MasterState { enabled: bool },
     Ready,
     Panic,
+    Files(files::FileMessage),
+    FileClipboardRef { stamp: Stamp, generation: u64 },
+    FileRoute { stamp: Stamp, generation: u64, recipient: MachineId },
 }
 
 /// Errors shared by framing and session-level protocol handling.

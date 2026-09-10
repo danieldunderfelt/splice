@@ -13,6 +13,22 @@ pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PENDING: usize = 64;
 const MAX_BUFFERED: usize = 64 * 1024 * 1024;
 
+pub(crate) fn is_file_reference_mime(mime: &str) -> bool {
+    let name = mime.split(';').next().unwrap_or(mime).trim();
+    [
+        "text/uri-list",
+        "x-special/gnome-copied-files",
+        "x-special/gnome-icon-list",
+        "application/vnd.portal.filetransfer",
+        "application/x-kde-cutselection",
+        "application/x-kde-urilist",
+        "application/x-kde4-urilist",
+        "public.file-url",
+        "com.apple.pasteboard.promised-file-url",
+        "NSFilenamesPboardType",
+    ].iter().any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 #[derive(Clone)]
 struct PendingOffer {
     origin: MachineId,
@@ -202,7 +218,7 @@ struct RemoteFetch {
 #[async_trait::async_trait]
 impl ClipFetch for RemoteFetch {
     async fn fetch(&self, mime: &str) -> Option<Vec<u8>> {
-        if !self.mimes.iter().any(|offered| offered == mime) {
+        if is_file_reference_mime(mime) || !self.mimes.iter().any(|offered| offered == mime) {
             return None;
         }
         let request = self.transfers.next_request.fetch_add(1, Ordering::Relaxed);
@@ -255,6 +271,16 @@ impl ClipFetch for RemoteFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_references_cannot_travel_as_ordinary_clipboard_data() {
+        for mime in ["text/uri-list", " Text/Uri-List ; charset=utf-8", "application/vnd.portal.filetransfer", "public.file-url", "x-special/gnome-copied-files"] {
+            assert!(is_file_reference_mime(mime), "{mime}");
+        }
+        for mime in ["text/plain;charset=utf-8", "text/html", "image/png", "application/rtf"] {
+            assert!(!is_file_reference_mime(mime), "{mime}");
+        }
+    }
 
     fn pending(
         transfers: &Transfers,

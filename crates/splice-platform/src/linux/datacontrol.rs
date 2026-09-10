@@ -49,7 +49,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Command {
-    SetOffer { mimes: Vec<String>, fetch: Arc<dyn ClipFetch> },
+    SetOffer { mimes: Vec<String>, fetch: Arc<dyn ClipFetch>, reply: oneshot::Sender<Result<()>> },
     Read { mime: String, reply: oneshot::Sender<io::Result<Vec<u8>>> },
     Shutdown,
 }
@@ -61,9 +61,11 @@ pub struct DataControlClipboard {
 #[async_trait::async_trait]
 impl Clipboard for DataControlClipboard {
     async fn set_remote_offer(&self, offer: ClipboardOffer, fetch: Arc<dyn ClipFetch>) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
         self.cmd
-            .send(Command::SetOffer { mimes: offer.mimes, fetch })
-            .map_err(|_| PlatformError::Unavailable("data-control clipboard stopped".into()))
+            .send(Command::SetOffer { mimes: offer.mimes, fetch, reply })
+            .map_err(|_| PlatformError::Unavailable("data-control clipboard stopped".into()))?;
+        rx.await.map_err(|_| PlatformError::Unavailable("clipboard publication dropped".into()))?
     }
 
     async fn read_local(&self, mime: &str) -> Result<Vec<u8>> {
@@ -198,7 +200,8 @@ struct State {
     retired: HashMap<ObjectId, (Source, Arc<dyn ClipFetch>)>,
     marker: String,
     /// Bumped per selection; late inline reads for an older selection are dropped.
-    generation: Arc<AtomicU64>,
+    generation: Arc<crate::ClipboardClock>,
+    inspection: Arc<AtomicU64>,
     running: bool,
 }
 
@@ -363,23 +366,25 @@ impl State {
     }
 
     fn selection(&mut self, id: Option<ObjectId>) {
-        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let inspection = self.inspection.fetch_add(1, Ordering::AcqRel) + 1;
+        let selected = id.and_then(|id| self.offers.remove(&id));
         if let Some((old, _)) = self.current.take() {
             old.destroy();
         }
-        let Some(id) = id else {
+        if selected.as_ref().is_some_and(|(_, mimes)| mimes.iter().any(|m| m == &self.marker)) {
+            if let Some((offer, _)) = selected {
+                offer.destroy();
+            }
+            return;
+        }
+        let generation = self.generation.invalidate();
+        let Some((offer, mimes)) = selected else {
+            if !self.generation.changed(generation, Vec::new(), None) {
+                self.shared.emit(PlatformEvent::ClipboardChanged { mimes: Vec::new(), inline_text: None });
+            }
             return;
         };
-        let Some((offer, mimes)) = self.offers.remove(&id) else { return };
-        if mimes.iter().any(|m| m == &self.marker) {
-            offer.destroy();
-            return;
-        }
         let normalized = normalize_mimes(&mimes);
-        if normalized.is_empty() {
-            self.current = Some((offer, mimes));
-            return;
-        }
         let has_text = normalized.iter().any(|m| m == TEXT_MIME);
         let inline = if has_text {
             self.receive(&offer, &mimes, TEXT_MIME).ok()
@@ -389,6 +394,7 @@ impl State {
         self.current = Some((offer, mimes));
         let shared = self.shared.clone();
         let current = self.generation.clone();
+        let current_inspection = self.inspection.clone();
         std::thread::spawn(move || {
             let inline_text = inline.and_then(|fd| {
                 read_pipe(fd, CLIP_INLINE_TEXT_MAX + 1, READ_TIMEOUT)
@@ -396,7 +402,10 @@ impl State {
                     .filter(|bytes| bytes.len() <= CLIP_INLINE_TEXT_MAX)
                     .and_then(|bytes| String::from_utf8(bytes).ok())
             });
-            if current.load(Ordering::Acquire) == generation {
+            if current_inspection.load(Ordering::Acquire) != inspection {
+                return;
+            }
+            if !current.changed(generation, normalized.clone(), inline_text.clone()) {
                 shared.emit(PlatformEvent::ClipboardChanged { mimes: normalized, inline_text });
             }
         });
@@ -418,11 +427,15 @@ impl State {
         Ok(read)
     }
 
-    fn set_offer(&mut self, qh: &QueueHandle<Self>, mimes: Vec<String>, fetch: Arc<dyn ClipFetch>) {
-        if mimes.is_empty() {
-            return;
+    fn set_offer(&mut self, qh: &QueueHandle<Self>, mimes: Vec<String>, fetch: Arc<dyn ClipFetch>) -> Result<()> {
+        if let Some(guard) = fetch.publication_guard() {
+            guard.check()?;
         }
-        let Some(device) = &self.device else { return };
+        if mimes.is_empty() {
+            return Err(PlatformError::Unavailable("clipboard offer has no representations".into()));
+        }
+        let device = self.device.as_ref().ok_or_else(|| PlatformError::Unavailable("no clipboard device".into()))?;
+        self.inspection.fetch_add(1, Ordering::AcqRel);
         if let Some(old) = self.own.take() {
             self.retired.insert(old.source.id(), (old.source, old.fetch));
         }
@@ -439,13 +452,19 @@ impl State {
             (Device::Wlr(d), Source::Wlr(s)) => d.set_selection(Some(s)),
             _ => {}
         }
+        if let Some(guard) = fetch.publication_guard() {
+            guard.published();
+        }
         self.own = Some(Own { source, mimes, fetch });
+        Ok(())
     }
 
     fn republish(&mut self, qh: &QueueHandle<Self>) {
         if let Some(own) = self.own.take() {
             own.source.destroy();
-            self.set_offer(qh, own.mimes, own.fetch);
+            if let Err(error) = self.set_offer(qh, own.mimes, own.fetch) {
+                tracing::debug!(%error, "clipboard offer was not reapplied");
+            }
         }
     }
 
@@ -517,10 +536,15 @@ impl State {
 
     fn handle_command(&mut self, qh: &QueueHandle<Self>, cmd: Command) {
         match cmd {
-            Command::SetOffer { mimes, fetch } => self.set_offer(qh, mimes, fetch),
+            Command::SetOffer { mimes, fetch, reply } => {
+                if !reply.is_closed() {
+                    let result = self.set_offer(qh, mimes, fetch);
+                    let _ = reply.send(result);
+                }
+            }
             Command::Read { mime, reply } => self.read(mime, reply),
             Command::Shutdown => {
-                self.generation.fetch_add(1, Ordering::AcqRel);
+                self.generation.invalidate();
                 if let Some(own) = self.own.take() {
                     own.source.destroy();
                 }
@@ -577,7 +601,8 @@ fn run(
             own: None,
             retired: HashMap::new(),
             marker: format!("{OWNER_MARKER_PREFIX}{}", std::process::id()),
-            generation: Arc::new(AtomicU64::new(0)),
+            generation: crate::native_clipboard_clock(),
+            inspection: Arc::new(AtomicU64::new(0)),
             running: true,
         };
         state.ensure_device(&qh);

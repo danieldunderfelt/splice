@@ -4,6 +4,13 @@
 //! below is the contract for splice-app / splice-daemon.
 
 mod inner;
+mod clipboard_clock;
+
+pub(crate) enum NativeClipboardEvent {
+    Invalidated { generation: u64, epoch: u64 },
+    Changed { generation: u64, mimes: Vec<String>, inline_text: Option<String>, epoch: u64 },
+    Captured { selection: crate::files::LocalSelection, generation: u64, epoch: u64 },
+}
 
 use crate::ui_state::UiState;
 use splice_proto::{MachineId, Vec2I};
@@ -15,6 +22,8 @@ use tokio::sync::{mpsc, watch};
 /// Commands from UI / tray / daemon control.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Command {
+    Files(crate::files::FileCommand),
+    FileClipboardSelection { paths: Vec<std::path::PathBuf>, generation: u64 },
     SetInputSettings(crate::input_settings::InputSettings),
     SelectTarget(MachineId),
     Update {
@@ -38,12 +47,30 @@ pub enum Command {
 
 #[derive(Clone)]
 pub struct EngineHandle {
+    files: crate::files::FileHandle,
+    native_selection: clipboard_clock::Sender,
     cmd: mpsc::UnboundedSender<Command>,
     state: watch::Receiver<UiState>,
     ready: watch::Receiver<Option<SocketAddr>>,
 }
 
 impl EngineHandle {
+    pub fn invalidate_file_clipboard(&self, generation: u64) -> anyhow::Result<()> {
+        self.native_selection.send(NativeClipboardEvent::Invalidated { generation, epoch: self.files.clipboard_epoch() })
+    }
+
+    pub fn clipboard_changed(&self, generation: u64, mimes: Vec<String>, inline_text: Option<String>) -> anyhow::Result<()> {
+        anyhow::ensure!(mimes.len() <= 64 && mimes.iter().all(|m| m.len() <= 256) && inline_text.as_ref().is_none_or(|text| text.len() <= splice_proto::CLIP_INLINE_TEXT_MAX), "clipboard event exceeds metadata limits");
+        self.native_selection.send(NativeClipboardEvent::Changed { generation, mimes, inline_text, epoch: self.files.clipboard_epoch() })
+    }
+
+    pub fn capture_file_clipboard(&self, selection: crate::files::LocalSelection, generation: u64) -> anyhow::Result<()> {
+        selection.validate()?;
+        self.native_selection.send(NativeClipboardEvent::Captured { selection, generation, epoch: self.files.clipboard_epoch() })
+    }
+
+    pub fn files(&self) -> crate::files::FileHandle { self.files.clone() }
+
     pub fn send(&self, cmd: Command) {
         let _ = self.cmd.send(cmd);
     }
@@ -127,7 +154,9 @@ impl Engine {
             ready_tx,
             update_host,
         )?;
+        let files = inner.file_handle();
+        let native_selection = inner.native_selection_sender();
         tokio::spawn(inner.run());
-        Ok(EngineHandle { cmd: cmd_tx, state: ui_rx, ready: ready_rx })
+        Ok(EngineHandle { files, native_selection, cmd: cmd_tx, state: ui_rx, ready: ready_rx })
     }
 }

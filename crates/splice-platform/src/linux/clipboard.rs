@@ -41,29 +41,38 @@ pub struct ClipSession {
 }
 
 struct OfferState {
-    mimes: Vec<String>,
     fetch: Arc<dyn ClipFetch>,
 }
 
 pub struct WaylandClipboard {
     conn: zbus::Connection,
     session_rx: watch::Receiver<Option<ClipSession>>,
+    observed_rx: watch::Receiver<Option<ClipSession>>,
     offer: Arc<Mutex<Option<OfferState>>>,
+    publication: tokio::sync::Mutex<()>,
 }
 
 #[async_trait::async_trait]
 impl Clipboard for WaylandClipboard {
     async fn set_remote_offer(&self, offer: ClipboardOffer, fetch: Arc<dyn ClipFetch>) -> Result<()> {
-        let mimes = offer.mimes.clone();
-        *self.offer.lock() = Some(OfferState { mimes: mimes.clone(), fetch });
-        // Bind first so the non-Send watch::Ref guard drops before the await.
-        let session = self.session_rx.borrow().clone();
-        if let Some(session) = session {
-            if session.enabled {
-                set_selection(&self.conn, &session.path, &mimes).await?;
+        let _publication = self.publication.lock().await;
+        let session = available_session(self.session_rx.borrow().clone(), &fetch)?;
+        if let Err(error) = wait_for_session(&self.session_rx, &self.observed_rx, &session).await {
+            if let Some(guard) = fetch.publication_guard().filter(|guard| !guard.is_published()) {
+                guard.cancel();
             }
+            return Err(error);
         }
-        Ok(())
+        let proxy = portal::proxy(&self.conn, IFACE).await?;
+        let path = portal::object_path(&session.path)?;
+        let mut opts = Options::new();
+        opts.insert("mime_types", Value::new(zbus::zvariant::Array::from(offer.mimes)));
+        publish_selection(&self.offer, fetch, async {
+            current_session(&self.session_rx, &session)?;
+            let result = proxy.call::<_, _, ()>("SetSelection", &(path, opts)).await.map_err(portal::err_ctx("SetSelection"));
+            current_session(&self.session_rx, &session)?;
+            result
+        }).await
     }
 
     async fn read_local(&self, mime: &str) -> Result<Vec<u8>> {
@@ -100,7 +109,8 @@ pub fn create(
 ) -> (Arc<WaylandClipboard>, Stop) {
     let offer: Arc<Mutex<Option<OfferState>>> = Arc::new(Mutex::new(None));
 
-    let observer = tokio::spawn(observe(shared, conn.clone(), session_rx.clone(), offer.clone()));
+    let (observed_tx, observed_rx) = watch::channel(None);
+    let observer = tokio::spawn(observe(shared, conn.clone(), session_rx.clone(), observed_tx, offer.clone()));
     let server = tokio::spawn(serve_transfers(conn.clone(), session_rx.clone(), offer.clone()));
     let stop = Stop::new({
         let observer = observer.abort_handle();
@@ -110,10 +120,11 @@ pub fn create(
             observer.abort();
             server.abort();
             *offer.lock() = None;
+            crate::native_clipboard_clock().invalidate();
         }
     });
 
-    (Arc::new(WaylandClipboard { conn, session_rx, offer }), stop)
+    (Arc::new(WaylandClipboard { conn, session_rx, observed_rx, offer, publication: tokio::sync::Mutex::new(()) }), stop)
 }
 
 fn normalize_mimes(mimes: &[String]) -> Vec<String> {
@@ -134,15 +145,73 @@ fn normalize_mimes(mimes: &[String]) -> Vec<String> {
     out
 }
 
-async fn set_selection(conn: &zbus::Connection, session_path: &str, mimes: &[String]) -> Result<()> {
-    let proxy = portal::proxy(conn, IFACE).await?;
-    let mut opts = Options::new();
-    opts.insert("mime_types", Value::new(zbus::zvariant::Array::from(mimes.to_vec())));
-    proxy
-        .call::<_, _, ()>("SetSelection", &(portal::object_path(session_path)?, opts))
-        .await
-        .map_err(portal::err_ctx("SetSelection"))?;
+fn available_session(session: Option<ClipSession>, fetch: &Arc<dyn ClipFetch>) -> Result<ClipSession> {
+    if let Some(session) = session.filter(|s| s.enabled) {
+        return Ok(session);
+    }
+    if let Some(guard) = fetch.publication_guard() {
+        if !guard.is_published() {
+            guard.cancel();
+        }
+    }
+    Err(PlatformError::Unavailable("no clipboard session; retry after the session is restored".into()))
+}
+
+fn current_session(session_rx: &watch::Receiver<Option<ClipSession>>, session: &ClipSession) -> Result<()> {
+    let current = session_rx.borrow();
+    if current.as_ref().is_none_or(|current| !current.enabled || current.path != session.path) {
+        return Err(PlatformError::Unavailable("clipboard session changed during publication".into()));
+    }
     Ok(())
+}
+
+async fn wait_for_session(
+    session_rx: &watch::Receiver<Option<ClipSession>>,
+    observed_rx: &watch::Receiver<Option<ClipSession>>,
+    session: &ClipSession,
+) -> Result<()> {
+    let mut current = session_rx.clone();
+    let mut observed = observed_rx.clone();
+    loop {
+        if current.has_changed().is_err() || observed.has_changed().is_err() {
+            return Err(PlatformError::Unavailable("clipboard observer stopped".into()));
+        }
+        current_session(&current, session)?;
+        if current_session(&observed, session).is_ok() {
+            return Ok(());
+        }
+        let changed = tokio::select! {
+            changed = current.changed() => changed,
+            changed = observed.changed() => changed,
+        };
+        changed.map_err(|_| PlatformError::Unavailable("clipboard observer stopped".into()))?;
+    }
+}
+
+async fn publish_selection(
+    offer: &Mutex<Option<OfferState>>,
+    fetch: Arc<dyn ClipFetch>,
+    publish: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let guard = fetch.publication_guard();
+    if let Some(guard) = &guard {
+        guard.check()?;
+    }
+    *offer.lock() = Some(OfferState { fetch: fetch.clone() });
+    let result = publish.await;
+    let cancelled = guard.as_ref().is_some_and(|guard| guard.is_cancelled());
+    if result.is_err() || cancelled {
+        let mut current = offer.lock();
+        if current.as_ref().is_some_and(|state| Arc::ptr_eq(&state.fetch, &fetch)) {
+            *current = None;
+        }
+    } else if let Some(guard) = guard {
+        guard.published();
+    }
+    if cancelled {
+        return Err(PlatformError::Unavailable("clipboard publication was cancelled".into()));
+    }
+    result
 }
 
 async fn selection_read(conn: &zbus::Connection, session_path: &str, mime: &str) -> Result<zvariant::OwnedFd> {
@@ -154,14 +223,14 @@ async fn selection_read(conn: &zbus::Connection, session_path: &str, mime: &str)
     Ok(fd)
 }
 
-/// Observes SelectionOwnerChanged; on a real (non-self) change, reads small text inline
-/// and republishes the offer. Re-applies a pending remote offer on session (re)grant.
 async fn observe(
     shared: Arc<Shared>,
     conn: zbus::Connection,
     mut session_rx: watch::Receiver<Option<ClipSession>>,
+    observed_tx: watch::Sender<Option<ClipSession>>,
     offer: Arc<Mutex<Option<OfferState>>>,
 ) {
+    let mut reads = tokio::task::JoinSet::new();
     loop {
         let session = loop {
             if let Some(s) = session_rx.borrow().clone().filter(|s| s.enabled) {
@@ -171,14 +240,6 @@ async fn observe(
                 return;
             }
         };
-        // Extract before the await: the parking_lot guard is not Send.
-        let pending = offer.lock().as_ref().map(|state| state.mimes.clone());
-        if let Some(mimes) = pending {
-            if let Err(err) = set_selection(&conn, &session.path, &mimes).await {
-                tracing::warn!(error = %err, "re-applying clipboard offer failed");
-            }
-        }
-
         let proxy = match portal::proxy(&conn, IFACE).await {
             Ok(p) => p,
             Err(_) => return,
@@ -187,14 +248,23 @@ async fn observe(
             Ok(s) => s,
             Err(_) => return,
         };
+        observed_tx.send_replace(Some(session.clone()));
         loop {
             tokio::select! {
                 changed = session_rx.changed() => {
                     if changed.is_err() {
                         return;
                     }
+                    if current_session(&session_rx, &session).is_ok() {
+                        continue;
+                    }
+                    observed_tx.send_replace(None);
+                    reads.abort_all();
+                    *offer.lock() = None;
+                    crate::native_clipboard_clock().invalidate();
                     break;
                 }
+                _ = reads.join_next(), if !reads.is_empty() => {}
                 msg = changes.next() => {
                     let Some(msg) = msg else { return };
                     let Some((path, opts)) = portal::session_signal(&msg)
@@ -206,17 +276,28 @@ async fn observe(
                     }
                     // Loop guard: our own SetSelection also fires this signal.
                     if portal::get::<bool>(&opts, "session_is_owner") == Some(true) {
+                        reads.abort_all();
                         continue;
                     }
+                    reads.abort_all();
+                    let clock = crate::native_clipboard_clock();
+                    let generation = clock.invalidate();
                     let mimes = normalize_mimes(
                         &portal::get::<Vec<String>>(&opts, "mime_types").unwrap_or_default(),
                     );
-                    let inline_text = if mimes.iter().any(|m| m == "text/plain;charset=utf-8") {
-                        read_inline_text(&conn, &session.path).await
-                    } else {
-                        None
-                    };
-                    shared.emit(PlatformEvent::ClipboardChanged { mimes, inline_text });
+                    let shared = shared.clone();
+                    let conn = conn.clone();
+                    let path = session.path.clone();
+                    reads.spawn(async move {
+                        let inline_text = if mimes.iter().any(|m| m == "text/plain;charset=utf-8") {
+                            read_inline_text(&conn, &path).await
+                        } else {
+                            None
+                        };
+                        if !clock.changed(generation, mimes.clone(), inline_text.clone()) {
+                            shared.emit(PlatformEvent::ClipboardChanged { mimes, inline_text });
+                        }
+                    });
                 }
             }
         }
@@ -419,4 +500,144 @@ async fn write_fd_inner(fd: OwnedFd, data: &[u8]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClipboardClock, ClipboardGuard};
+
+    struct Fetch(ClipboardGuard);
+
+    #[async_trait::async_trait]
+    impl ClipFetch for Fetch {
+        fn publication_guard(&self) -> Option<ClipboardGuard> {
+            Some(self.0.clone())
+        }
+
+        async fn fetch(&self, _mime: &str) -> Option<Vec<u8>> {
+            if self.0.is_cancelled() { None } else { Some(b"offered".to_vec()) }
+        }
+    }
+
+    fn provider() -> (Arc<ClipboardClock>, ClipboardGuard, Arc<dyn ClipFetch>) {
+        let clock = Arc::new(ClipboardClock::default());
+        let guard = ClipboardGuard::new(clock.clone(), clock.current(), None);
+        let fetch: Arc<dyn ClipFetch> = Arc::new(Fetch(guard.clone()));
+        (clock, guard, fetch)
+    }
+
+    #[tokio::test]
+    async fn foreign_owner_before_set_selection_reply_preserves_the_submitted_provider() {
+        let (clock, guard, fetch) = provider();
+        let offer = Arc::new(Mutex::new(None));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task = {
+            let offer = offer.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                publish_selection(&offer, fetch, async {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(())
+                }).await
+            })
+        };
+        entered.notified().await;
+        clock.invalidate();
+        release.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(guard.is_published());
+        let retained = offer.lock().as_ref().unwrap().fetch.clone();
+        assert_eq!(retained.fetch("text/plain").await.unwrap(), b"offered");
+        clock.invalidate();
+        assert_eq!(retained.fetch("text/plain").await.unwrap(), b"offered");
+    }
+
+    #[tokio::test]
+    async fn successful_native_reply_never_revives_a_cancelled_provider() {
+        let (_, guard, fetch) = provider();
+        let offer = Mutex::new(None);
+        assert!(publish_selection(&offer, fetch, async {
+            guard.cancel();
+            Ok(())
+        }).await.is_err());
+        assert!(offer.lock().is_none());
+        assert!(guard.is_cancelled());
+        assert!(!guard.is_published());
+    }
+
+    #[tokio::test]
+    async fn cancelled_cached_offer_cannot_reach_set_selection_after_regrant() {
+        let (_, guard, fetch) = provider();
+        assert!(available_session(None, &fetch).is_err());
+        assert!(guard.is_cancelled());
+        assert!(!guard.is_published());
+        let restored = Some(ClipSession { path: "/session/new".into(), enabled: true });
+        assert!(available_session(restored, &fetch).is_ok());
+        let offer = Mutex::new(None);
+        let called = std::sync::atomic::AtomicBool::new(false);
+        assert!(publish_selection(&offer, fetch, async {
+            called.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }).await.is_err());
+        assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+        assert!(offer.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_session_does_not_cancel_already_published_ordinary_bytes() {
+        let (clock, guard, fetch) = provider();
+        guard.published();
+        clock.invalidate();
+        assert!(available_session(None, &fetch).is_err());
+        assert!(!guard.is_cancelled());
+        assert_eq!(fetch.fetch("text/plain").await.unwrap(), b"offered");
+    }
+
+    #[tokio::test]
+    async fn session_replacement_during_set_selection_cannot_ack_the_old_offer() {
+        let (_, guard, fetch) = provider();
+        let session = ClipSession { path: "/session/old".into(), enabled: true };
+        let (tx, rx) = watch::channel(Some(session.clone()));
+        let offer = Mutex::new(None);
+        assert!(publish_selection(&offer, fetch, async {
+            current_session(&rx, &session)?;
+            tx.send_replace(Some(ClipSession { path: "/session/new".into(), enabled: true }));
+            current_session(&rx, &session)
+        }).await.is_err());
+        assert!(!guard.is_published());
+        assert!(offer.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn publication_waits_for_observation_of_the_current_session() {
+        use futures::FutureExt;
+        let session = ClipSession { path: "/session/new".into(), enabled: true };
+        let (_session_tx, session_rx) = watch::channel(Some(session.clone()));
+        let (observed_tx, observed_rx) = watch::channel(Some(ClipSession { path: "/session/old".into(), enabled: true }));
+        let ready = wait_for_session(&session_rx, &observed_rx, &session);
+        tokio::pin!(ready);
+        assert!(ready.as_mut().now_or_never().is_none());
+        observed_tx.send_replace(Some(session.clone()));
+        ready.await.unwrap();
+        drop(observed_tx);
+        assert!(wait_for_session(&session_rx, &observed_rx, &session).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn losing_session_while_waiting_for_observation_fails() {
+        use futures::FutureExt;
+        let session = ClipSession { path: "/session/current".into(), enabled: true };
+        let (session_tx, session_rx) = watch::channel(Some(session.clone()));
+        let (_observed_tx, observed_rx) = watch::channel(None);
+        let ready = wait_for_session(&session_rx, &observed_rx, &session);
+        tokio::pin!(ready);
+        assert!(ready.as_mut().now_or_never().is_none());
+        session_tx.send_replace(None);
+        assert!(ready.await.is_err());
+    }
+
 }

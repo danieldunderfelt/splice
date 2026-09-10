@@ -65,6 +65,9 @@ impl LayoutDoc {
 impl Frame {
     pub fn validate(&self) -> Result<(), ProtoError> {
         let valid = match self {
+            Frame::Files(message) => return message.validate(),
+            Frame::FileClipboardRef { stamp: value, .. } => stamp(value),
+            Frame::FileRoute { stamp: value, recipient, .. } => stamp(value) && identity(recipient),
             Frame::RawReady {
                 session,
                 port,

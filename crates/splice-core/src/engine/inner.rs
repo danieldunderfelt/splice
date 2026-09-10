@@ -3,6 +3,7 @@
 //! capture/emulation and publishes UiState snapshots (debounced to <=10 Hz).
 
 mod crossing;
+mod files;
 mod raw;
 
 use crate::engine::Command;
@@ -59,6 +60,13 @@ struct Peer {
 }
 
 pub struct Inner {
+    files: crate::files::Bridge,
+    native_selection_tx: super::clipboard_clock::Sender,
+    native_selection_rx: super::clipboard_clock::Receiver,
+    clipboard_clock: super::clipboard_clock::ClipboardClock,
+    file_clipboard: Option<crate::files::FileClipboardRef>,
+    local_clipboard_epoch: u64,
+    file_route: Option<(Stamp, MachineId)>,
     raw: raw::RawState,
     crossing: Option<crossing::Crossing>,
     self_info: MachineInfo,
@@ -147,11 +155,20 @@ impl Inner {
             displays,
             events,
             backends,
+            ..
         } = platform;
         if let Some(backends) = &backends {
             let _ = backends.send(cfg.backends);
         }
+        let (native_selection_tx, native_selection_rx) = super::clipboard_clock::channel();
         Ok(Inner {
+            files: crate::files::Bridge::new(),
+            native_selection_tx,
+            native_selection_rx,
+            clipboard_clock: Default::default(),
+            file_clipboard: None,
+            local_clipboard_epoch: 0,
+            file_route: None,
             crossing: None,
             raw: raw::RawState::new(
                 raw_capture,
@@ -220,6 +237,10 @@ impl Inner {
         })
     }
 
+    pub fn native_selection_sender(&self) -> super::clipboard_clock::Sender { self.native_selection_tx.clone() }
+
+    pub fn file_handle(&self) -> crate::files::FileHandle { self.files.handle.clone() }
+
     pub async fn run(mut self) {
         if !self.bootstrap().await {
             return;
@@ -232,6 +253,7 @@ impl Inner {
         self.recompute().await;
         self.publish_ui();
 
+        let mut file_state = self.files.handle.summary();
         let mut net_events = self.net_events.take();
         let mut discovery = tokio::time::interval_at(
             tokio::time::Instant::now() + self.poll_interval,
@@ -264,6 +286,14 @@ impl Inner {
                         }
                     }
                 }
+                changed = file_state.changed() => {
+                    if changed.is_ok() {
+                        self.retire_stale_file_clipboard();
+                        if !file_state.borrow().enabled { self.invalidate_pending_native_clipboard(); if self.file_clipboard.is_some() { self.clear_file_clipboard(); } }
+                        self.touch_ui();
+                    }
+                }
+                Some(event) = self.native_selection_rx.recv() => self.native_clipboard_event(event),
                 cmd = self.cmd.recv() => match cmd {
                     Some(cmd) => {
                         self.on_command(cmd).await;
@@ -407,6 +437,7 @@ impl Inner {
             .await
             {
                 Ok((mgr, control)) => {
+                    self.files.start(self.self_info.id.clone(), control.clone(), self.ts.clone(), self.data_dir.clone()).await;
                     let _ = self.ready_tx.send(Some(mgr.local_addr));
                     self.net = Some(control);
                     self.net_events = Some(mgr.events);
@@ -559,7 +590,7 @@ impl Inner {
                 self.driven_grace_until = None;
             }
             PlatformEvent::ClipboardChanged { mimes, inline_text } => {
-                self.on_clipboard_changed(mimes, inline_text);
+                if !self.native_clipboard_ordered() { self.on_clipboard_changed(mimes, inline_text); }
             }
             PlatformEvent::DisplaysChanged { displays } => {
                 tracing::info!(
@@ -950,6 +981,7 @@ impl Inner {
     }
 
     async fn panic(&mut self) {
+        let _ = self.files.handle.send(crate::files::FileCommand::CancelDrags);
         self.crossing = None;
         self.stop_raw().await;
         if let Focus::Remote(target) = self.focus.clone() {
@@ -1047,6 +1079,7 @@ impl Inner {
                     net.send_to(&id, Frame::SourceClaim { stamp: claim });
                 }
                 self.send_master_state(&id);
+                self.send_file_clipboard_ref(&id);
                 self.auto_place(&id);
                 if self.settle_layout() {
                     self.bump_layout();
@@ -1099,6 +1132,9 @@ impl Inner {
                 self.touch_ui();
             }
             PeerEvent::Disconnected(id, reason) => {
+                if self.file_route.as_ref().is_some_and(|(stamp, recipient)| stamp.writer == id || *recipient == id) {
+                    self.file_route = None;
+                }
                 if self
                     .raw
                     .pending_target
@@ -1137,7 +1173,10 @@ impl Inner {
     }
 
     async fn on_frame(&mut self, from: Arc<MachineId>, frame: Frame) {
+
         match frame {
+            Frame::FileClipboardRef { stamp, generation } => self.remote_file_clipboard(&from, stamp, generation),
+            Frame::FileRoute { stamp, generation, recipient } => self.remote_file_route(&from, stamp, generation, recipient),
             Frame::RawBoundary { session, target, pos } => {
                 self.cross_raw_boundary(from.as_ref(), session, target, pos).await;
             }
@@ -1264,6 +1303,7 @@ impl Inner {
                 }
             }
             Frame::Panic => {
+                let _ = self.files.handle.send(crate::files::FileCommand::CancelPeerDrags { peer: from.as_ref().clone() });
                 self.stop_raw().await;
                 match self.focus.clone() {
                 Focus::Remote(target) => self.end_remote(&target, LeaveReason::Panic, None, true).await,
@@ -1461,6 +1501,14 @@ impl Inner {
 
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
+            Command::FileClipboardSelection { paths, generation } => self.local_file_clipboard(paths, generation),
+            Command::Files(command) => {
+                if matches!(command, crate::files::FileCommand::SetEnabled(false)) { self.invalidate_pending_native_clipboard(); }
+                if let Err(error) = self.files.handle.send(command) {
+                    self.config_error = Some(error.to_string());
+                    self.touch_ui();
+                }
+            }
             Command::SetInputSettings(settings) => {
                 self.crossing = None;
                 match settings.save(&self.data_dir) {
@@ -1523,6 +1571,7 @@ impl Inner {
                 self.touch_ui();
             }
             Command::SetMasterEnabled(on) => {
+                if !on { self.invalidate_pending_native_clipboard(); }
                 self.cfg.master_enabled = on;
                 self.mark_cfg_dirty();
                 let ids: Vec<MachineId> = self.peers.keys().cloned().collect();
@@ -1548,6 +1597,7 @@ impl Inner {
                 self.touch_ui();
             }
             Command::SetMachineEnabled(id, enabled) => {
+                if !enabled && id == self.self_info.id { self.invalidate_pending_native_clipboard(); }
                 self.ensure_doc();
                 self.layout
                     .as_mut()
@@ -1587,9 +1637,11 @@ impl Inner {
                 self.bump_layout();
             }
             Command::SetClipboardSync(on) => {
+                if !on { self.invalidate_pending_native_clipboard(); }
                 self.cfg.clipboard_sync = on;
                 if !on {
                     self.live_offer = None;
+                    self.clear_file_clipboard();
                     self.pending_fetches.clear();
                     self.clipboard_offers.clear();
                     self.clipboard_jobs.abort_all();
@@ -1616,6 +1668,9 @@ impl Inner {
     // ----- clipboard broker -----
 
     fn on_clipboard_changed(&mut self, mimes: Vec<String>, inline_text: Option<String>) {
+        let mimes: Vec<_> = mimes.into_iter().filter(|m| !crate::clipboard::is_file_reference_mime(m)).collect();
+        let inline_text = inline_text.filter(|_| mimes.iter().any(|m| m.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/plain"))));
+        self.clear_file_clipboard();
         if !self.cfg.clipboard_sync {
             return;
         }
@@ -1639,6 +1694,8 @@ impl Inner {
         mimes: Vec<String>,
         inline_text: Option<String>,
     ) {
+        let mimes: Vec<_> = mimes.into_iter().filter(|m| !crate::clipboard::is_file_reference_mime(m)).collect();
+        let inline_text = inline_text.filter(|_| mimes.iter().any(|m| m.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/plain"))));
         self.clip_lamport = self.clip_lamport.max(stamp.lamport);
         if !self.cfg.clipboard_sync {
             return;
@@ -1649,6 +1706,8 @@ impl Inner {
         if self.clip_seen.as_ref().is_some_and(|seen| stamp <= *seen) {
             return;
         }
+        self.invalidate_pending_native_clipboard();
+        self.clear_file_clipboard();
         self.clip_seen = Some(stamp);
         if let Some(net) = &self.net {
             let fetch = self.pending_fetches.offer(net.clone(), from.clone(), id, mimes.clone());
@@ -1658,7 +1717,7 @@ impl Inner {
 
     fn on_clip_request(&mut self, from: MachineId, id: u64, request: u64, mime: String) {
         let Some(net) = self.net.clone() else { return };
-        let live = self.cfg.clipboard_sync
+        let live = self.cfg.clipboard_sync && !crate::clipboard::is_file_reference_mime(&mime)
             && self.live_offer.as_ref().is_some_and(|(offer, mimes)| *offer == id && mimes.contains(&mime));
         if !live {
             net.send_to(&from, Frame::ClipAbort { request, reason: "clipboard offer is unavailable".into() });
@@ -1706,6 +1765,8 @@ impl Inner {
     /// Recompute the derived state from layout + reachability. Focus validity,
     /// crossable links and OS barriers are all projections of authoritative state.
     async fn recompute(&mut self) {
+        self.sync_file_policy();
+        self.route_file_clipboard();
         let mut geo: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         let mut active: BTreeMap<MachineId, MachineGeom> = BTreeMap::new();
         if let Some(doc) = &self.layout {
@@ -1925,6 +1986,37 @@ impl Inner {
         let _ = self.ui_tx.send(self.build_ui());
     }
 
+    fn sync_file_policy(&mut self) {
+        let mut peers = BTreeMap::new();
+        if let Some(net) = &self.net {
+            for (id, peer) in &self.peers {
+                if peer.connected && !peer.master_off && self.machine_enabled(id)
+                    && peer.caps.iter().any(|c| c == caps::FILES_V2) {
+                    if let (Some(generation), Some(ip)) = (net.connection_generation(id), net.peer_ip(id)) {
+                        peers.insert(id.clone(), (generation, ip));
+                    }
+                }
+            }
+        }
+        let mut next = crate::files::Policy {
+            epochs: BTreeMap::new(),
+            peers,
+            enabled: self.cfg.master_enabled && self.machine_enabled(&self.self_info.id),
+            clipboard_enabled: self.cfg.clipboard_sync,
+        };
+        let revoked = {
+            let previous = self.files.policy.borrow();
+            (previous.enabled && !next.enabled) || (previous.clipboard_enabled && !next.clipboard_enabled)
+        };
+        if revoked { self.invalidate_pending_native_clipboard(); }
+        self.files.policy.send_if_modified(|policy| {
+            next.epochs = policy.epochs.clone();
+            let changed: std::collections::BTreeSet<_> = policy.peers.keys().chain(next.peers.keys()).filter(|peer| policy.enabled != next.enabled || policy.peers.get(*peer) != next.peers.get(*peer)).cloned().collect();
+            for peer in changed { *next.epochs.entry(peer).or_default() += 1; }
+            if *policy == next { false } else { *policy = next; true }
+        });
+    }
+
     fn build_ui(&self) -> UiState {
         let source = self.claim.as_ref().map(|c| c.writer.clone());
         let doc = &self.layout;
@@ -2016,7 +2108,8 @@ impl Inner {
             diagnostics.peers = net.diagnostics();
         }
         UiState {
-            crossing_progress: self.crossing.as_ref().map(|c| crate::ui_state::UiCrossing {
+            files: self.files.handle.summary().borrow().clone(),
+            file_clipboard: self.file_clipboard.clone(),            crossing_progress: self.crossing.as_ref().map(|c| crate::ui_state::UiCrossing {
                 from: c.link.from.clone(),
                 to: c.link.to.clone(),
                 progress: c.progress,

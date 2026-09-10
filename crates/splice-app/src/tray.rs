@@ -22,6 +22,7 @@ use crate::runtime::Controller;
 #[derive(Clone, Debug)]
 pub enum AppAction {
     Open,
+    Files,
     Quit,
     ToggleMachine(MachineId),
     DisconnectAll,
@@ -281,6 +282,14 @@ pub mod linux {
                     label: "Open Splice".into(),
                     activate: Box::new(|tray: &mut Self| {
                         let _ = tray.actions.send(AppAction::Open);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Open file shelf".into(),
+                    activate: Box::new(|tray: &mut Self| {
+                        let _ = tray.actions.send(AppAction::Files);
                     }),
                     ..Default::default()
                 }

@@ -8,6 +8,9 @@ homepage = "https://github.com/danieldunderfelt/splice"
 repository = "https://github.com/danieldunderfelt/splice"
 authors = ["Daniel Dunderfelt <dev@developsuperpowers.com>"]
 
+[features]
+native-ui-tests = []
+
 [[bin]]
 name = "splice"
 path = "src/main.rs"
@@ -32,19 +35,27 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { workspace = true }
 libc = "0.2"
+splice-files = { workspace = true, features = ["helper"] }
+zbus = { workspace = true }
+async-trait = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"
 
 [package.metadata.deb]
 name = "splice"
 section = "utils"
 priority = "optional"
-depends = "libc6, libgcc-s1, libwayland-client0, libxkbcommon0"
+depends = "$auto, fuse3"
 recommends = "tailscale, libvulkan1, mesa-vulkan-drivers, xdg-desktop-portal-gnome | xdg-desktop-portal-kde"
 maintainer-scripts = "../../packaging/deb"
 extended-description = """\
 Splice shares one keyboard and mouse between the computers on your Tailscale
 network. Move the pointer through a screen edge and the keyboard follows.
-Clipboard contents are shared as well. On Linux it uses the Wayland
-Input Capture and Remote Desktop portals, so it needs GNOME or KDE Plasma."""
+Clipboard contents and files are shared as well. On Linux it uses the Wayland
+Input Capture and Remote Desktop portals, so it needs GNOME or KDE Plasma.
+File drag and drop uses a GTK4 file shelf process and a user-only
+read-only FUSE filesystem."""
 assets = [
     ["target/release/splice", "usr/bin/", "755"],
     ["../../packaging/linux/io.github.danieldunderfelt.Splice.desktop", "usr/share/applications/", "644"],
@@ -60,9 +71,11 @@ assets = [
 tray-icon = { workspace = true }
 block2 = "0.6"
 objc2 = { workspace = true }
+dispatch2 = { workspace = true }
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
 
 [[test]]
 name = "macos_tray"
 harness = false
+required-features = ["native-ui-tests"]

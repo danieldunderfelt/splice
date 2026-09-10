@@ -12,8 +12,13 @@ Source1:        %{name}-%{version}-vendor.tar.xz
 BuildRequires:  cargo
 BuildRequires:  rust
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  gtk4-devel
+BuildRequires:  fuse3-devel
+BuildRequires:  pkgconf
 Requires:       libwayland-client
 Requires:       libxkbcommon
+Requires:       gtk4 >= 4.10
+Requires:       fuse3
 Recommends:     tailscale
 Recommends:     vulkan-loader
 Recommends:     (xdg-desktop-portal-gnome or xdg-desktop-portal-kde)
@@ -21,7 +26,7 @@ Recommends:     (xdg-desktop-portal-gnome or xdg-desktop-portal-kde)
 %description
 Splice shares one keyboard and mouse between the computers on your Tailscale
 network. Move the pointer through a screen edge and the keyboard follows.
-Clipboard contents are shared as well. On Linux it uses the Wayland Input
+Clipboard contents and files are shared as well. On Linux it uses the Wayland Input
 Capture and Remote Desktop portals, so it needs GNOME or KDE Plasma.
 
 %prep
@@ -49,7 +54,6 @@ install -Dpm0644 packaging/linux/app-splice.service \
     %{buildroot}%{_userunitdir}/app-splice.service
 install -Dpm0644 packaging/linux/70-splice.rules \
     %{buildroot}%{_udevrulesdir}/70-splice.rules
-%{_modulesloaddir}/splice.conf
 install -Dpm0644 packaging/linux/splice-modules.conf \
     %{buildroot}%{_modulesloaddir}/splice.conf
 
@@ -69,6 +73,7 @@ udevadm trigger --sysname-match=uinput --action=change >/dev/null 2>&1 || :
 %{_metainfodir}/io.github.danieldunderfelt.Splice.metainfo.xml
 %{_userunitdir}/app-splice.service
 %{_udevrulesdir}/70-splice.rules
+%{_modulesloaddir}/splice.conf
 
 %changelog
 * Thu Sep 03 2026 Daniel Dunderfelt <dev@developsuperpowers.com> - 1.0.0-1

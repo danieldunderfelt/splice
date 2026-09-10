@@ -61,6 +61,10 @@ pub struct UiCrossing {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
+    #[serde(default)]
+    pub files: crate::files::FileSummary,
+    #[serde(default)]
+    pub file_clipboard: Option<crate::files::FileClipboardRef>,
     pub crossing_progress: Option<UiCrossing>,
     pub input_settings: crate::input_settings::InputSettings,
     pub input_error: Option<String>,
@@ -94,6 +98,8 @@ pub struct UiState {
 impl UiState {
     pub fn initial(self_id: MachineId) -> Self {
         UiState {
+            files: Default::default(),
+            file_clipboard: None,
             crossing_progress: None,
             input_settings: Default::default(),
             input_error: None,

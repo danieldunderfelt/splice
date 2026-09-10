@@ -174,6 +174,7 @@ impl NetManager {
         let input_endpoint = crate::input_transport::Endpoint::bind(local_addr).await?;
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(NetControlInner {
+            file_incoming: RwLock::new(None),
             bind_ip: local_addr.ip(),
             input_endpoint,
             raw_endpoint: tokio::sync::OnceCell::new(),
@@ -204,6 +205,7 @@ pub struct NetControl {
 }
 
 pub(crate) struct NetControlInner {
+    file_incoming: RwLock<Option<crate::files::WireSender>>,
     raw_endpoint: tokio::sync::OnceCell<crate::input_transport::Endpoint>,
     input_endpoint: crate::input_transport::Endpoint,
     bind_ip: IpAddr,
@@ -241,6 +243,10 @@ impl NetControlInner {
 }
 
 impl NetControl {
+    pub(crate) fn file_receiver(&self, receiver: Option<crate::files::WireSender>) {
+        *self.inner.file_incoming.write() = receiver;
+    }
+
     pub(crate) async fn raw_endpoint(&self) -> anyhow::Result<crate::input_transport::Endpoint> {
         let endpoint = self.inner.raw_endpoint.get_or_try_init(|| async {
             let ip = self.inner.bind_ip;
@@ -258,6 +264,10 @@ impl NetControl {
         if let Some(slot) = self.inner.peers.read().get(peer) {
             slot.control.input.allow(session);
         }
+    }
+
+    pub(crate) fn connection_generation(&self, peer: &MachineId) -> Option<u64> {
+        self.inner.peers.read().get(peer).map(|slot| slot.seq)
     }
 
     pub(crate) fn current_connection(&self, peer: &MachineId, connection: u64) -> bool {
@@ -493,3 +503,6 @@ fn jittered(d: Duration) -> Duration {
     let spread = (d.as_nanos() / 4) as u64;
     d + Duration::from_nanos(if spread > 0 { x % spread } else { 0 })
 }
+
+#[cfg(test)]
+mod file_tests;

@@ -22,8 +22,11 @@
 pub mod cursor;
 pub mod displays;
 pub mod ffi;
+pub mod files;
 pub mod inject;
 pub mod pasteboard;
+pub mod promise;
+pub mod shelf;
 pub mod tap;
 
 mod raw;
@@ -182,7 +185,9 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         });
     }
 
-    let clipboard = Arc::new(pasteboard::PasteboardClip::new(shared.clone()));
+    let own_change = Arc::new(Mutex::new(-1));
+    let (file_adapter, file_ctx) = files::create(&opts.data_dir, own_change.clone());
+    let clipboard = Arc::new(pasteboard::PasteboardClip::new(shared.clone(), own_change, file_ctx));
 
     Ok(Platform {
         raw_capture: Some(raw::HidCapture::spawn(shared.clone(), tap_state.clone())),
@@ -193,5 +198,6 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         displays,
         events,
         backends: None,
+        files: Some(file_adapter),
     })
 }

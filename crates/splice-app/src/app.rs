@@ -39,6 +39,7 @@ pub struct SpliceApp {
     #[cfg(target_os = "macos")]
     edge_indicator: crate::edge_indicator::EdgeIndicator,
     ctrl: Controller,
+    files: crate::file_shelf::FileShelf,
     tray: Tray,
     actions: mpsc::Receiver<AppAction>,
     drag: Option<CardDrag>,
@@ -66,6 +67,7 @@ impl SpliceApp {
         SpliceApp {
             #[cfg(target_os = "macos")]
             edge_indicator: crate::edge_indicator::EdgeIndicator::new(),
+            files: crate::file_shelf::FileShelf::new(ctrl.clone()),
             ctrl,
             tray,
             actions,
@@ -204,6 +206,16 @@ impl SpliceApp {
                         ui.separator();
                         ui.add_space(10.0);
                         self.sensitivity_section(ui, state);
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        if crate::files_panel::panel(ui, state, &self.ctrl) {
+                            self.files.open();
+                        }
+                        if let Some(error) = self.files.error() {
+                            banner(ui, theme::ERR, &error);
+                        }
                         ui.add_space(14.0);
                         ui.separator();
                         ui.add_space(10.0);
@@ -701,6 +713,7 @@ impl eframe::App for SpliceApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                AppAction::Files => self.files.open(),
                 AppAction::Quit => {
                     self.ctrl.quit();
                     self.allow_close = true;

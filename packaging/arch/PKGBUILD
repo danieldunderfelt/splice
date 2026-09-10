@@ -6,7 +6,7 @@ pkgdesc="Software KVM: share one keyboard and mouse across your Tailscale machin
 arch=('x86_64' 'aarch64')
 url="https://github.com/danieldunderfelt/splice"
 license=('MIT')
-depends=('gcc-libs' 'glibc' 'wayland' 'libxkbcommon')
+depends=('gcc-libs' 'glibc' 'wayland' 'libxkbcommon' 'gtk4' 'fuse3')
 optdepends=('tailscale: peer discovery and transport'
             'xdg-desktop-portal-gnome: GNOME portal backend'
             'xdg-desktop-portal-kde: KDE Plasma portal backend'

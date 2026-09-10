@@ -23,6 +23,8 @@ mod clipboard;
 mod datacontrol;
 mod displays;
 mod emulate;
+pub mod fileclip;
+pub mod fileportal;
 mod overlay;
 mod portal;
 mod probe;
@@ -301,5 +303,6 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
         displays,
         events,
         backends: Some(prefs_tx),
+        files: None,
     })
 }

@@ -784,7 +784,7 @@ async fn disabling_unfocused_third_machine_preserves_active_pair() {
 
     a.handle.send(Command::SetMachineEnabled(mid("ccc"), false));
     wait_until("third-machine disable converges", || {
-        [&a, &c].iter().all(|rig| {
+        [&a, &b, &c].iter().all(|rig| {
             rig.handle
                 .state()
                 .borrow()
@@ -2434,4 +2434,27 @@ async fn manual_raw_handoff_delivers_every_captured_click_before_leaving() {
     assert!(a.handle.state().borrow().input_error.is_none());
     assert!(b.handle.state().borrow().input_error.is_none());
     assert!(output.is_closed());
+}
+
+#[tokio::test]
+async fn ordinary_clipboard_cannot_serve_file_urls_or_portal_keys() {
+    let (a, b) = spawn_pair().await;
+    for (mime, bytes) in [
+        (TEXT_MIME, b"shared text".as_slice()),
+        ("text/uri-list", b"file:///private/local-selection.txt".as_slice()),
+        ("application/vnd.portal.filetransfer", b"local-only-portal-key".as_slice()),
+    ] {
+        a.mock.state.lock().local_clip.insert(mime.into(), bytes.to_vec());
+    }
+    a.mock.events.send(PlatformEvent::ClipboardChanged {
+        mimes: vec![TEXT_MIME.into(), "text/uri-list".into(), "application/vnd.portal.filetransfer".into()],
+        inline_text: None,
+    }).unwrap();
+    wait_until("safe text representation arrives", || b.mock.last_fetch.lock().is_some()).await;
+    let offer = b.mock.state.lock().remote_offers.last().unwrap().clone();
+    assert_eq!(offer.mimes, vec![TEXT_MIME.to_string()]);
+    let fetch = b.mock.last_fetch.lock().clone().unwrap();
+    assert_eq!(fetch.fetch("text/uri-list").await, None);
+    assert_eq!(fetch.fetch("application/vnd.portal.filetransfer").await, None);
+    assert_eq!(fetch.fetch(TEXT_MIME).await, Some(b"shared text".to_vec()));
 }

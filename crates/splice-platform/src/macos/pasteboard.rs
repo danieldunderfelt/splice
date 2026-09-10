@@ -2,6 +2,8 @@
 //! (lazily provided) items for remote offers.
 
 use super::MacShared;
+use super::files::ShelfCtx;
+use crate::file_shelf::FileEvent;
 use crate::{ClipFetch, Clipboard, ClipboardOffer, PlatformError, PlatformEvent, Result};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
@@ -63,6 +65,7 @@ pub fn normalize(utis: &[String]) -> Vec<String> {
 }
 
 pub struct PasteboardClip {
+    files: Arc<ShelfCtx>,
     shared: Arc<MacShared>,
     /// changeCount produced by our own writes, skipped by the poller (loop guard).
     own_change: Arc<Mutex<i64>>,
@@ -70,16 +73,16 @@ pub struct PasteboardClip {
 }
 
 impl PasteboardClip {
-    pub fn new(shared: Arc<MacShared>) -> Self {
-        let own_change = Arc::new(Mutex::new(-1));
+    pub fn new(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>, files: Arc<ShelfCtx>) -> Self {
         let this = Self {
+            files: files.clone(),
             shared: shared.clone(),
             own_change: own_change.clone(),
             runtime: tokio::runtime::Handle::current(),
         };
         std::thread::Builder::new()
             .name("splice-pasteboard".into())
-            .spawn(move || poll_loop(shared, own_change))
+            .spawn(move || poll_loop(shared, own_change, files))
             .expect("spawning the pasteboard poller");
         this
     }
@@ -87,12 +90,13 @@ impl PasteboardClip {
 
 /// NSPasteboard has no change notification; polling changeCount is cheap and is what every
 /// macOS clipboard manager does.
-fn poll_loop(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>) {
+fn poll_loop(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>, files: Arc<ShelfCtx>) {
     let mut last = pasteboard_change_count();
     while !shared.tx.is_closed() {
         std::thread::sleep(POLL_INTERVAL);
         let own_change = own_change.lock();
         let count = pasteboard_change_count();
+        files.release_publication_if_replaced(count as u64);
         if count == last || count == *own_change {
             last = count;
             continue;
@@ -100,10 +104,27 @@ fn poll_loop(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>) {
         last = count;
         objc2::rc::autoreleasepool(|_| {
             let pb = NSPasteboard::generalPasteboard();
-            let Some(types) = pb.types() else { return };
-            let utis: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+            files.emit(FileEvent::ClipboardInvalidated { generation: count as u64 });
+            if let Some(selection) = super::files::read_file_urls(&pb) {
+                if pb.changeCount() as i64 == count {
+                    files.emit(FileEvent::ClipboardFiles {
+                        paths: selection.paths,
+                        generation: count as u64,
+                        lease: selection.lease,
+                    });
+                }
+                return;
+            }
+            let utis: Vec<String> = pb
+                .types()
+                .map(|types| types.iter().map(|t| t.to_string()).collect())
+                .unwrap_or_default();
             let mimes = normalize(&utis);
             if mimes.is_empty() {
+                if pb.changeCount() as i64 == count {
+                    files.emit(FileEvent::ClipboardChanged { generation: count as u64, mimes: mimes.clone(), inline_text: None });
+                    shared.emit(PlatformEvent::ClipboardChanged { mimes, inline_text: None });
+                }
                 return;
             }
             // Content reads are gated to what we actually offer: small text only.
@@ -111,7 +132,10 @@ fn poll_loop(shared: Arc<MacShared>, own_change: Arc<Mutex<i64>>) {
                 .stringForType(unsafe { NSPasteboardTypeString })
                 .map(|s| s.to_string())
                 .filter(|s| s.len() <= CLIP_INLINE_TEXT_MAX);
-            shared.emit(PlatformEvent::ClipboardChanged { mimes, inline_text });
+            if pb.changeCount() as i64 == count {
+                files.emit(FileEvent::ClipboardChanged { generation: count as u64, mimes: mimes.clone(), inline_text: inline_text.clone() });
+                shared.emit(PlatformEvent::ClipboardChanged { mimes, inline_text });
+            }
         });
     }
 }
@@ -178,6 +202,8 @@ impl Clipboard for PasteboardClip {
             pb.changeCount() as i64
         });
         *own_change = count;
+        self.files.release_publication_if_replaced(count as u64);
+        self.files.emit(FileEvent::ClipboardInvalidated { generation: count as u64 });
         drop(own_change);
         self.shared.set_health(|h| h.clipboard = None);
         Ok(())

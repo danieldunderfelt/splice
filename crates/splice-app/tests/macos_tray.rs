@@ -6,6 +6,9 @@ mod runtime;
 #[cfg(target_os = "macos")]
 #[path = "../src/tray.rs"]
 mod tray;
+#[cfg(target_os = "macos")]
+#[path = "../src/file_shelf/mod.rs"]
+mod file_shelf;
 
 #[cfg(target_os = "macos")]
 fn main() {
@@ -79,7 +82,7 @@ fn main() {
     assert!(matches!(rx.try_recv().unwrap(), tray::AppAction::Open));
     NSRunLoop::mainRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.02));
     tray.sync(&state).unwrap();
-    assert_eq!(original.numberOfItems(), 6);
+    assert_eq!(original.numberOfItems(), 7);
     assert!(std::ptr::eq(&*open, &*original.itemAtIndex(0).unwrap()));
     original.performActionForItemAtIndex(0);
     assert!(matches!(rx.try_recv().unwrap(), tray::AppAction::Open));

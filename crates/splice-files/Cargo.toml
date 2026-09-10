@@ -1,0 +1,35 @@
+[package]
+name = "splice-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["helper"]
+helper = ["dep:gtk4"]
+
+[[bin]]
+name = "splice-files"
+path = "src/bin/splice-files.rs"
+required-features = ["helper"]
+
+[dependencies]
+splice-platform = { workspace = true }
+splice-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { workspace = true }
+gtk4 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"

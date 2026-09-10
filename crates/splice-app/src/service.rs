@@ -12,11 +12,14 @@ use anyhow::Context;
 use parking_lot::{Mutex, RwLock};
 use splice_core::{Command, EngineHandle, UiState};
 use splice_proto::MachineId;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+use crate::file_service::Bridge;
 use crate::ipc::{self, ClientMessage, ServerMessage};
 use crate::runtime::{self, BootStatus, RETRY_INTERVAL};
 use crate::tray::{self, AppAction};
@@ -34,6 +37,7 @@ struct Shared {
     /// Bumped on every state/status change; window clients send a snapshot per bump.
     version: watch::Sender<u64>,
     engine: Mutex<Option<EngineHandle>>,
+    files_notice: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -42,10 +46,17 @@ impl Shared {
     }
 
     fn snapshot(&self) -> ServerMessage {
+        let mut state = self.state.read().clone();
+        if let Some(notice) = self.files_notice.lock().clone() {
+            state.files.error = Some(match state.files.error.take() {
+                Some(error) => format!("{error} · {notice}"),
+                None => notice,
+            });
+        }
         ServerMessage::Snapshot {
             status: self.status.lock().clone(),
             tray: self.tray.load(Ordering::Acquire),
-            state: Box::new(self.state.read().clone()),
+            state: Box::new(state),
         }
     }
 }
@@ -142,13 +153,16 @@ fn acquire_service_lock(path: &std::path::Path) -> std::io::Result<Option<std::f
 }
 
 async fn serve(path: &PathBuf) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     let shared = Arc::new(Shared {
         state: Arc::new(RwLock::new(UiState::initial(MachineId("self".into())))),
         status: Mutex::new(BootStatus::Starting),
         tray: AtomicBool::new(false),
         version: watch::channel(0).0,
         engine: Mutex::new(None),
+        files_notice: Mutex::new(None),
     });
     let windows: SharedWindowRegistry = Arc::new(Mutex::new(WindowRegistry {
         senders: Vec::new(),
@@ -157,7 +171,9 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
     }));
     let (actions_tx, mut actions_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (retry_tx, retry_rx) = mpsc::unbounded_channel::<()>();
-    tokio::spawn(engine_loop(shared.clone(), retry_rx));
+    let files = Bridge::start();
+    tokio::spawn(sync_files_notice(files.status(), shared.clone()));
+    tokio::spawn(engine_loop(shared.clone(), retry_rx, files.clone()));
     let mut clients = JoinSet::new();
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel::<AppAction>();
@@ -177,7 +193,10 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
-                        clients.spawn(client(stream, shared.clone(), actions_tx.clone(), windows.clone()));
+                        let same_user = stream.peer_cred().is_ok_and(|credentials| credentials.uid() == unsafe { libc::geteuid() });
+                        if same_user && clients.len() < 32 {
+                            clients.spawn(client(stream, shared.clone(), actions_tx.clone(), windows.clone()));
+                        }
                     }
                     Err(err) => tracing::warn!(error = %err, "accept failed"),
                 }
@@ -191,6 +210,7 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
                 let Some(action) = action else { break };
                 match action {
                     ClientMessage::Open => open_window(&windows),
+                    ClientMessage::OpenFiles => files.open_shelf(),
                     ClientMessage::Quit => break,
                     ClientMessage::Command(cmd) => {
                         match shared.engine.lock().as_ref() {
@@ -218,8 +238,22 @@ async fn serve(path: &PathBuf) -> anyhow::Result<()> {
         engine.send(Command::Panic);
         tokio::time::sleep(RELEASE_GRACE).await;
     }
+    files.shutdown().await;
     drain_clients(&mut clients).await;
     Ok(())
+}
+
+async fn sync_files_notice(mut status: watch::Receiver<Option<String>>, shared: Arc<Shared>) {
+    loop {
+        let notice = status.borrow_and_update().clone();
+        if *shared.files_notice.lock() != notice {
+            *shared.files_notice.lock() = notice;
+            shared.bump();
+        }
+        if status.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 async fn drain_clients(clients: &mut JoinSet<()>) {
@@ -237,10 +271,10 @@ async fn drain_clients(clients: &mut JoinSet<()>) {
 
 /// Bootstrap the engine, forward its state, and re-bootstrap after failures. A panic
 /// inside bootstrap surfaces as an ordinary offline status via the task's JoinError.
-async fn engine_loop(shared: Arc<Shared>, mut retry_rx: mpsc::UnboundedReceiver<()>) {
+async fn engine_loop(shared: Arc<Shared>, mut retry_rx: mpsc::UnboundedReceiver<()>, files: Bridge) {
     loop {
-        let handle = match tokio::spawn(runtime::bootstrap()).await {
-            Ok(Ok(handle)) => handle,
+        let (handle, engine_files) = match tokio::spawn(runtime::bootstrap()).await {
+            Ok(Ok(boot)) => (boot.engine, boot.files),
             Ok(Err(err)) => {
                 tracing::warn!("engine bootstrap failed: {err:#}");
                 *shared.status.lock() = BootStatus::Offline(format!("{err:#}"));
@@ -262,6 +296,7 @@ async fn engine_loop(shared: Arc<Shared>, mut retry_rx: mpsc::UnboundedReceiver<
         };
         let mut watch = handle.state();
         *shared.state.write() = watch.borrow_and_update().clone();
+        files.attach(handle.clone(), engine_files);
         *shared.engine.lock() = Some(handle);
         *shared.status.lock() = BootStatus::Online;
         shared.bump();
@@ -271,6 +306,7 @@ async fn engine_loop(shared: Arc<Shared>, mut retry_rx: mpsc::UnboundedReceiver<
             if shared.state.read().restart_requested { return; }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        files.detach();
         *shared.engine.lock() = None;
         *shared.status.lock() = BootStatus::Offline("engine stopped".into());
         shared.bump();
@@ -293,6 +329,7 @@ async fn bridge_tray(
     while let Some(action) = tray_rx.recv().await {
         let message = match action {
             AppAction::Open => ClientMessage::Open,
+            AppAction::Files => ClientMessage::OpenFiles,
             AppAction::Quit => ClientMessage::Quit,
             AppAction::DisconnectAll => ClientMessage::Command(Command::Panic),
             AppAction::ToggleMachine(id) => {
@@ -362,16 +399,15 @@ async fn client(
     windows: SharedWindowRegistry,
 ) {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut messages = ipc::AsyncMessages::new(reader);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let mut version = shared.version.subscribe();
     let mut is_window = false;
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                let Ok(Some(line)) = line else { break };
-                match serde_json::from_str::<ClientMessage>(&line) {
-                    Ok(ClientMessage::Hello { window }) => {
+            message = messages.next::<ClientMessage>() => {
+                match message {
+                    Ok(Some(ClientMessage::Hello { window })) => {
                         if window && !is_window {
                             is_window = true;
                             windows.lock().register(out_tx.clone());
@@ -380,10 +416,14 @@ async fn client(
                             }
                         }
                     }
-                    Ok(message) => {
+                    Ok(Some(message)) => {
                         let _ = actions.send(message);
                     }
-                    Err(err) => tracing::warn!(error = %err, "bad client message"),
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "bad client message");
+                        break;
+                    }
                 }
             }
             changed = version.changed(), if is_window => {
@@ -409,9 +449,10 @@ async fn client(
 }
 
 async fn write(writer: &mut tokio::net::unix::OwnedWriteHalf, message: &ServerMessage) -> std::io::Result<()> {
-    let mut line = serde_json::to_vec(message).map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    writer.write_all(&line).await
+    let line = ipc::encode_message(message)?;
+    tokio::time::timeout(Duration::from_secs(5), writer.write_all(&line))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "Splice window stopped reading"))?
 }
 
 #[cfg(test)]
@@ -426,6 +467,7 @@ mod tests {
             tray: AtomicBool::new(false),
             version: watch::channel(0).0,
             engine: Mutex::new(None),
+            files_notice: Mutex::new(None),
         });
         assert!(shared.engine.lock().is_none());
         let windows: SharedWindowRegistry = Arc::new(Mutex::new(WindowRegistry {
@@ -464,6 +506,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(serde_json::from_str::<ServerMessage>(&quit).unwrap(), ServerMessage::Quit));
+    }
+
+    #[test]
+    fn file_bridge_notice_is_visible_in_window_snapshots() {
+        let shared = Shared {
+            state: Arc::new(RwLock::new(UiState::initial(MachineId("self".into())))),
+            status: Mutex::new(BootStatus::Online),
+            tray: AtomicBool::new(false),
+            version: watch::channel(0).0,
+            engine: Mutex::new(None),
+            files_notice: Mutex::new(Some("File drags are unavailable: no FUSE".into())),
+        };
+        let ServerMessage::Snapshot { state, .. } = shared.snapshot() else { panic!("expected snapshot") };
+        assert_eq!(state.files.error.as_deref(), Some("File drags are unavailable: no FUSE"));
+        shared.state.write().files.error = Some("file service: offline".into());
+        let ServerMessage::Snapshot { state, .. } = shared.snapshot() else { panic!("expected snapshot") };
+        assert_eq!(state.files.error.as_deref(), Some("file service: offline · File drags are unavailable: no FUSE"));
+        assert_eq!(shared.state.read().files.error.as_deref(), Some("file service: offline"));
     }
 
     #[test]

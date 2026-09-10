@@ -23,7 +23,8 @@ Debian, Ubuntu, and Mint:
 
 ```sh
 cargo install cargo-deb
-cargo deb -p splice-app
+cargo build -p splice-app --release --locked
+cargo deb -p splice-app --no-build
 sudo apt install ./target/debian/splice_*.deb
 ```
 
@@ -62,7 +63,7 @@ sudo udevadm trigger --sysname-match=uinput --action=change
 Per-user install without a package:
 
 ```sh
-cargo build -p splice-app --release
+cargo build -p splice-app --release --locked
 packaging/linux/install.sh
 ```
 
@@ -89,6 +90,14 @@ Ways to start and stop it:
 The service logs to `~/.config/splice/splice.log` and each window to `splice-window.log` next
 to it, unless started from a terminal. Flatpak installs cannot register a systemd user unit; use
 **Start Splice at login** instead.
+
+## File sharing
+
+The file shelf uses GTK4 and runs in a separate process from the same `splice` executable. Install FUSE3 and make `/dev/fuse` available for deferred file drags. The service owns a private read-only mount under `$XDG_RUNTIME_DIR/splice/mnt`; the shelf opens only when requested with `splice files`, the Files button, or its tray action.
+
+Read [sharing files](file-sharing.md) for copy/paste and drag handoff. Native handoff acceptance on individual file managers remains in [the validation matrix](file-handoff-validation.md). The Flatpak build includes the shelf and uses the GNOME 50 runtime for GTK4. Deferred file drags require a host FUSE mount and are not supported by the current Flatpak sandbox configuration. Use a host installation for file handoff validation.
+
+Allow TCP 41720 on the Tailscale interface for file contents. File content uses a separate connection from input and clipboard control.
 
 ## Input-device access
 
@@ -201,12 +210,12 @@ peer is online. Splice does not use MagicDNS for peer connections.
 
 ## Send and receive raw input
 
-Use the same protocol 6 build on every computer. Raw input requires `/dev/uinput` access even if
+Use the same protocol 7 build on every computer. Raw input requires `/dev/uinput` access even if
 the Desktop injection backend uses the Remote Desktop portal. Install the udev rule above; a
 missing permission produces a preparation error and restores local control.
 
 Allow UDP 41717 and 41719 on the Tailscale interface, alongside TCP 41717 for control and clipboard
-and TCP 41718 for updates.
+and TCP 41718 for updates. File sharing additionally uses TCP 41720.
 The receiver creates `Splice Virtual Raw Mouse` and `Splice Virtual Raw Keyboard`, then keeps
 them alive across handoffs. The devices use relative mouse axes and preserve physical key codes.
 The destination desktop or game applies its own acceleration, keyboard layout, and repeat settings.

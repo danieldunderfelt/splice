@@ -1,6 +1,6 @@
 # Splice
 
-Splice shares one mouse, keyboard, and clipboard across macOS and Linux computers on the same Tailscale network. It discovers peers automatically. Move the pointer across an arranged screen edge to control another computer.
+Splice shares one mouse, keyboard, clipboard, and files across macOS and Linux computers on the same Tailscale network. It discovers peers automatically. Move the pointer across an arranged screen edge to control another computer.
 
 The workspace version is Splice 1.2.0.
 
@@ -44,10 +44,10 @@ RUST_LOG=debug cargo run -p splice-app
 Build the optimized desktop binary:
 
 ```sh
-cargo build -p splice-app --release
+cargo build -p splice-app --release --locked
 ```
 
-The binary is written to `target/release/splice`.
+The binary is written to `target/release/splice`. On Linux the same executable also runs the GTK4 file shelf in a separate process. Linux builds require GTK4 4.10 or newer and FUSE3 development libraries.
 
 ### Build a macOS app
 
@@ -70,11 +70,11 @@ unit, and the udev rule that grants input-device access.
 
 | Distribution | Route |
 |---|---|
-| Debian, Ubuntu, Mint | `cargo install cargo-deb && cargo deb -p splice-app`, then `sudo apt install ./target/debian/splice_*.deb` |
+| Debian, Ubuntu, Mint | `cargo install cargo-deb && cargo build -p splice-app --release --locked && cargo deb -p splice-app --no-build`, then `sudo apt install ./target/debian/splice_*.deb` |
 | Fedora, RHEL, openSUSE | `packaging/rpm/build.sh` (needs `rpm-build` and `rpmdevtools`), then `sudo dnf install ~/rpmbuild/RPMS/*/splice-*.rpm` |
 | Arch, CachyOS, EndeavourOS | `cd packaging/arch && makepkg -si` |
 | SteamOS, Bazzite, Silverblue and other immutable systems | Flatpak: see `packaging/flatpak/` |
-| Any distribution, per user | `cargo build -p splice-app --release && packaging/linux/install.sh` |
+| Any distribution, per user | `cargo build -p splice-app --release --locked && packaging/linux/install.sh` |
 
 The per-user installer puts the binary in `~/.local/bin` and asks for `sudo` once to install the
 udev rule. Remove that install again with `packaging/linux/install.sh --uninstall`, for example
@@ -98,14 +98,16 @@ Complete the portal setup in [the Linux setup guide](docs/linux-setup.md).
 
 ## Use Splice
 
-1. Install the same current build and start Splice on every computer. Protocol 5 rejects older clients.
+1. Install the same current build and start Splice on every computer. Protocol 7 rejects older clients.
 2. Approve the operating system permission prompts.
 3. Open Splice from its menu bar or system tray icon, or launch it again from the app menu to bring the window back.
 4. Drag the machine cards so their screen edges touch in the same arrangement as your physical displays.
 5. Enable the machines that you want to control.
 6. Move the pointer through a shared edge. The keyboard follows the pointer to the other machine.
 
-Splice also synchronizes text and images when **Clipboard sync** is enabled. Use the per-machine pointer-speed controls to adjust remote movement.
+Splice synchronizes text and images when **Clipboard sync** is enabled. Open the file shelf from **Files** or the tray to offer files and folders, receive copied files, or pick up an incoming drag. Offering files sends only metadata; receiving or an accepted native drop starts the copy. See [sharing files](docs/file-sharing.md) for the two-step handoff and copy/paste flow.
+
+Use the per-machine pointer-speed controls to adjust remote movement.
 
 Press `Left Shift+Right Shift+Escape` to release captured input. You can also choose **Disconnect all** from the app or tray menu.
 
@@ -129,6 +131,8 @@ Run the workspace test suite:
 ```sh
 cargo test --workspace
 ```
+
+The Mac tray harness is opt-in with the `native-ui-tests` feature. Run native tests only during a scheduled desktop test session; they can open windows or interact with input.
 
 The suite checks full meshes of three and five machines, restart convergence, multi-hop input,
 clipboard isolation, and network failure handling. The KDE compositor check runs separately
@@ -155,4 +159,4 @@ See [Linux raw input setup and validation](docs/raw-input-linux.md) for device r
 Native Mac capture and gaming validation are pending. See the [implementation status](docs/raw-input-design.md)
 and [Mac build and validation handoff](docs/raw-input-macos-handoff.md) before releasing raw mode.
 Input uses UDP 41717 (Desktop) and UDP 41719 (Raw) on the Tailscale interface.
-Keep TCP 41717 for control and clipboard, and TCP 41718 for updates. Every computer must use protocol 6.
+Keep TCP 41717 for control and clipboard, TCP 41718 for updates, and TCP 41720 for file transfers. Every computer must use protocol 7.

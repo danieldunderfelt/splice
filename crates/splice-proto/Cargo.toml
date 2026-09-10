@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 bytes = "1"
 semver = "1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

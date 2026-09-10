@@ -10,6 +10,8 @@
 //! [`PlatformEvent`] mpsc channel and the async trait methods below. Trait methods must be
 //! quick (enqueue work, don't block on OS dialogs).
 
+pub mod file_shelf;
+pub mod files;
 pub mod keymap;
 pub mod mock;
 pub mod raw;
@@ -122,9 +124,114 @@ pub trait Clipboard: Send + Sync {
     async fn read_local(&self, mime: &str) -> Result<Vec<u8>>;
 }
 
+pub trait ClipboardObserver: Send + Sync {
+    fn invalidated(&self, generation: u64);
+    fn changed(&self, generation: u64, mimes: Vec<String>, inline_text: Option<String>);
+}
+
+#[derive(Default)]
+pub struct ClipboardClock {
+    generation: std::sync::atomic::AtomicU64,
+    observer: parking_lot::Mutex<Option<Arc<dyn ClipboardObserver>>>,
+}
+
+impl ClipboardClock {
+    pub fn current(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn observe(&self, observer: Arc<dyn ClipboardObserver>) {
+        *self.observer.lock() = Some(observer);
+    }
+
+    pub fn invalidate(&self) -> u64 {
+        let observer = self.observer.lock();
+        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if let Some(observer) = observer.as_ref() {
+            observer.invalidated(generation);
+        }
+        generation
+    }
+
+    pub fn changed(&self, generation: u64, mimes: Vec<String>, inline_text: Option<String>) -> bool {
+        let observer = self.observer.lock();
+        if self.current() != generation {
+            return true;
+        }
+        if let Some(observer) = observer.as_ref() {
+            observer.changed(generation, mimes, inline_text);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub fn native_clipboard_clock() -> Arc<ClipboardClock> {
+    static CLOCK: std::sync::OnceLock<Arc<ClipboardClock>> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(Default::default).clone()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationState {
+    Pending,
+    Published,
+    Cancelled,
+}
+
+#[derive(Clone)]
+pub struct ClipboardGuard {
+    clock: Arc<ClipboardClock>,
+    generation: u64,
+    intent: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
+    publication: Arc<parking_lot::Mutex<PublicationState>>,
+}
+
+impl ClipboardGuard {
+    pub fn new(clock: Arc<ClipboardClock>, generation: u64, intent: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>) -> Self {
+        Self { clock, generation, intent, publication: Arc::new(parking_lot::Mutex::new(PublicationState::Pending)) }
+    }
+
+    pub fn published(&self) {
+        let mut state = self.publication.lock();
+        if *state == PublicationState::Pending {
+            *state = PublicationState::Published;
+        }
+    }
+
+    pub fn is_published(&self) -> bool {
+        *self.publication.lock() == PublicationState::Published
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.publication.lock() == PublicationState::Cancelled
+    }
+
+    pub fn cancel(&self) {
+        *self.publication.lock() = PublicationState::Cancelled;
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            return Err(PlatformError::Unavailable("clipboard publication was cancelled".into()));
+        }
+        if self.clock.current() != self.generation {
+            return Err(PlatformError::Unavailable("the clipboard changed while the received files were being prepared".into()));
+        }
+        if self.intent.as_ref().is_some_and(|(latest, sequence)| latest.load(std::sync::atomic::Ordering::Acquire) != *sequence) {
+            return Err(PlatformError::Unavailable("a newer receive superseded this publication".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Engine-provided callback used by clipboard backends to lazily pull remote data.
 #[async_trait::async_trait]
 pub trait ClipFetch: Send + Sync {
+    fn publication_guard(&self) -> Option<ClipboardGuard> {
+        None
+    }
+
     /// Fetch a representation from the offering peer. Returns None if unavailable.
     async fn fetch(&self, mime: &str) -> Option<Vec<u8>>;
 }
@@ -232,6 +339,7 @@ pub struct Platform {
     /// Live backend selection (Linux only); the backend hot-swaps implementations when
     /// the engine publishes new preferences here.
     pub backends: Option<tokio::sync::watch::Sender<BackendPrefs>>,
+    pub files: Option<file_shelf::FileAdapter>,
 }
 
 /// Options for constructing the platform backend.
@@ -263,5 +371,80 @@ pub async fn create(opts: PlatformOpts) -> Result<Platform> {
     {
         let _ = opts;
         Err(PlatformError::Unavailable("unsupported OS".into()))
+    }
+}
+
+#[cfg(test)]
+mod clipboard_clock_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct Observer(parking_lot::Mutex<Vec<(u64, bool, Vec<String>)>>);
+
+    impl ClipboardObserver for Observer {
+        fn invalidated(&self, generation: u64) {
+            self.0.lock().push((generation, false, Vec::new()));
+        }
+
+        fn changed(&self, generation: u64, mimes: Vec<String>, _inline_text: Option<String>) {
+            self.0.lock().push((generation, true, mimes));
+        }
+    }
+
+    #[test]
+    fn invalidation_is_synchronous_and_empty_selection_supersedes_pending_text() {
+        let clock = Arc::new(ClipboardClock::default());
+        let observer = Arc::new(Observer::default());
+        clock.observe(observer.clone());
+        let text = clock.invalidate();
+        assert_eq!(*observer.0.lock(), vec![(text, false, Vec::new())]);
+        let empty = clock.invalidate();
+        assert!(clock.changed(empty, Vec::new(), None));
+        assert!(clock.changed(text, vec!["text/plain".into()], Some("late".into())));
+        assert_eq!(*observer.0.lock(), vec![(text, false, Vec::new()), (empty, false, Vec::new()), (empty, true, Vec::new())]);
+    }
+
+    struct Fetch(ClipboardGuard);
+
+    #[async_trait::async_trait]
+    impl ClipFetch for Fetch {
+        fn publication_guard(&self) -> Option<ClipboardGuard> {
+            Some(self.0.clone())
+        }
+
+        async fn fetch(&self, _mime: &str) -> Option<Vec<u8>> {
+            Some(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_native_publication_rechecks_generation_intent_and_cancellation() {
+        for change in 0..3 {
+            let (platform, mock) = mock::create(Vec::new());
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            mock.state.lock().clipboard_offer_gate = Some(gate.clone());
+            let clock = Arc::new(ClipboardClock::default());
+            let latest = Arc::new(AtomicU64::new(1));
+            let guard = ClipboardGuard::new(clock.clone(), clock.current(), Some((latest.clone(), 1)));
+            let fetch = Arc::new(Fetch(guard.clone()));
+            let task = tokio::spawn(async move {
+                platform.clipboard.set_remote_offer(ClipboardOffer { id: 1, mimes: vec!["text/uri-list".into()], inline_text: None }, fetch).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while mock.state.lock().clipboard_offers_started == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            match change {
+                0 => { clock.invalidate(); }
+                1 => latest.store(2, Ordering::Release),
+                _ => guard.cancel(),
+            }
+            gate.add_permits(1);
+            assert!(task.await.unwrap().is_err());
+            assert!(mock.state.lock().remote_offers.is_empty());
+            assert!(!guard.is_published());
+        }
     }
 }

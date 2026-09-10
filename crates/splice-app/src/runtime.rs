@@ -40,6 +40,8 @@ pub struct Controller {
     tray_hint: Arc<Mutex<Option<String>>>,
     focus_request: Arc<AtomicBool>,
     quit_request: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    native_files: crate::file_shelf::NativeSlot,
 }
 
 #[derive(Clone)]
@@ -55,6 +57,11 @@ enum Mode {
 }
 
 impl Controller {
+    #[cfg(target_os = "macos")]
+    pub fn native_files(&self) -> crate::file_shelf::NativeSlot {
+        self.native_files.clone()
+    }
+
     /// Latest published snapshot. The UI renders this and nothing else.
     pub fn state(&self) -> UiState {
         self.state.read().clone()
@@ -119,6 +126,13 @@ impl Controller {
         self.tray_hint.lock().clone()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn open_files(&self) {
+        if let Mode::Remote(remote) = &self.mode {
+            remote.send(crate::ipc::ClientMessage::OpenFiles);
+        }
+    }
+
     pub fn take_focus_request(&self) -> bool {
         self.focus_request.swap(false, Ordering::AcqRel)
     }
@@ -141,6 +155,8 @@ pub fn start(preview: bool, ctx: egui::Context) -> Controller {
     let tray_hint = Arc::new(Mutex::new(None));
     let focus_request = Arc::new(AtomicBool::new(false));
     let quit_request = Arc::new(AtomicBool::new(false));
+    #[cfg(target_os = "macos")]
+    let native_files = crate::file_shelf::NativeSlot::default();
     let mode = if preview {
         Mode::Preview
     } else {
@@ -159,7 +175,7 @@ pub fn start(preview: bool, ctx: egui::Context) -> Controller {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            engine_mode(ctx, state.clone(), status.clone())
+            engine_mode(ctx, state.clone(), status.clone(), native_files.clone())
         }
     };
     Controller {
@@ -170,11 +186,13 @@ pub fn start(preview: bool, ctx: egui::Context) -> Controller {
         tray_hint,
         focus_request,
         quit_request,
+        #[cfg(target_os = "macos")]
+        native_files,
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn engine_mode(ctx: egui::Context, state: Arc<RwLock<UiState>>, status: Arc<Mutex<BootStatus>>) -> Mode {
+fn engine_mode(ctx: egui::Context, state: Arc<RwLock<UiState>>, status: Arc<Mutex<BootStatus>>, native_files: crate::file_shelf::NativeSlot) -> Mode {
     let (retry_tx, retry_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let handle_slot: Arc<Mutex<Option<EngineHandle>>> = Arc::new(Mutex::new(None));
     let mode = Mode::Engine {
@@ -197,7 +215,7 @@ fn engine_mode(ctx: egui::Context, state: Arc<RwLock<UiState>>, status: Arc<Mute
     let thread_status = status.clone();
     let spawned = std::thread::Builder::new()
         .name("splice-runtime".into())
-        .spawn(move || runtime_thread(runtime, retry_rx, state, thread_status, handle_slot, ctx));
+        .spawn(move || runtime_thread(runtime, retry_rx, state, thread_status, handle_slot, ctx, native_files));
     if let Err(err) = spawned {
         tracing::error!("failed to spawn runtime thread: {err}");
         *status.lock() = BootStatus::Offline(format!("failed to spawn runtime: {err}"));
@@ -213,6 +231,7 @@ fn runtime_thread(
     status: Arc<Mutex<BootStatus>>,
     handle_slot: Arc<Mutex<Option<EngineHandle>>>,
     ctx: egui::Context,
+    native_files: crate::file_shelf::NativeSlot,
 ) {
     loop {
         // A panic anywhere in bootstrap must read as an ordinary bootstrap
@@ -221,8 +240,8 @@ fn runtime_thread(
             runtime.block_on(bootstrap())
         }));
 
-        let handle = match outcome {
-            Ok(Ok(handle)) => handle,
+        let boot = match outcome {
+            Ok(Ok(boot)) => boot,
             Ok(Err(err)) => {
                 tracing::warn!("engine bootstrap failed: {err:#}");
                 *status.lock() = BootStatus::Offline(format!("{err:#}"));
@@ -240,6 +259,11 @@ fn runtime_thread(
                 continue;
             }
         };
+
+        let handle = boot.engine;
+        if let Some(adapter) = boot.native_files {
+            runtime.block_on(crate::file_shelf::attach(handle.clone(), adapter, native_files.clone()));
+        }
 
         // Online: publish immediately, then forward every watch change into a repaint,
         // coalesced to <=10 Hz (DESIGN: "repaints on change (coalesced <=10 Hz)").
@@ -283,10 +307,19 @@ fn wait_for_retry(
     });
 }
 
-pub async fn bootstrap() -> anyhow::Result<EngineHandle> {
+pub struct Bootstrapped {
+    pub engine: EngineHandle,
+    #[cfg(target_os = "macos")]
+    pub native_files: Option<splice_platform::file_shelf::FileAdapter>,
+    #[cfg(target_os = "linux")]
+    pub files: crate::file_service::clipboard::EngineFiles,
+}
+
+pub async fn bootstrap() -> anyhow::Result<Bootstrapped> {
     let data_dir = splice_core::config::config_dir().context("resolving config dir")?;
     let cfg = splice_core::config::load(&data_dir)?;
-    let platform = splice_platform::create(splice_platform::PlatformOpts {
+    #[allow(unused_mut)]
+    let mut platform = splice_platform::create(splice_platform::PlatformOpts {
         data_dir: data_dir.clone(),
         panic_chord: cfg.panic_chord.clone(),
         backends: cfg.backends,
@@ -296,9 +329,22 @@ pub async fn bootstrap() -> anyhow::Result<EngineHandle> {
     let ts = splice_tailscale::Client::discover()
         .await
         .context("connecting to tailscaled (is Tailscale running?)")?;
-    splice_core::Engine::spawn(platform, ts, data_dir)
+    #[cfg(target_os = "macos")]
+    let native_files = platform.files.take();
+    #[cfg(target_os = "linux")]
+    let files = crate::file_service::clipboard::install(&mut platform).await;
+    let engine = splice_core::Engine::spawn(platform, ts, data_dir)
         .await
-        .context("spawning engine")
+        .context("spawning engine")?;
+    #[cfg(target_os = "linux")]
+    files.set_engine(engine.clone());
+    Ok(Bootstrapped {
+        engine,
+        #[cfg(target_os = "macos")]
+        native_files,
+        #[cfg(target_os = "linux")]
+        files,
+    })
 }
 
 pub fn panic_message(payload: &dyn std::any::Any) -> String {
@@ -389,6 +435,8 @@ pub mod preview {
             preparing_input: None,
             build: splice_proto::BuildInfo::current(),
             diagnostics: Default::default(),
+            files: Default::default(),
+            file_clipboard: None,
             updates: Default::default(),
             restart_requested: false,
             self_id: self_id.clone(),
@@ -495,6 +543,9 @@ pub mod preview {
                 if let Some(backends) = &mut state.backends {
                     backends.prefs = *prefs;
                 }
+            }
+            Command::Files(_) | Command::FileClipboardSelection { .. } => {
+                state.files.error = Some("File operations require a connected Splice service".into());
             }
             Command::Refresh | Command::ExportDiagnostics | Command::Update { .. } => {}
         }

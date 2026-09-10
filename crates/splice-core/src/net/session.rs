@@ -47,6 +47,7 @@ pub(crate) struct SessionControl {
     pub(crate) input: crate::input_transport::desktop::Control,
     frames: mpsc::Sender<QueuedFrame>,
     bulk: mpsc::Sender<QueuedFrame>,
+    files: mpsc::Sender<QueuedFrame>,
     traffic: Arc<Traffic>,
     shutdown: watch::Sender<Option<String>>,
 }
@@ -57,14 +58,27 @@ struct QueuedFrame {
 }
 
 impl SessionControl {
+    fn sender(&self, frame: &Frame) -> &mpsc::Sender<QueuedFrame> {
+        match frame {
+            Frame::Files(_) | Frame::FileClipboardRef { .. } | Frame::FileRoute { .. } => &self.files,
+            Frame::ClipChunk { .. } => &self.bulk,
+            _ => &self.frames,
+        }
+    }
+
+    fn depth(&self) -> usize {
+        [&self.frames, &self.files, &self.bulk].into_iter()
+            .map(|queue| queue.max_capacity() - queue.capacity()).sum()
+    }
+
     pub async fn send_wait(&self, frame: Frame, timeout: Duration) -> bool {
         if matches!(frame, Frame::Input { .. } | Frame::Enter { .. }) {
             return self.send(frame);
         }
-        let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
+        let sender = self.sender(&frame);
         match tokio::time::timeout(timeout, sender.reserve()).await {
             Ok(Ok(permit)) => {
-                self.traffic.queued(self.frames.max_capacity() - self.frames.capacity() + self.bulk.max_capacity() - self.bulk.capacity());
+                self.traffic.queued(self.depth());
                 permit.send(QueuedFrame { frame, queued: Instant::now() });
                 true
             }
@@ -81,11 +95,12 @@ impl SessionControl {
         if let Frame::Enter { session, .. } = &frame {
             if !self.input.start(*session) { self.close("UDP session queue exceeded its limit"); return false; }
         }
-        let sender = if matches!(frame, Frame::ClipChunk { .. }) { &self.bulk } else { &self.frames };
-        let depth = self.frames.max_capacity() - self.frames.capacity() + self.bulk.max_capacity() - self.bulk.capacity() + 1;
+        let sender = self.sender(&frame);
+        let depth = self.depth() + 1;
         match sender.try_send(QueuedFrame { frame, queued: Instant::now() }) {
             Ok(()) => { self.traffic.queued(depth); true },
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(mpsc::error::TrySendError::Full(queued)) => {
+                if matches!(queued.frame, Frame::Files(_) | Frame::FileClipboardRef { .. } | Frame::FileRoute { .. }) { return false; }
                 self.close("outgoing queue exceeded its limit");
                 false
             }
@@ -101,6 +116,7 @@ impl SessionControl {
 struct OutgoingFrames {
     priority: mpsc::Receiver<QueuedFrame>,
     bulk: mpsc::Receiver<QueuedFrame>,
+    files: mpsc::Receiver<QueuedFrame>,
 }
 
 impl OutgoingFrames {
@@ -108,6 +124,7 @@ impl OutgoingFrames {
         tokio::select! {
             biased;
             frame = self.priority.recv() => frame,
+            frame = self.files.recv() => frame,
             frame = self.bulk.recv() => frame,
         }
     }
@@ -120,8 +137,10 @@ struct SessionCommands {
     shutdown: watch::Receiver<Option<String>>,
 }
 
-fn our_caps() -> Vec<String> {
-    [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].iter().map(|s| s.to_string()).collect()
+fn our_caps(inner: &NetControlInner) -> Vec<String> {
+    let mut caps: Vec<String> = [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].iter().map(|s| s.to_string()).collect();
+    if inner.file_incoming.read().is_some() { caps.push(caps::FILES_V2.to_string()); }
+    caps
 }
 
 fn reject(inner: &NetControlInner, peer: &MachineId, reason: String) {
@@ -131,7 +150,7 @@ fn reject(inner: &NetControlInner, peer: &MachineId, reason: String) {
 }
 
 fn supports_required_capabilities(caps: &[String]) -> bool {
-    our_caps().iter().all(|required| caps.contains(required))
+    [caps::INPUT_V1, caps::CLIPBOARD_V2, caps::LAYOUT_V1, caps::MASTER_V1].iter().all(|required| caps.iter().any(|cap| cap == required))
 }
 
 /// A Ping is missed when no Pong arrives within this multiple of the current cadence.
@@ -211,16 +230,17 @@ fn register(
 ) -> (Registration, u64, SessionCommands, Arc<Liveness>) {
     let (frames, frame_rx) = mpsc::channel(128);
     let (bulk, bulk_rx) = mpsc::channel(4);
+    let (files, files_rx) = mpsc::channel(16);
     let (shutdown, shutdown_rx) = watch::channel(None);
     let traffic = Arc::new(Traffic::default());
     let seq = inner.next_seq.fetch_add(1, Ordering::Relaxed);
     let input = crate::input_transport::desktop::Control::spawn(input, peer.clone(), seq, inner.events.clone(), shutdown.clone(), traffic.clone());
-    let cmd_rx = SessionCommands { input: input.clone(), frames: OutgoingFrames { priority: frame_rx, bulk: bulk_rx }, shutdown: shutdown_rx, traffic: traffic.clone() };
+    let cmd_rx = SessionCommands { input: input.clone(), frames: OutgoingFrames { priority: frame_rx, bulk: bulk_rx, files: files_rx }, shutdown: shutdown_rx, traffic: traffic.clone() };
     let active = Arc::new(Liveness::default());
     let slot = PeerSlot {
         seq,
         traffic: traffic.clone(),
-        control: SessionControl { input, frames, bulk, shutdown, traffic },
+        control: SessionControl { input, frames, bulk, files, shutdown, traffic },
         rule_following: matches!(role, Role::Dialer) == (self_id < peer),
         active: active.clone(),
     };
@@ -251,7 +271,7 @@ pub(crate) async fn run(
                 proto_min: inner.opts.proto_min,
                 proto_max: inner.opts.proto_max,
                 machine: self_info.clone(),
-                caps: our_caps(),
+                caps: our_caps(&inner),
             });
             if let Err(error) = write_frame(&inner, &mut sock, &hello).await {
                 if let Some(id) = &expected { reject(&inner, id, format!("Sending Hello failed: {error}")); }
@@ -352,7 +372,7 @@ pub(crate) async fn run(
                 let _ = write_frame(&inner, &mut sock, &Frame::Bye { reason }).await;
                 return false;
             }
-            let caps = our_caps();
+            let caps = our_caps(&inner);
             let peer = hello.machine.id.clone();
             let welcome = Frame::Welcome(Welcome { proto, machine: self_info.clone(), caps: caps.clone() });
             if write_frame(&inner, &mut sock, &welcome).await.is_err() {
@@ -384,7 +404,7 @@ pub(crate) async fn run(
             let _ = inner.events.send(PeerEvent::Connected {
                 id: peer.clone(),
                 hello: hello.machine,
-                caps,
+                caps: hello.caps,
                 addr: peer_addr,
             });
             drop(admission);
@@ -572,6 +592,15 @@ async fn session_loop(
                 Some(Ok(Frame::Bye { reason })) => break reason,
                 Some(Ok(Frame::Hello(_) | Frame::Welcome(_) | Frame::Ready | Frame::InputOffer { .. })) => break "unexpected handshake frame".into(),
                 Some(Ok(Frame::Input { .. })) => break "input requires the authenticated UDP channel".into(),
+                Some(Ok(Frame::Files(message))) => {
+                    let peers = inner.peers.read();
+                    if peers.get(&peer).is_some_and(|slot| slot.seq == seq) {
+                        let incoming = inner.file_incoming.read();
+                        if let Some(tx) = incoming.as_ref() {
+                            let _ = tx.try_send((peer.clone(), seq, message));
+                        }
+                    }
+                }
                 Some(Ok(f)) => {
                     let peers = inner.peers.read();
                     if peers.get(&peer).is_some_and(|slot| slot.seq == seq) {
@@ -641,13 +670,39 @@ mod tests {
         let b = right.subscribe(left.address().unwrap(), [2; 16], [1; 16]).unwrap();
         let (frames, priority) = mpsc::channel(2);
         let (bulk, bulk_rx) = mpsc::channel(2);
+        let (files, files_rx) = mpsc::channel(2);
         let (shutdown, reason) = watch::channel(None);
         let (events, received) = mpsc::unbounded_channel();
         let traffic = Arc::new(Traffic::default());
         let input = Control::spawn(a, MachineId("b".into()), 1, events.clone(), shutdown.clone(), traffic.clone());
         let destination = Control::spawn(b, MachineId("a".into()), 1, events, shutdown.clone(), Arc::new(Traffic::default()));
-        let control = SessionControl { input, frames, bulk, shutdown, traffic };
-        (control, OutgoingFrames { priority, bulk: bulk_rx }, reason, received, destination)
+        let control = SessionControl { input, frames, bulk, files, shutdown, traffic };
+        (control, OutgoingFrames { priority, bulk: bulk_rx, files: files_rx }, reason, received, destination)
+    }
+
+    #[tokio::test]
+    async fn file_control_overflow_preserves_priority_control_session() {
+        let (control, mut frames, reason, _events, _destination) = controls().await;
+        let frame = Frame::Files(splice_proto::files::FileMessage::Cancel { transfer: splice_proto::files::TransferId([1; 16]) });
+        assert!(control.send(frame.clone()));
+        assert!(control.send(frame.clone()));
+        assert!(!control.send(frame));
+        assert!(reason.borrow().is_none());
+        assert!(control.send(Frame::ReleaseAll));
+        assert!(matches!(frames.recv().await.unwrap().frame, Frame::ReleaseAll));
+        assert!(reason.borrow().is_none());
+    }
+
+    #[tokio::test]
+    async fn clipboard_backpressure_cannot_refuse_file_control() {
+        let (control, mut frames, reason, _events, _destination) = controls().await;
+        for request in [1, 2] {
+            assert!(control.send_wait(Frame::ClipChunk { request, data: vec![7; splice_proto::CLIP_CHUNK], last: true }, Duration::from_secs(1)).await);
+        }
+        let transfer = splice_proto::files::TransferId([8; 16]);
+        assert!(control.send(Frame::Files(splice_proto::files::FileMessage::Cancel { transfer })));
+        assert!(matches!(frames.recv().await.unwrap().frame, Frame::Files(splice_proto::files::FileMessage::Cancel { transfer: got }) if got == transfer));
+        assert!(reason.borrow().is_none());
     }
 
     #[tokio::test]

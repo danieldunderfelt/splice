@@ -14,15 +14,19 @@
 //! the service if needed; `splice quit` stops everything.
 
 mod app;
+mod file_shelf;
+mod files_panel;
 #[cfg(target_os = "macos")]
 mod edge_indicator;
 #[cfg(target_os = "linux")]
 mod autostart;
+#[cfg(target_os = "linux")]
+mod file_service;
 mod drag;
 mod diagnostics;
 mod updates;
 mod input;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 mod ipc;
 #[cfg(target_os = "linux")]
 mod remote;
@@ -94,8 +98,25 @@ fn dispatch(preview: bool) {
             }
             exit(0);
         }
+        Some("file-shelf") => {
+            init_tracing("splice-files.log");
+            if let Err(error) = splice_files::helper::run() {
+                tracing::error!(%error, "file shelf stopped");
+                exit(1);
+            }
+            exit(0);
+        }
+        Some("files") => {
+            let opened = ipc::ensure_service()
+                .and_then(|mut stream| ipc::write_message(&mut stream, &ipc::ClientMessage::OpenFiles));
+            if let Err(err) = opened {
+                eprintln!("cannot open the Splice file shelf: {err}");
+                exit(1);
+            }
+            exit(0);
+        }
         Some(other) => {
-            eprintln!("unknown command {other:?}\nusage: splice [window|service|quit]");
+            eprintln!("unknown command {other:?}\nusage: splice [window|files|service|quit]");
             exit(2);
         }
     }

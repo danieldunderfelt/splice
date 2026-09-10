@@ -8,6 +8,7 @@ members = [
     "crates/splice-daemon",
     "crates/splice-app",
     "crates/splice-update",
+    "crates/splice-files",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ splice-tailscale = { path = "crates/splice-tailscale" }
 splice-core = { path = "crates/splice-core" }
 splice-platform = { path = "crates/splice-platform" }
 splice-update = { path = "crates/splice-update" }
+splice-files = { path = "crates/splice-files", default-features = false }
 
 # shared
 tokio = { version = "1", features = ["full"] }
@@ -38,12 +40,17 @@ base64 = "0.22"
 directories = "6"
 keycode = "1"
 parking_lot = "0.12"
+rand = "0.10"
+sha2 = "0.10"
+percent-encoding = "2"
 
 # UI
 eframe = "0.36"
 egui = "0.36"
 
 # Linux
+fuser = "0.15"
+gtk4 = { version = "0.10", features = ["v4_10"] }
 ashpd = { version = "0.13", default-features = false, features = ["tokio"] }
 reis = { version = "0.7", features = ["tokio"] }
 evdev = { version = "0.13", features = ["tokio"] }
@@ -51,6 +58,7 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 ksni = "0.3"
 
 # macOS
+dispatch2 = { version = "0.3", features = ["objc2"] }
 core-graphics = "0.25"
 core-foundation = "0.10"
 objc2 = "0.6"

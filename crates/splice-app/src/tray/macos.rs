@@ -15,6 +15,7 @@ use std::sync::{
 use tray_icon::menu::{CheckMenuItem, ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 const OPEN_ID: &str = "splice.open";
+const FILES_ID: &str = "splice.files";
 const DISCONNECT_ID: &str = "splice.disconnect";
 const QUIT_ID: &str = "splice.quit";
 const MACHINE_PREFIX: &str = "splice.machine.";
@@ -35,6 +36,7 @@ impl MacTray {
         let menu = Menu::new();
         menu.append_items(&[
             &MenuItem::with_id(OPEN_ID, "Open Splice", true, None),
+            &MenuItem::with_id(FILES_ID, "Open file shelf", true, None),
             &PredefinedMenuItem::separator(),
             &PredefinedMenuItem::separator(),
             &MenuItem::with_id(DISCONNECT_ID, "Disconnect all", true, None),
@@ -62,6 +64,7 @@ impl MacTray {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let action = match event.id().0.as_str() {
                 OPEN_ID => Some(AppAction::Open),
+                FILES_ID => Some(AppAction::Files),
                 DISCONNECT_ID => Some(AppAction::DisconnectAll),
                 QUIT_ID => Some(AppAction::Quit),
                 id => id
@@ -101,7 +104,7 @@ impl MacTray {
                     let item = &items[position].1;
                     self.menu.remove(item).map_err(|error| error.to_string())?;
                     self.menu
-                        .insert(item, index + 2)
+                        .insert(item, index + 3)
                         .map_err(|error| error.to_string())?;
                     let item = items.remove(position);
                     items.insert(index, item);
@@ -116,7 +119,7 @@ impl MacTray {
                         None,
                     );
                     self.menu
-                        .insert(&item, index + 2)
+                        .insert(&item, index + 3)
                         .map_err(|error| error.to_string())?;
                     items.insert(index, (machine.id.clone(), item));
                 }

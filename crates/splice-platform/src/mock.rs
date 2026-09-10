@@ -111,6 +111,10 @@ impl Clipboard for MockClipboard {
         if let Some(error) = &self.0.state.lock().clipboard_offer_error {
             return Err(crate::PlatformError::Unavailable(error.clone()));
         }
+        if let Some(guard) = fetch.publication_guard() {
+            guard.check()?;
+            guard.published();
+        }
         self.0.state.lock().remote_offers.push(offer);
         *self.0.last_fetch.lock() = Some(fetch);
         Ok(())
@@ -145,6 +149,7 @@ pub fn create(displays: Vec<DisplayRect>) -> (Platform, MockHandle) {
         displays,
         events: rx,
         backends: None,
+        files: None,
     };
     (platform, handle)
 }
