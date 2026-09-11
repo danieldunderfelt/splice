@@ -22,6 +22,7 @@ mod capture;
 mod clipboard;
 mod datacontrol;
 mod displays;
+pub mod dragattach;
 mod emulate;
 pub mod fileclip;
 pub mod fileportal;

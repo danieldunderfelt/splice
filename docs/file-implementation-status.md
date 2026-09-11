@@ -29,4 +29,14 @@ The broad integrated core/protocol run passed 248 tests. Later storage repairs p
 
 The feature remains uncommitted in the working tree on base `3f348529c137b1d6906e328e941c21816b7a527f`. The existing user change to `AGENTS.md` is preserved. A source snapshot and compiled Linux candidate are available at the locations in [the server checklist](file-handoff-validation.md). The installed Mac and Linux applications were not updated for this handoff.
 
+## GNOME acceptance, 2026-09-11
+
+Run on the GNOME machine (GNOME Shell 50.4, Mutter 50.4, Nautilus 50.2.2, GTK 4.22, Fedora 44 on Wayland) with `splice-files --pilot`, driven by uinput injection while no Splice service was running. The pilot logs pointer motion and the offer row's bounds so an injected sweep can locate its window.
+
+- Reading a view file before any drop failed with EIO.
+- The first drag gesture on the pre-armed row started a native drag. Releasing over a maximized Nautilus folder produced `drop_performed`, one commit, and both files materialized and copied by Nautilus with matching SHA-256.
+- Releasing the drag back over the shelf ended with `ZeroPayload`, no commit, an unchanged destination and a fresh armed view.
+
+This is the shipped two-gesture flow and needed no GNOME-specific change. The continuous held-button variant is covered in [drag-attach-spike-results.md](research/drag-attach-spike-results.md).
+
 Use [the server checklist](file-handoff-validation.md) for native testing and [file sharing](file-sharing.md) for the user workflow. It uses separate shelf drop and pickup gestures; automatic boundary drag continuation is not implemented.

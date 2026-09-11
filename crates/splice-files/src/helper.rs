@@ -247,6 +247,14 @@ impl Shelf {
         shelf
     }
 
+    pub fn window(&self) -> &gtk4::Window {
+        &self.window
+    }
+
+    pub fn offer_row_widget(&self, offer: FileOfferId) -> Option<gtk4::Widget> {
+        self.offer_rows.borrow().get(&offer).map(|row| row.widget.clone())
+    }
+
     pub fn selected_recipient(&self) -> Option<String> {
         let index = self.peer_select.selected().checked_sub(1)? as usize;
         self.peers.borrow().get(index).map(|p| p.id.clone())

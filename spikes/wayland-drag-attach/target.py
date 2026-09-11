@@ -54,7 +54,11 @@ def main():
         target.connect("motion", on_motion)
         target.connect("drop", on_drop)
         win.add_controller(target)
-        win.fullscreen()
+        win.connect("notify::is-active", lambda w, _p: note(f"is-active={w.is_active()}"))
+        if os.environ.get('SPIKE_TARGET_MAXIMIZE'):
+            win.maximize()
+        else:
+            win.fullscreen()
         win.present()
         note("target window presented (fullscreen)")
         GLib.timeout_add_seconds(40, lambda: (note("target timeout"), app.quit(), False)[2])

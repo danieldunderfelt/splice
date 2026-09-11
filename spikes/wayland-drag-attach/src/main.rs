@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,7 @@ fn log(msg: impl AsRef<str>) {
 enum Mode {
     Layer,
     Toplevel,
+    Catch,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +71,7 @@ struct Config {
     screen: (i32, i32),
     files: Vec<PathBuf>,
     keep_input: bool,
+    unmap: bool,
     shots: Option<PathBuf>,
     timeout: Duration,
     post_click: Option<(i32, i32)>,
@@ -83,6 +86,7 @@ fn parse_args() -> Result<Config> {
         screen: (2560, 2160),
         files: Vec::new(),
         keep_input: false,
+        unmap: false,
         shots: None,
         timeout: Duration::from_secs(20),
         post_click: None,
@@ -98,6 +102,7 @@ fn parse_args() -> Result<Config> {
                 cfg.mode = match args.next().as_deref() {
                     Some("layer") => Mode::Layer,
                     Some("toplevel") => Mode::Toplevel,
+                    Some("catch") => Mode::Catch,
                     other => return Err(anyhow!("unknown mode {other:?}")),
                 }
             }
@@ -105,6 +110,7 @@ fn parse_args() -> Result<Config> {
             "--target" => cfg.target = pair(&mut args)?,
             "--screen" => cfg.screen = pair(&mut args)?,
             "--keep-input" => cfg.keep_input = true,
+            "--unmap" => cfg.unmap = true,
             "--post-click" => cfg.post_click = Some(pair(&mut args)?),
             "--shots" => cfg.shots = Some(PathBuf::from(args.next().context("missing dir")?)),
             "--timeout" => cfg.timeout = Duration::from_secs(args.next().context("missing secs")?.parse()?),
@@ -135,6 +141,7 @@ fn uri_list(files: &[PathBuf]) -> String {
 enum Origin {
     Layer(LayerSurface),
     Toplevel(Window),
+    Pending(wl_surface::WlSurface),
 }
 
 impl Origin {
@@ -142,6 +149,7 @@ impl Origin {
         match self {
             Origin::Layer(layer) => layer.wl_surface(),
             Origin::Toplevel(window) => window.wl_surface(),
+            Origin::Pending(surface) => surface,
         }
     }
 }
@@ -149,6 +157,7 @@ impl Origin {
 struct State {
     cfg: Config,
     phase: Arc<AtomicU8>,
+    map_request: Arc<AtomicBool>,
     registry: RegistryState,
     outputs: OutputState,
     seats: SeatState,
@@ -160,6 +169,7 @@ struct State {
     pointer: Option<wl_pointer::WlPointer>,
     data_device: Option<DataDevice>,
     origin: Origin,
+    xdg: Option<XdgShell>,
     size: (u32, u32),
     drag: Option<DragSource>,
     outcome: Option<Result<(), String>>,
@@ -175,7 +185,7 @@ impl State {
             return;
         };
         for px in canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0x00, 0x00, 0x60, 0x60]);
+            px.copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         }
         let surface = self.origin.surface();
         if buffer.attach_to(surface).is_err() {
@@ -199,7 +209,12 @@ impl State {
         source.start_drag(device, self.origin.surface(), None, serial);
         log(format!("start_drag sent with serial {serial}"));
         self.drag = Some(source);
-        if !self.cfg.keep_input {
+        if self.cfg.unmap {
+            let surface = self.origin.surface();
+            surface.attach(None, 0, 0);
+            surface.commit();
+            log("origin surface unmapped after start_drag");
+        } else if !self.cfg.keep_input {
             match Region::new(&self.compositor) {
                 Ok(region) => {
                     let surface = self.origin.surface();
@@ -211,6 +226,19 @@ impl State {
             }
         }
         self.phase.store(PHASE_DRAGGING, Ordering::Release);
+    }
+
+    fn accept_offer(&mut self, _device: &wl_data_device::WlDataDevice) {
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else {
+            return;
+        };
+        let mimes = offer.with_mime_types(|m| m.to_vec());
+        if self.phase.load(Ordering::Acquire) < PHASE_DRAGGING {
+            log(format!("catcher offer mime types: {mimes:?}"));
+            self.phase.store(PHASE_DRAGGING, Ordering::Release);
+        }
+        offer.accept_mime_type(offer.serial, Some("text/uri-list".to_owned()));
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
     }
 
     fn finish(&mut self, outcome: Result<(), String>) {
@@ -314,7 +342,7 @@ impl PointerHandler for State {
                 PointerEventKind::Leave { serial } => log(format!("pointer left origin serial {serial}")),
                 PointerEventKind::Press { button, serial, .. } => {
                     log(format!("button {button:#x} pressed on origin serial {serial}"));
-                    if *button == u32::from(BTN_LEFT) && self.drag.is_none() {
+                    if *button == u32::from(BTN_LEFT) && self.drag.is_none() && self.cfg.mode != Mode::Catch {
                         self.start_drag(qh, *serial);
                     }
                 }
@@ -327,16 +355,52 @@ impl PointerHandler for State {
 }
 
 impl DataDeviceHandler for State {
-    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, x: f64, y: f64, _: &wl_surface::WlSurface) {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, device: &wl_data_device::WlDataDevice, x: f64, y: f64, _: &wl_surface::WlSurface) {
         log(format!("data device: drag entered our own surface at {x:.0},{y:.0}"));
+        if self.cfg.mode == Mode::Catch {
+            self.accept_offer(device);
+        }
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
         log("data device: drag left our surface");
     }
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, _: f64, _: f64) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, device: &wl_data_device::WlDataDevice, _: f64, _: f64) {
+        if self.cfg.mode == Mode::Catch {
+            self.accept_offer(device);
+        }
+    }
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
-        log("data device: drop performed on our own surface (unexpected)");
+    fn drop_performed(&mut self, conn: &Connection, _: &QueueHandle<Self>, _device: &wl_data_device::WlDataDevice) {
+        if self.cfg.mode != Mode::Catch {
+            log("data device: drop performed on our own surface (unexpected)");
+            return;
+        }
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else {
+            log("drop performed but no offer is present");
+            self.finish(Err("drop without offer".into()));
+            return;
+        };
+        log("data device: drop performed on the catcher surface; receiving text/uri-list");
+        match offer.receive("text/uri-list".to_owned()) {
+            Ok(pipe) => {
+                let _ = conn.flush();
+                let mut body = String::new();
+                let mut file = std::fs::File::from(std::os::fd::OwnedFd::from(pipe));
+                let result = file.read_to_string(&mut body);
+                log(format!("received {} bytes ({result:?}): {}", body.len(), body.trim().replace("\r\n", " | ")));
+                offer.finish();
+                let expected = uri_list(&self.cfg.files);
+                if body == expected {
+                    self.finish(Ok(()));
+                } else {
+                    self.finish(Err(format!("uri list mismatch, expected {expected:?}")));
+                }
+            }
+            Err(err) => {
+                log(format!("receive failed: {err}"));
+                self.finish(Err("receive failed".into()));
+            }
+        }
     }
 }
 
@@ -399,6 +463,15 @@ delegate_xdg_window!(State);
 delegate_data_device!(State);
 delegate_registry!(State);
 
+fn fullscreen_window(xdg: &XdgShell, surface: wl_surface::WlSurface, qh: &QueueHandle<State>) -> Window {
+    let window = xdg.create_window(surface, WindowDecorations::RequestClient, qh);
+    window.set_title("Splice spike drag origin");
+    window.set_app_id("dev.splice.spike.origin");
+    window.set_fullscreen(None);
+    window.commit();
+    window
+}
+
 fn abs_coords(screen: (i32, i32), p: (i32, i32)) -> (i32, i32) {
     let scale = |v: i32, extent: i32| ((f64::from(v) + 0.5) * 65536.0 / f64::from(extent)).floor().clamp(0.0, 65535.0) as i32;
     (scale(p.0, screen.0), scale(p.1, screen.1))
@@ -417,7 +490,7 @@ fn shot(dir: &Option<PathBuf>, name: &str) {
     }
 }
 
-fn injector(cfg: Config, phase: Arc<AtomicU8>) -> Result<()> {
+fn injector(cfg: Config, phase: Arc<AtomicU8>, map_request: Arc<AtomicBool>) -> Result<()> {
     let mut buttons = AttributeSet::<KeyCode>::new();
     for code in BTN_LEFT..=BTN_TASK {
         buttons.insert(KeyCode::new(code));
@@ -439,9 +512,6 @@ fn injector(cfg: Config, phase: Arc<AtomicU8>) -> Result<()> {
         }
         phase.load(Ordering::Acquire) >= target
     };
-    if !wait_for(PHASE_MAPPED, Duration::from_secs(5)) {
-        return Err(anyhow!("origin surface never mapped"));
-    }
     let move_to = |device: &mut VirtualDevice, p: (i32, i32)| -> Result<()> {
         let (x, y) = abs_coords(cfg.screen, p);
         device.emit(&[
@@ -450,12 +520,32 @@ fn injector(cfg: Config, phase: Arc<AtomicU8>) -> Result<()> {
         ])?;
         Ok(())
     };
+    if cfg.mode != Mode::Catch && !wait_for(PHASE_MAPPED, Duration::from_secs(5)) {
+        return Err(anyhow!("origin surface never mapped"));
+    }
     move_to(&mut device, (cfg.origin.0 - 3, cfg.origin.1 - 3))?;
     std::thread::sleep(Duration::from_millis(120));
     move_to(&mut device, cfg.origin)?;
     std::thread::sleep(Duration::from_millis(300));
     log(format!("injecting BTN_LEFT press at {:?}", cfg.origin));
     device.emit(&[InputEvent::new(EventType::KEY.0, BTN_LEFT, 1)])?;
+    if cfg.mode == Mode::Catch {
+        for i in 1..=12 {
+            move_to(&mut device, (cfg.origin.0 + i * 5, cfg.origin.1 + i * 5))?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        log("foreign drag should be in progress; requesting the catcher toplevel to map");
+        map_request.store(true, Ordering::Release);
+        if !wait_for(PHASE_MAPPED, Duration::from_secs(5)) {
+            return Err(anyhow!("catcher surface never mapped"));
+        }
+        for i in 1..=6 {
+            move_to(&mut device, (cfg.origin.0 + 60 + i * 5, cfg.origin.1 + 60 + i * 5))?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
     if !wait_for(PHASE_DRAGGING, Duration::from_secs(2)) {
         log("drag did not start within 2s of the press; continuing anyway");
     }
@@ -478,7 +568,7 @@ fn injector(cfg: Config, phase: Arc<AtomicU8>) -> Result<()> {
     shot(&cfg.shots, "3-over-target");
     log(format!("injecting BTN_LEFT release at {:?}", cfg.target));
     device.emit(&[InputEvent::new(EventType::KEY.0, BTN_LEFT, 0)])?;
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(if cfg.mode == Mode::Catch { 1500 } else { 400 }));
     if let Some(click) = cfg.post_click {
         std::thread::sleep(Duration::from_millis(700));
         shot(&cfg.shots, "4-drop-menu");
@@ -509,6 +599,7 @@ fn main() -> Result<()> {
     let pool = SlotPool::new((cfg.screen.0 * cfg.screen.1 * 4) as usize, &shm).context("shm pool")?;
     let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).context("wl_data_device_manager")?;
     let surface = compositor.create_surface(&qh);
+    let xdg = XdgShell::bind(&globals, &qh).context("xdg_wm_base")?;
     let origin = match cfg.mode {
         Mode::Layer => {
             let layer_shell = LayerShell::bind(&globals, &qh).context("zwlr_layer_shell_v1 (not on GNOME)")?;
@@ -522,20 +613,15 @@ fn main() -> Result<()> {
             layer.commit();
             Origin::Layer(layer)
         }
-        Mode::Toplevel => {
-            let xdg = XdgShell::bind(&globals, &qh).context("xdg_wm_base")?;
-            let window = xdg.create_window(surface, WindowDecorations::RequestClient, &qh);
-            window.set_title("Splice spike drag origin");
-            window.set_app_id("dev.splice.spike.origin");
-            window.set_fullscreen(None);
-            window.commit();
-            Origin::Toplevel(window)
-        }
+        Mode::Toplevel => Origin::Toplevel(fullscreen_window(&xdg, surface, &qh)),
+        Mode::Catch => Origin::Pending(surface),
     };
     let phase = Arc::new(AtomicU8::new(0));
+    let map_request = Arc::new(AtomicBool::new(false));
     let mut state = State {
         cfg: cfg.clone(),
         phase: phase.clone(),
+        map_request: map_request.clone(),
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &qh),
         seats: SeatState::new(&globals, &qh),
@@ -547,6 +633,7 @@ fn main() -> Result<()> {
         pointer: None,
         data_device: None,
         origin,
+        xdg: Some(xdg),
         size: (ORIGIN_SIZE, ORIGIN_SIZE),
         drag: None,
         outcome: None,
@@ -568,11 +655,19 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow!("timer: {e}"))?;
     let injector_cfg = cfg.clone();
     let injector_phase = phase.clone();
-    let injector = std::thread::spawn(move || injector(injector_cfg, injector_phase));
+    let injector_map = map_request.clone();
+    let injector = std::thread::spawn(move || injector(injector_cfg, injector_phase, injector_map));
     while state.running || !injector.is_finished() {
         event_loop.dispatch(Some(Duration::from_millis(50)), &mut state).context("dispatch")?;
-        if injector.is_finished() && state.drag.is_none() && state.phase.load(Ordering::Acquire) < PHASE_DRAGGING {
-            state.finish(Err("injector finished before a drag started".into()));
+        if state.map_request.swap(false, Ordering::AcqRel) {
+            if let Origin::Pending(surface) = std::mem::replace(&mut state.origin, Origin::Pending(state.compositor.create_surface(&qh))) {
+                let window = fullscreen_window(state.xdg.as_ref().expect("xdg shell"), surface, &qh);
+                state.origin = Origin::Toplevel(window);
+                log("catcher toplevel created and committed under the in-progress drag");
+            }
+        }
+        if injector.is_finished() && state.outcome.is_none() {
+            state.finish(Err("injector finished without a completed drop".into()));
         }
     }
     let _ = conn.flush();

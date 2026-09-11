@@ -28,12 +28,16 @@ fn main() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use anyhow::{anyhow, Result};
+    use gtk4::prelude::*;
     use splice_files::helper::{self, PilotLog, Shelf, ShelfHooks, ViewOutcome};
     use splice_files::ipc::{OfferDesc, OfferStateDesc, PeerDesc, ReceiptDesc, ReceiptStateDesc};
     use splice_files::local::{LocalDirSource, SourceEvent};
     use splice_files::manifest::{self, SourceTree};
     use splice_files::mount::{Mount, MountConfig};
-    use splice_platform::files::{EntryKind, FileContentSource, FileOfferId};
+    use splice_platform::files::{EntryKind, FileContentSource, FileOfferId, ViewState};
+    use splice_platform::linux::dragattach::{
+        self, AttachEvent, AttachRequest, CatchEvent, CatchRequest,
+    };
 
     if identity() {
         return Ok(());
@@ -49,25 +53,33 @@ fn main() -> anyhow::Result<()> {
     return match &args[1..] {
         [] => helper::run(),
         [flag, dir] if flag == "--pilot" => pilot(PathBuf::from(dir)),
+        [flag, dir, x, y] if flag == "--pilot-attach" => {
+            pilot_attach(PathBuf::from(dir), (x.parse()?, y.parse()?))
+        }
+        [flag, dir, x, y] if flag == "--pilot-catch" => {
+            pilot_catch(PathBuf::from(dir), (x.parse()?, y.parse()?))
+        }
         _ => {
-            eprintln!("usage: splice-files [--version|--version-json|--pilot <dir>]");
+            eprintln!(
+                "usage: splice-files [--version|--version-json|--pilot <dir>|--pilot-attach <dir> <x> <y>|--pilot-catch <dir> <x> <y>]"
+            );
             std::process::exit(2);
         }
     };
 
-    fn pilot(dir: PathBuf) -> Result<()> {
-        gtk4::init().map_err(|e| anyhow!("gtk init: {e}"))?;
-        std::fs::create_dir_all(&dir)?;
-        let log = PilotLog::new(&dir.join("pilot.jsonl"))?;
+    fn pilot_backing(
+        dir: &Path,
+        log: &Arc<PilotLog>,
+        offer_id: FileOfferId,
+    ) -> Result<(Rc<SourceTree>, Arc<LocalDirSource>, Arc<Mount>)> {
         let source_dir = dir.join("source");
         ensure_pilot_source(&source_dir)?;
-        let offer_id = FileOfferId::new();
         let tree = Rc::new(manifest::from_paths(
             offer_id,
             "pilot",
             std::slice::from_ref(&source_dir),
         )?);
-        let log_source = Arc::clone(&log);
+        let log_source = Arc::clone(log);
         let source = Arc::new(LocalDirSource::new(
             dir.join("cache"),
             Box::new(move |event| {
@@ -97,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                 log_source.log(name, fields);
             }),
         )?);
-        let mount = Rc::new(Mount::spawn(MountConfig {
+        let mount = Arc::new(Mount::spawn(MountConfig {
             mountpoint: dir.join("mnt"),
             content: Arc::clone(&source) as Arc<dyn FileContentSource>,
             workers: 4,
@@ -107,6 +119,125 @@ fn main() -> anyhow::Result<()> {
             "mount",
             serde_json::json!({ "mountpoint": mount.mountpoint().display().to_string() }),
         );
+        Ok((tree, source, mount))
+    }
+
+    fn pilot_attach(dir: PathBuf, entry: (i32, i32)) -> Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let log = PilotLog::new(&dir.join("pilot.jsonl"))?;
+        let (tree, source, mount) = pilot_backing(&dir, &log, FileOfferId::new())?;
+        let view = mount.create_view(tree.manifest.clone());
+        source.register_view(view, &tree);
+        let uris = mount.view_uris(view);
+        log.log(
+            "view",
+            serde_json::json!({ "view": view.to_string(), "uris": uris.iter().map(|u| u.display().to_string()).collect::<Vec<_>>() }),
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<AttachEvent>();
+        let session = dragattach::attach(
+            AttachRequest {
+                entry,
+                uris,
+                portal_key: None,
+                press_timeout: std::time::Duration::from_secs(15),
+            },
+            move |event| {
+                let _ = tx.send(event);
+            },
+        )?;
+        let mut settled = false;
+        while let Ok(event) = rx.recv() {
+            log.log("attach", serde_json::json!({ "kind": format!("{event:?}") }));
+            match event {
+                AttachEvent::Armed(_) => {
+                    println!("ARMED at {},{}", entry.0, entry.1);
+                }
+                AttachEvent::Started => mount.drag_started(view),
+                AttachEvent::Dropped => {
+                    let recorded = mount.drop_performed(view);
+                    log.log("drop_performed", serde_json::json!({ "recorded": recorded }));
+                }
+                AttachEvent::Finished => {
+                    if mount.view_state(view) == Some(ViewState::Offered) {
+                        let outcome = mount.cancel_view(view);
+                        log.log("finished_without_drop", serde_json::json!({ "outcome": format!("{outcome:?}") }));
+                    }
+                    settled = true;
+                    break;
+                }
+                AttachEvent::Cancelled(reason) => {
+                    let outcome = mount.cancel_view(view);
+                    log.log(
+                        "cancelled",
+                        serde_json::json!({ "reason": reason, "outcome": format!("{outcome:?}") }),
+                    );
+                    break;
+                }
+            }
+        }
+        drop(session);
+        if settled {
+            let mut last = None;
+            let mut stable = 0;
+            while stable < 6 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let stats = stats_json(mount.stats(view));
+                let readers = mount.open_readers(view);
+                let snapshot = (stats.to_string(), readers);
+                if last.as_ref() == Some(&snapshot) {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                last = Some(snapshot);
+            }
+        }
+        log.log(
+            "final",
+            serde_json::json!({ "stats": stats_json(mount.stats(view)), "state": format!("{:?}", mount.view_state(view)) }),
+        );
+        mount.retire_view(view);
+        Ok(())
+    }
+
+    fn pilot_catch(dir: PathBuf, near: (i32, i32)) -> Result<()> {
+        std::fs::create_dir_all(&dir)?;
+        let log = PilotLog::new(&dir.join("pilot.jsonl"))?;
+        let (tx, rx) = std::sync::mpsc::channel::<CatchEvent>();
+        let session = dragattach::catch(
+            CatchRequest {
+                near,
+                timeout: std::time::Duration::from_secs(15),
+            },
+            move |event| {
+                let _ = tx.send(event);
+            },
+        )?;
+        while let Ok(event) = rx.recv() {
+            log.log("catch", serde_json::json!({ "kind": format!("{event:?}") }));
+            match event {
+                CatchEvent::Mapped => println!("MAPPED near {},{}", near.0, near.1),
+                CatchEvent::Entered { .. } => {}
+                CatchEvent::Dropped { uris, portal_key } => {
+                    log.log(
+                        "caught",
+                        serde_json::json!({ "uris": uris.iter().map(|u| u.display().to_string()).collect::<Vec<_>>(), "portal_key": portal_key }),
+                    );
+                    break;
+                }
+                CatchEvent::Cancelled(_) => break,
+            }
+        }
+        drop(session);
+        Ok(())
+    }
+
+    fn pilot(dir: PathBuf) -> Result<()> {
+        gtk4::init().map_err(|e| anyhow!("gtk init: {e}"))?;
+        std::fs::create_dir_all(&dir)?;
+        let log = PilotLog::new(&dir.join("pilot.jsonl"))?;
+        let offer_id = FileOfferId::new();
+        let (tree, source, mount) = pilot_backing(&dir, &log, offer_id)?;
 
         let names: Vec<String> = tree.manifest.roots().map(|r| r.name.clone()).collect();
         let total_size: u64 = tree
@@ -127,7 +258,7 @@ fn main() -> anyhow::Result<()> {
         };
 
         let arm_view = {
-            let mount = Rc::clone(&mount);
+            let mount = Arc::clone(&mount);
             let source = Arc::clone(&source);
             let tree = Rc::clone(&tree);
             Rc::new(move || {
@@ -210,7 +341,7 @@ fn main() -> anyhow::Result<()> {
                 })
             },
             drop_performed: {
-                let mount = Rc::clone(&mount);
+                let mount = Arc::clone(&mount);
                 let log = Arc::clone(&log);
                 Rc::new(move |view| {
                     let recorded = mount.drop_performed(view);
@@ -221,7 +352,7 @@ fn main() -> anyhow::Result<()> {
                 })
             },
             drag_cancelled: {
-                let mount = Rc::clone(&mount);
+                let mount = Arc::clone(&mount);
                 let source = Arc::clone(&source);
                 let log = Arc::clone(&log);
                 Rc::new(move |view| {
@@ -239,7 +370,7 @@ fn main() -> anyhow::Result<()> {
                 })
             },
             drag_finished: {
-                let mount = Rc::clone(&mount);
+                let mount = Arc::clone(&mount);
                 let log = Arc::clone(&log);
                 Rc::new(move |view| {
                     log.log(
@@ -266,7 +397,7 @@ fn main() -> anyhow::Result<()> {
                 })
             },
             receive: {
-                let mount = Rc::clone(&mount);
+                let mount = Arc::clone(&mount);
                 let source = Arc::clone(&source);
                 let tree = Rc::clone(&tree);
                 let log = Arc::clone(&log);
@@ -336,7 +467,7 @@ fn main() -> anyhow::Result<()> {
                 })
             },
             save_to: {
-                let mount = Rc::clone(&mount);
+                let mount = Arc::clone(&mount);
                 let source = Arc::clone(&source);
                 let tree = Rc::clone(&tree);
                 let log = Arc::clone(&log);
@@ -444,6 +575,30 @@ fn main() -> anyhow::Result<()> {
             shelf,
             clipboard_published: published,
         };
+        let motion = gtk4::EventControllerMotion::new();
+        let pointer_log = Arc::clone(&log);
+        motion.connect_motion(move |_, x, y| {
+            pointer_log.log("pointer", serde_json::json!({ "x": x, "y": y }));
+        });
+        ui.shelf.window().add_controller(motion);
+        let bounds_shelf = Rc::clone(&ui.shelf);
+        let bounds_log = Arc::clone(&log);
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            let bounds = bounds_shelf
+                .offer_row_widget(offer_id)
+                .and_then(|widget| widget.compute_bounds(bounds_shelf.window()));
+            if let Some(bounds) = bounds {
+                bounds_log.log(
+                    "offer_row",
+                    serde_json::json!({
+                        "x": bounds.x(),
+                        "y": bounds.y(),
+                        "width": bounds.width(),
+                        "height": bounds.height(),
+                    }),
+                );
+            }
+        });
         helper::run_window(&ui);
         Ok(())
     }

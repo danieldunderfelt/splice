@@ -49,23 +49,82 @@ at the FUSE view already used by the shelf, empty the input region, and keep inj
 forwarded motion. The carried release drops. This reuses the existing FUSE view, the deferred
 read gate, and the transfer service unchanged.
 
-## GNOME / Mutter: NOT RUN
+## GNOME Shell 50.4 / Mutter 50.4 (this machine, Fedora 44, Wayland): YES, with one change
 
-No GNOME session was reachable (aidev refused SSH; no GNOME on gamedev). Run 2 above shows
-the layer-shell-free origin shape works on KWin; whether Mutter (a) delivers a libei or
-uinput button to a fullscreen client toplevel with a serial it will honour in `start_drag`,
-and (b) lets an input-region-empty fullscreen window pass drag targeting to windows beneath,
-is still open. Run the same binary with `--mode toplevel` on a GNOME Wayland session:
+Run 2026-09-11 on the GNOME machine (3840x2160, scale 1) with the same binary in `--mode toplevel`
+and the same uinput device shape. Nautilus 50.2.2, GTK 4.22. No Splice service was running.
+
+| Run | Origin handling after `start_drag` | Target | Result |
+|---|---|---|---|
+| 4 | Input region emptied (the KWin recipe) | Fullscreen GTK4 `DropTarget(FileList)` | Drag left the origin and never entered anything else; every `target` was null; release cancelled the source |
+| 5 | Input region kept (control) | Same | Drag stayed on the origin, drop landed on the origin; Mutter's drag machinery accepts the injected press serial |
+| 6 | Origin toplevel unmapped (null buffer attach + commit) | Same | Drop received, both files read back with matching SHA-256 |
+| 7 | Input region emptied | Maximized GTK4 target instead of fullscreen | Same failure as run 4 |
+| 8 | Origin unmapped | Real Nautilus window, maximized, on an empty folder | Nautilus copied both files into the folder, SHA-256 match, no drop menu |
+
+Observed mechanics on Mutter:
+
+- Mutter delivers the injected `wl_pointer.button` with a serial it honours in `start_drag` (a).
+- Emptying the origin's input region does not re-route drag targeting on Mutter (b fails). The
+  fallback from the previous section works: unmap the origin right after `start_drag`. Mutter only
+  ends a drag when the origin *resource is destroyed* (`destroy_data_device_origin` in
+  `meta-wayland-data-device.c`); an unmapped-but-alive surface keeps the grab, and the next injected
+  motion repicks the window beneath. Keep the `wl_surface` alive until `dnd_finished`/`cancelled`.
+- The fullscreen origin takes activation while mapped. The window beneath got `is-active` back when
+  the drag ended, not at unmap time, so a transparent origin costs a brief focus change and nothing
+  visible.
+- Nautilus reads `text/uri-list` during hover and copies on release with the Copy action. No menu.
+
+Source half on GNOME (no layer-shell strip to receive the drag at the edge): run 9 used
+`--mode catch` against `source.py`, a fullscreen GTK4 `DragSource` offering a file list. The
+injector pressed on the GTK source and moved past the drag threshold. The spike then created and
+committed a fullscreen toplevel *during* the foreign drag. Mutter delivered `wl_data_device.enter`
+to the new surface within 90 ms of the commit (offer types: `application/x-gtk-local-dnd`,
+`text/plain;charset=utf-8`, `text/uri-list`, `application/vnd.portal.filetransfer`,
+`application/vnd.portal.files`). The spike accepted `text/uri-list`, the injected release produced
+`drop`, `receive` returned both URIs, and the GTK source saw `drag-end` with the Copy action.
+
+Implication for GNOME: the same continuous design works with two substitutions. Destination side,
+the origin is a fully transparent fullscreen toplevel that is unmapped after `start_drag` instead
+of having its input region emptied. Source side, when a held-button crossing is detected with a
+native drag in flight, mapping a transparent fullscreen toplevel under the cursor is enough to
+become the drop target and read the file list, so GNOME does not need an edge strip to capture
+the selection. What is still unverified on GNOME is the interaction with the InputCapture portal:
+whether a portal barrier fires during a native drag and whether the drag survives the capture
+activation/release around it. That needs the real Splice capture path, not this spike.
 
 ```
 cd spikes/wayland-drag-attach && cargo build
 python3 target.py &            # fullscreen GTK4 drop target
-./target/debug/wayland-drag-attach --mode toplevel --screen W H --origin X Y --target X2 Y2 /path/a /path/b
+./target/debug/wayland-drag-attach --mode toplevel --unmap --screen 3840 2160 --origin 1500 600 --target 1500 1500 /tmp/a /tmp/b
+python3 source.py /tmp/a /tmp/b &   # fullscreen GTK4 drag source
+./target/debug/wayland-drag-attach --mode catch --screen 3840 2160 --origin 1500 600 --target 1500 1500 /tmp/a /tmp/b
 ```
 
-If (b) fails on Mutter, the fallback is to unmap the origin toplevel right after `start_drag`
-instead of emptying its input region, and if that cancels the drag, GNOME keeps the
-two-gesture shelf flow.
+### Carried into Splice the same day
+
+`crates/splice-platform/src/linux/dragattach.rs` implements both halves as library calls.
+`attach` maps the origin at the entry point (layer-shell where the global exists, fullscreen
+toplevel otherwise), sends `start_drag` on the carried press, then empties the input region or
+unmaps the toplevel. `catch` maps a fullscreen catcher that accepts `text/uri-list`, reads it
+and the portal key at the drop and finishes the offer. `splice-files --pilot-attach <dir> <x> <y>`
+and `splice-files --pilot-catch <dir> <x> <y>` drive them against a real deferred FUSE view.
+Results on this GNOME machine, Nautilus maximized behind the origin, input from uinput:
+
+| Pilot | Result |
+|---|---|
+| `--pilot-attach` at 1500,600; press, glide, release over Nautilus | `Armed(FullscreenToplevel)`, `Started`, `Dropped` (gate opened), `Finished`; one commit on Nautilus's first read; both files copied, SHA-256 match; the two pre-drop reads were denied |
+| `--pilot-catch` mapped 3 s into a GTK drag from `source.py` | `Entered` 200 ms after mapping, `Dropped` with both URIs and GTK's portal key; the source ended with Copy |
+
+Two things the spike hid. Mutter's first `xdg_toplevel.configure` carries no size, so the origin
+sizes itself to the chosen output or it maps as 200x200 nowhere near the pointer. GTK's portal
+key arrives NUL-terminated. The module handles both.
+
+Not wired yet, and not GNOME-specific: the engine replays the held button right after
+`Frame::Enter`, so the destination must start `attach` and wait for `Armed` before that replay;
+the crossing must carry the offer id; and the source side must start `catch` (or hand the KDE
+strip the drag) before capture activates. The InputCapture portal's behaviour during a native
+drag is the one remaining GNOME unknown.
 
 ## macOS: NOT RUN
 
@@ -88,6 +147,7 @@ through Splice; the posted events would fight the injector.
 ## Fallback ladder
 
 1. KDE, wlroots (sway, Hyprland, niri), COSMIC: layer-shell origin, confirmed on KWin.
-2. GNOME: fullscreen toplevel origin, pending Mutter verification.
+2. GNOME: fullscreen toplevel origin unmapped after `start_drag`, confirmed on Mutter 50.4 with
+   GTK4 and Nautilus. Mapping a fullscreen toplevel mid-drag also captures a foreign drag.
 3. Any compositor where neither works: the existing two-gesture shelf flow.
 4. macOS: AppKit panel plus promise providers, pending Finder verification.
