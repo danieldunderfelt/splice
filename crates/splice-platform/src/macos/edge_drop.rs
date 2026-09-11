@@ -54,6 +54,9 @@ define_class!(
             let copy = sender.draggingSourceOperationMask().contains(NSDragOperation::Copy);
             if iv.enabled.get() && has_files && copy {
                 super::set_file_drag_at_edge(true);
+                if let Some(window) = self.window() {
+                    window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(0.23, 0.51, 0.96, 0.6)));
+                }
                 iv.label
                     .setStringValue(&NSString::from_str(&format!("Release to send to {}", iv.recipient.name)));
                 NSDragOperation::Copy
@@ -79,7 +82,7 @@ define_class!(
         #[unsafe(method(draggingExited:))]
         fn exited(&self, _sender: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
             super::set_file_drag_at_edge(false);
-            self.ivars().label.setStringValue(&NSString::from_str(""));
+            self.clear_feedback();
         }
 
         #[unsafe(method(prepareForDragOperation:))]
@@ -94,31 +97,40 @@ define_class!(
         #[unsafe(method(performDragOperation:))]
         fn perform(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
             super::set_file_drag_at_edge(false);
+            self.clear_feedback();
             let iv = self.ivars();
-            if !iv.enabled.get() {
-                return false;
-            }
-            let pb = sender.draggingPasteboard();
-            let Some(selection) = super::files::read_file_urls(&pb) else {
-                return false;
+            let selection = if iv.enabled.get() {
+                super::files::read_file_urls(&sender.draggingPasteboard())
+            } else {
+                None
             };
-            iv.ctx.emit(FileEvent::SourceSelected {
-                paths: selection.paths,
-                recipient: iv.recipient.id.clone(),
-                gesture: SourceGesture::NativeDrop,
-                lease: selection.lease,
-            })
+            match selection {
+                Some(selection) => iv.ctx.emit(FileEvent::SourceSelected {
+                    paths: selection.paths,
+                    recipient: iv.recipient.id.clone(),
+                    gesture: SourceGesture::NativeDrop,
+                    lease: selection.lease,
+                }),
+                None => false,
+            }
         }
 
         #[unsafe(method(concludeDragOperation:))]
         fn conclude(&self, _sender: Option<&ProtocolObject<dyn NSDraggingInfo>>) {
             super::set_file_drag_at_edge(false);
-            self.ivars().label.setStringValue(&NSString::from_str(""));
+            self.clear_feedback();
         }
     }
 );
 
 impl EdgeDropView {
+    fn clear_feedback(&self) {
+        self.ivars().label.setStringValue(&NSString::from_str(""));
+        if let Some(window) = self.window() {
+            window.setBackgroundColor(Some(&NSColor::clearColor()));
+        }
+    }
+
     fn new(mtm: MainThreadMarker, ctx: Arc<ShelfCtx>, recipient: Recipient, frame: NSRect) -> Retained<Self> {
         let label = NSTextField::labelWithString(&NSString::from_str(""), mtm);
         label.setTextColor(Some(&NSColor::whiteColor()));
@@ -173,7 +185,7 @@ impl EdgeDropPanels {
             );
             unsafe { panel.setReleasedWhenClosed(false) };
             panel.setOpaque(false);
-            panel.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(0.23, 0.51, 0.96, 0.16)));
+            panel.setBackgroundColor(Some(&NSColor::clearColor()));
             panel.setHasShadow(false);
             panel.setHidesOnDeactivate(false);
             panel.setLevel(objc2_app_kit::NSFloatingWindowLevel);
