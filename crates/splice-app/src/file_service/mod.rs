@@ -750,6 +750,9 @@ impl Runner {
                         info.phase = Phase::Dragging;
                         let offer = info.offer;
                         let receipt = info.receipt;
+                        if let Some(mount) = &self.mount {
+                            mount.drag_started(view);
+                        }
                         if let Some(state) = self.clients.get_mut(&client) {
                             if state.armed.get(&offer) == Some(&view) {
                                 state.armed.remove(&offer);

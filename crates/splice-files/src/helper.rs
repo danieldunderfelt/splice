@@ -514,6 +514,7 @@ impl Shelf {
             let view_errors = Rc::clone(&self.view_errors);
             let error = Rc::new(move || view_errors.borrow().get(&offer_id).cloned());
             self.attach_drag(&column, take, rearm, error);
+            (self.hooks.arm_view)(offer_id);
         }
         OfferRow {
             widget: column.upcast(),
@@ -574,6 +575,7 @@ impl Shelf {
             let rearm = Rc::new(move || (hooks.arm_receipt_view)(rearm_key.clone()));
             let error = Rc::new(|| -> Option<String> { None });
             self.attach_drag(&column, take, rearm, error);
+            (self.hooks.arm_receipt_view)(key.clone());
         }
         ReceiptRow {
             widget: column.upcast(),

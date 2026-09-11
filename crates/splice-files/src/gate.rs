@@ -17,18 +17,21 @@ pub enum CancelOutcome {
 #[derive(Debug)]
 pub struct Gate {
     state: ViewState,
+    dragging: bool,
 }
 
 impl Gate {
     pub fn new() -> Self {
         Self {
             state: ViewState::Offered,
+            dragging: false,
         }
     }
 
     pub fn committed() -> Self {
         Self {
             state: ViewState::Committed,
+            dragging: false,
         }
     }
 
@@ -36,10 +39,21 @@ impl Gate {
         self.state
     }
 
+    pub fn drag_started(&mut self) {
+        if self.state == ViewState::Offered {
+            self.dragging = true;
+        }
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
     pub fn drop_performed(&mut self) -> bool {
         match self.state {
             ViewState::Offered => {
                 self.state = ViewState::DroppedAwaitingRead;
+                self.dragging = false;
                 true
             }
             _ => false,
@@ -59,6 +73,7 @@ impl Gate {
     }
 
     pub fn cancel(&mut self) -> CancelOutcome {
+        self.dragging = false;
         match self.state {
             ViewState::Offered | ViewState::DroppedAwaitingRead => {
                 self.state = ViewState::Retired;
@@ -74,6 +89,7 @@ impl Gate {
 
     pub fn retire(&mut self) {
         self.state = ViewState::Retired;
+        self.dragging = false;
     }
 }
 
@@ -159,6 +175,30 @@ mod tests {
         assert!(!gate.drop_performed());
         gate.cancel();
         assert!(!gate.drop_performed());
+    }
+
+    #[test]
+    fn drag_started_marks_only_offered_views_and_clears_on_leaving_offered() {
+        let mut gate = Gate::new();
+        assert!(!gate.is_dragging());
+        gate.drag_started();
+        assert!(gate.is_dragging());
+        assert!(gate.drop_performed());
+        assert!(!gate.is_dragging());
+
+        let mut committed = Gate::committed();
+        committed.drag_started();
+        assert!(!committed.is_dragging());
+
+        let mut cancelled = Gate::new();
+        cancelled.drag_started();
+        cancelled.cancel();
+        assert!(!cancelled.is_dragging());
+
+        let mut retired = Gate::new();
+        retired.drag_started();
+        retired.retire();
+        assert!(!retired.is_dragging());
     }
 
     #[test]

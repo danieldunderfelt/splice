@@ -1,0 +1,13 @@
+[package]
+name = "wayland-drag-attach"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+evdev = { version = "0.13", features = ["tokio"] }
+smithay-client-toolkit = { version = "0.19.2", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"

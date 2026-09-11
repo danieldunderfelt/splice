@@ -5,7 +5,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
@@ -20,6 +20,7 @@ use crate::gate::{CancelOutcome, Gate, ReadDecision};
 
 const TTL: Duration = Duration::from_secs(1);
 const MAX_READ: usize = 1024 * 1024;
+const DROP_SETTLE: Duration = Duration::from_millis(250);
 
 pub const DEFAULT_WORKERS: usize = 4;
 pub const DEFAULT_QUEUE: usize = 64;
@@ -36,6 +37,7 @@ struct ReadJob {
     offset: u64,
     size: u32,
     reply: ReplyData,
+    await_drop: bool,
 }
 
 struct View {
@@ -44,6 +46,7 @@ struct View {
     dir_ino: u64,
     entry_inos: HashMap<EntryId, u64>,
     gate: Mutex<Gate>,
+    drop_signal: Condvar,
     lifecycle: Mutex<()>,
     cache: Mutex<HashMap<EntryId, PathBuf>>,
     materializing: Mutex<HashSet<EntryId>>,
@@ -160,6 +163,7 @@ impl Mount {
             dir_ino,
             entry_inos,
             gate: Mutex::new(gate),
+            drop_signal: Condvar::new(),
             lifecycle: Mutex::new(()),
             cache: Mutex::new(HashMap::new()),
             materializing: Mutex::new(HashSet::new()),
@@ -193,6 +197,12 @@ impl Mount {
         Some(self.inner.views.read().get(&view)?.gate.lock().state())
     }
 
+    pub fn drag_started(&self, view: ViewId) {
+        if let Some(view) = self.inner.views.read().get(&view).cloned() {
+            view.gate.lock().drag_started();
+        }
+    }
+
     pub fn drop_performed(&self, view: ViewId) -> bool {
         let views = self.inner.views.read();
         let Some(view) = views.get(&view).cloned() else {
@@ -200,6 +210,7 @@ impl Mount {
         };
         drop(views);
         let performed = view.gate.lock().drop_performed();
+        view.drop_signal.notify_all();
         performed
     }
 
@@ -218,6 +229,7 @@ impl Mount {
             }
             outcome
         };
+        view.drop_signal.notify_all();
         drop(views);
         if outcome != CancelOutcome::AlreadyRetired {
             self.remove_view(view.id);
@@ -228,6 +240,7 @@ impl Mount {
     pub fn retire_view(&self, view: ViewId) {
         if let Some(view) = self.inner.views.read().get(&view).cloned() {
             view.gate.lock().retire();
+            view.drop_signal.notify_all();
         }
         self.remove_view(view);
     }
@@ -244,6 +257,7 @@ impl Mount {
         }
         for view in &held {
             view.gate.lock().retire();
+            view.drop_signal.notify_all();
         }
         drop(guards);
         for view in &held {
@@ -333,8 +347,49 @@ fn drain_queue(rx: &Mutex<std::sync::mpsc::Receiver<ReadJob>>) {
     }
 }
 
+fn decide(inner: &MountInner, view: &Arc<View>) -> ReadDecision {
+    let _lifecycle = view.lifecycle.lock();
+    let decision = view.gate.lock().on_read();
+    if decision == ReadDecision::Commit {
+        view.commits.fetch_add(1, Ordering::Relaxed);
+        inner.content.on_commit(view.id);
+    }
+    decision
+}
+
+fn await_drop(view: &View) {
+    let mut gate = view.gate.lock();
+    let deadline = Instant::now() + DROP_SETTLE;
+    while gate.state() == ViewState::Offered && gate.is_dragging() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || view.drop_signal.wait_for(&mut gate, remaining).timed_out() {
+            break;
+        }
+    }
+}
+
 fn serve_read(inner: &MountInner, job: ReadJob) {
-    let ReadJob { view, entry, offset, size, reply } = job;
+    let ReadJob { view, entry, offset, size, reply, await_drop: wait } = job;
+    if wait {
+        await_drop(&view);
+        match decide(inner, &view) {
+            ReadDecision::Deny => {
+                view.denied_reads.fetch_add(1, Ordering::Relaxed);
+                reply.error(libc::EIO);
+                return;
+            }
+            ReadDecision::Commit | ReadDecision::Serve => {
+                let Some(meta) = view.manifest.entry(entry) else {
+                    reply.error(libc::EIO);
+                    return;
+                };
+                if meta.kind != EntryKind::File || meta.size == 0 {
+                    reply.data(&[]);
+                    return;
+                }
+            }
+        }
+    }
     let path = match ensure_materialized(inner, &view, entry) {
         Ok(path) => path,
         Err(()) => {
@@ -492,6 +547,14 @@ impl ViewFs {
 
     fn view(&self, id: ViewId) -> Option<Arc<View>> {
         self.inner.views.read().get(&id).cloned()
+    }
+
+    fn enqueue(&self, job: ReadJob) {
+        match self.inner.queue.try_send(job) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(job)) => job.reply.error(libc::EAGAIN),
+            Err(std::sync::mpsc::TrySendError::Disconnected(job)) => job.reply.error(libc::EIO),
+        }
     }
 
     fn entry_node<'a>(&self, view: &'a View, entry: EntryId) -> Option<(u64, &'a FileEntry)> {
@@ -668,16 +731,27 @@ impl Filesystem for ViewFs {
             return;
         };
         view.reads.fetch_add(1, Ordering::Relaxed);
-        let decision = {
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
+        }
+        let awaiting_drop = {
             let _lifecycle = view.lifecycle.lock();
-            let decision = view.gate.lock().on_read();
-            if decision == ReadDecision::Commit {
-                view.commits.fetch_add(1, Ordering::Relaxed);
-                self.inner.content.on_commit(view.id);
-            }
-            decision
+            let gate = view.gate.lock();
+            gate.state() == ViewState::Offered && gate.is_dragging()
         };
-        match decision {
+        if awaiting_drop {
+            self.enqueue(ReadJob {
+                view: Arc::clone(&view),
+                entry,
+                offset: offset as u64,
+                size: (size as usize).min(MAX_READ) as u32,
+                reply,
+                await_drop: true,
+            });
+            return;
+        }
+        match decide(&self.inner, &view) {
             ReadDecision::Deny => {
                 view.denied_reads.fetch_add(1, Ordering::Relaxed);
                 reply.error(libc::EIO);
@@ -691,22 +765,14 @@ impl Filesystem for ViewFs {
                     reply.data(&[]);
                     return;
                 }
-                if offset < 0 {
-                    reply.error(libc::EINVAL);
-                    return;
-                }
-                let job = ReadJob {
+                self.enqueue(ReadJob {
                     view: Arc::clone(&view),
                     entry,
                     offset: offset as u64,
                     size: (size as usize).min(MAX_READ) as u32,
                     reply,
-                };
-                match self.inner.queue.try_send(job) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(job)) => job.reply.error(libc::EAGAIN),
-                    Err(std::sync::mpsc::TrySendError::Disconnected(job)) => job.reply.error(libc::EIO),
-                }
+                    await_drop: false,
+                });
             }
         }
     }
@@ -910,6 +976,32 @@ mod tests {
         assert_eq!(stats.commits, 1);
         assert!(stats.denied_reads >= 2);
         assert!(stats.bytes_served >= fx.content.len() as u64);
+    }
+
+    #[test]
+    fn read_racing_ahead_of_a_started_drag_waits_for_the_drop_then_commits() {
+        let Some(fx) = fixture() else { return };
+        let (view, path) = fx.new_view();
+        fx.mount.drag_started(view);
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || std::fs::read(&reader_path));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(fx.source.commits.load(Ordering::Relaxed), 0);
+        assert!(fx.mount.drop_performed(view));
+        let data = reader.join().unwrap().unwrap();
+        assert_eq!(data, fx.content);
+        assert_eq!(fx.source.commits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn read_during_a_drag_that_never_drops_times_out_and_denies() {
+        let Some(fx) = fixture() else { return };
+        let (view, path) = fx.new_view();
+        fx.mount.drag_started(view);
+        let err = std::fs::read(&path).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert_eq!(fx.source.commits.load(Ordering::Relaxed), 0);
+        assert_eq!(fx.mount.view_state(view), Some(ViewState::Offered));
     }
 
     #[test]
