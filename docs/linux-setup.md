@@ -16,6 +16,14 @@ window shows what is active and lets you force a choice; a change takes effect i
 
 ## Install Splice
 
+The deb, rpm, and per-user routes compile Splice on this machine, so install the build
+dependencies first: a C toolchain, `pkg-config`, and the development packages for GTK4 4.10 or
+newer, FUSE 3, Wayland, xkbcommon, libudev, D-Bus, EGL and X11. The
+[build dependencies section of the README](../README.md#build-dependencies) has the exact command
+per distribution; without the FUSE 3 development package the build fails in the `fuser` crate.
+`makepkg` installs the same set from the PKGBUILD, and the Flatpak build brings its own inside the
+GNOME SDK.
+
 Use a distribution package when you can; each one installs the binary, the desktop entry, the
 `app-splice.service` user unit, and the udev rule for input-device access.
 
@@ -41,11 +49,14 @@ Arch and derivatives:
 cd packaging/arch && makepkg -si
 ```
 
-Flatpak, for SteamOS, Bazzite, Silverblue and other immutable systems (needs `flatpak-builder`):
+Flatpak, for SteamOS, Bazzite, Silverblue and other immutable systems (needs `flatpak-builder`).
+The build runs inside the GNOME 50 SDK, and `--install-deps-from=flathub` pulls that runtime, its
+SDK, and the Rust extension the manifest builds with:
 
 ```sh
 packaging/flatpak/generate-sources.sh
-flatpak-builder --user --install --force-clean build-dir packaging/flatpak/io.github.danieldunderfelt.Splice.yml
+flatpak-builder --user --install --force-clean --install-deps-from=flathub \
+    build-dir packaging/flatpak/io.github.danieldunderfelt.Splice.yml
 ```
 
 A Flatpak cannot install host udev rules, so add them yourself once (works on immutable
@@ -93,7 +104,7 @@ to it, unless started from a terminal. Flatpak installs cannot register a system
 
 ## File sharing
 
-The file shelf uses GTK4 and runs in a separate process from the same `splice` executable. Install FUSE3 and make `/dev/fuse` available for deferred file drags. The service owns a private read-only mount under `$XDG_RUNTIME_DIR/splice/mnt`; the shelf opens only when requested with `splice files`, the Files button, or its tray action.
+The file shelf uses GTK4 and runs in a separate process from the same `splice` executable. Deferred file drags need the `fuse3` package for its `fusermount3` binary and a usable `/dev/fuse`; the distribution packages depend on `fuse3` already, a build from source does not. The service owns a private read-only mount under `$XDG_RUNTIME_DIR/splice/mnt`; the shelf opens only when requested with `splice files`, the Files button, or its tray action.
 
 Read [sharing files](file-sharing.md) for copy/paste and drag handoff. Native handoff acceptance on individual file managers remains in [the validation matrix](file-handoff-validation.md). The Flatpak build includes the shelf and uses the GNOME 50 runtime for GTK4. Deferred file drags require a host FUSE mount and are not supported by the current Flatpak sandbox configuration. Use a host installation for file handoff validation.
 

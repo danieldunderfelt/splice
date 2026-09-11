@@ -15,6 +15,49 @@ Install these on every computer that will run Splice:
 
 On Linux, use a Wayland session. Splice picks the best capture, injection and clipboard implementation your compositor offers, and the window lets you switch. See [the Linux setup guide](docs/linux-setup.md) for the support table, the udev rule, and troubleshooting.
 
+### Build dependencies
+
+macOS needs the Xcode command line tools:
+
+```sh
+xcode-select --install
+```
+
+Linux needs a C toolchain, `pkg-config`, and the development packages for GTK4 4.10 or newer, FUSE 3, Wayland, xkbcommon, libudev, D-Bus, EGL and X11. GTK4 is for the file shelf, FUSE 3 for the read-only mount behind deferred file drags, and the rest for the window and the input backends. The `fuse3` package belongs on the list as well: the mount runs through its `fusermount3` binary at run time.
+
+Debian, Ubuntu, Mint:
+
+```sh
+sudo apt install build-essential pkg-config libgtk-4-dev libfuse3-dev fuse3 \
+  libwayland-dev libxkbcommon-dev libudev-dev libdbus-1-dev libegl1-mesa-dev \
+  libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev
+```
+
+Fedora, RHEL, and other RPM distributions:
+
+```sh
+sudo dnf install gcc pkgconf-pkg-config gtk4-devel fuse3-devel fuse3 \
+  wayland-devel libxkbcommon-devel systemd-devel dbus-devel mesa-libEGL-devel \
+  libX11-devel libXi-devel libXcursor-devel libXrandr-devel libXinerama-devel
+```
+
+openSUSE:
+
+```sh
+sudo zypper install gcc pkgconf-pkg-config gtk4-devel fuse3-devel fuse3 \
+  wayland-devel libxkbcommon-devel systemd-devel dbus-1-devel Mesa-libEGL-devel \
+  libX11-devel libXi-devel libXcursor-devel libXrandr-devel libXinerama-devel
+```
+
+Arch, CachyOS, EndeavourOS:
+
+```sh
+sudo pacman -S --needed base-devel gtk4 fuse3 wayland libxkbcommon systemd-libs \
+  dbus libglvnd mesa libx11 libxi libxcursor libxrandr libxinerama
+```
+
+FUSE 3 is the most recent addition, so a machine that built Splice before file drag and drop landed needs that package added. Without it the build stops in the `fuser` crate with `The system library fuse3 required by crate fuser was not found`; a missing GTK4 development package stops it in `gtk4-sys` the same way.
+
 ## Run from source
 
 From the repository root, run the desktop app:
@@ -47,7 +90,18 @@ Build the optimized desktop binary:
 cargo build -p splice-app --release --locked
 ```
 
-The binary is written to `target/release/splice`. On Linux the same executable also runs the GTK4 file shelf in a separate process. Linux builds require GTK4 4.10 or newer and FUSE3 development libraries.
+The binary is written to `target/release/splice`. On Linux the same executable also runs the GTK4 file shelf in a separate process, so a Linux build needs the [build dependencies](#build-dependencies) installed first: GTK4 4.10 or newer, FUSE 3, and the Wayland, xkbcommon, libudev, D-Bus, EGL and X11 development packages.
+
+CI builds every target with Rust 1.98.0 and runs these checks; run them before pushing:
+
+```sh
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test -p splice-core --release --test engine_e2e --locked
+python3 -m unittest discover -s packaging/tests -v
+```
+
+Run the tests as your own user, not as root. A few file-ownership tests make a directory unreadable and expect the read to fail, and root is never refused.
 
 ### Build a macOS app
 
