@@ -21,6 +21,7 @@
 
 pub mod cursor;
 pub mod displays;
+pub mod edge_drop;
 pub mod ffi;
 pub mod files;
 pub mod inject;
@@ -52,6 +53,20 @@ pub struct MacShared {
     tx: UnboundedSender<PlatformEvent>,
     pub displays: RwLock<Vec<DisplayRect>>,
     health: Mutex<HealthReport>,
+}
+
+/// Set while a native file drag is hovering an edge drop panel, so the event tap does not
+/// mistake the drag reaching the boundary for an ordinary input crossing.
+static FILE_DRAG_AT_EDGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks whether a native file drag is currently over an edge drop panel.
+pub fn set_file_drag_at_edge(active: bool) {
+    FILE_DRAG_AT_EDGE.store(active, std::sync::atomic::Ordering::Release);
+}
+
+/// True while a native file drag hovers an edge drop panel.
+pub fn file_drag_at_edge() -> bool {
+    FILE_DRAG_AT_EDGE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl MacShared {

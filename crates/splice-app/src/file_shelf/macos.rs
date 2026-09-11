@@ -50,6 +50,7 @@ async fn run(context: Arc<ContextState>, mut events: tokio::sync::mpsc::Receiver
     let mut ticker = tokio::time::interval(Duration::from_millis(150));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last = None;
+    let mut last_edge_targets: Vec<native::EdgeTarget> = Vec::new();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -150,6 +151,11 @@ async fn run(context: Arc<ContextState>, mut events: tokio::sync::mpsc::Receiver
         if last.as_ref() != Some(&snapshot) {
             context.shelf.sync(snapshot.clone());
             last = Some(snapshot);
+        }
+        let targets = edge_targets(&ui.borrow());
+        if targets != last_edge_targets {
+            context.shelf.set_edge_targets(targets.clone());
+            last_edge_targets = targets;
         }
     }
     jobs.abort_all();
@@ -262,6 +268,28 @@ fn pin_ready(context: &Arc<ContextState>, state: &core::FileState, jobs: &mut Jo
             }
         });
     }
+}
+
+fn edge_targets(ui: &splice_core::UiState) -> Vec<native::EdgeTarget> {
+    ui.edge_targets
+        .iter()
+        .filter(|target| target.crossable)
+        .map(|target| native::EdgeTarget {
+            recipient: native::Recipient {
+                id: target.target.clone(),
+                name: ui
+                    .machines
+                    .iter()
+                    .find(|machine| machine.id == target.target)
+                    .map(|machine| machine.hostname.clone())
+                    .unwrap_or_else(|| target.target.0.clone()),
+            },
+            side: target.side,
+            at: target.at,
+            from: target.from,
+            to: target.to,
+        })
+        .collect()
 }
 
 fn snapshot(context: &ContextState, ui: &splice_core::UiState, files: &core::FileState) -> native::ShelfSnapshot {

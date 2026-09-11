@@ -399,9 +399,21 @@ pub enum FileEvent {
     },
 }
 
+/// An armed screen edge that accepts native file drags, in local logical coordinates
+/// like [`crate::EdgeSpec`]. Files released there are offered to `recipient`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeTarget {
+    pub recipient: Recipient,
+    pub side: crate::EdgeSide,
+    pub at: i32,
+    pub from: i32,
+    pub to: i32,
+}
+
 pub trait FileShelf: Send + Sync {
     fn sync(&self, snapshot: ShelfSnapshot);
     fn set_visible(&self, visible: bool);
+    fn set_edge_targets(&self, targets: Vec<EdgeTarget>);
     fn publish_clipboard_files(
         &self,
         selection: ReceivedSelection,

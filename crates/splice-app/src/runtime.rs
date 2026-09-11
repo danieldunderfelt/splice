@@ -473,6 +473,7 @@ pub mod preview {
                 ),
             ],
             edges: Vec::new(),
+            edge_targets: Vec::new(),
             source: Some(self_id),
             focus: UiFocus::Local,
             health: HealthReport {

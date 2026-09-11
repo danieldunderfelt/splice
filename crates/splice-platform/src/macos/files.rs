@@ -275,6 +275,11 @@ impl FileShelf for MacFileShelf {
         on_main(move || shelf::with_ui(&ctx, |ui| ui.set_visible_by_user(visible)));
     }
 
+    fn set_edge_targets(&self, targets: Vec<crate::file_shelf::EdgeTarget>) {
+        let ctx = self.ctx.clone();
+        on_main(move || shelf::with_ui(&ctx, |ui| ui.set_edge_targets(targets)));
+    }
+
     fn publish_clipboard_files(
         &self,
         selection: ReceivedSelection,

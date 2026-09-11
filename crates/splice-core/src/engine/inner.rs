@@ -579,6 +579,7 @@ impl Inner {
                 }
             }
             PlatformEvent::Capture(CaptureEvent::Panic) => self.panic().await,
+            PlatformEvent::FileDrop { edge_id, items } => self.on_file_drop(edge_id, items),
             PlatformEvent::PhysicalActivity => {
                 if !self.cfg.master_enabled || !self.machine_enabled(&self.self_info.id) {
                     return;
@@ -625,6 +626,69 @@ impl Inner {
 
     async fn on_edge_hit(&mut self, edge_id: u32, along: f64) {
         self.begin_edge(edge_id, along, false).await;
+    }
+
+    /// Files released on an armed edge become an offer to the machine behind that edge.
+    /// Nothing is transferred until the other side accepts the offer.
+    fn on_file_drop(
+        &mut self,
+        edge_id: u32,
+        items: Vec<(PathBuf, Option<Arc<std::fs::File>>)>,
+    ) {
+        let Some(link) = self.armed.get(edge_id as usize).cloned() else {
+            tracing::warn!(edge_id, "files dropped on an unknown edge");
+            return;
+        };
+        let target = link.to.clone();
+        let name = self
+            .peers
+            .get(&target)
+            .and_then(|peer| peer.hostname.clone())
+            .unwrap_or_else(|| target.0.clone());
+        let block = if !self.cfg.master_enabled {
+            Some("master disabled")
+        } else if !self.machine_enabled(&self.self_info.id) {
+            Some("self disabled in layout")
+        } else if !self.machine_enabled(&target) {
+            Some("target disabled in layout")
+        } else if !self.peer_usable(&target) || !self.links.contains(&link) {
+            Some("target not connected")
+        } else if !self.peer_has_files(&target) {
+            Some("target has no file sharing")
+        } else if !self.files.handle.summary().borrow().enabled {
+            Some("file sharing disabled")
+        } else {
+            None
+        };
+        if let Some(reason) = block {
+            tracing::warn!(target = %name, reason, "files dropped on an edge that cannot take them");
+            return;
+        }
+        let selection = match crate::files::LocalSelection::from_descriptors(items) {
+            Ok(selection) => selection,
+            Err(error) => {
+                tracing::warn!(error, target = %name, "edge drop selection rejected");
+                return;
+            }
+        };
+        let files = self.files.handle.clone();
+        tokio::spawn(async move {
+            match files
+                .offer_local(selection, target, crate::files::OfferOrigin::Selection)
+                .await
+            {
+                Ok(offer) => tracing::info!(?offer, target = %name, "edge drop offered"),
+                Err(error) => {
+                    tracing::warn!(%error, target = %name, "edge drop could not be offered")
+                }
+            }
+        });
+    }
+
+    fn peer_has_files(&self, id: &MachineId) -> bool {
+        self.peers
+            .get(id)
+            .is_some_and(|peer| peer.connected && peer.caps.iter().any(|c| c == caps::FILES_V2))
     }
 
     async fn begin_edge(&mut self, edge_id: u32, along: f64, committed: bool) {
@@ -2133,6 +2197,21 @@ impl Inner {
             clipboard_sync: self.cfg.clipboard_sync,
             machines,
             edges,
+            edge_targets: self
+                .armed_specs
+                .iter()
+                .zip(&self.armed)
+                .map(|(spec, link)| crate::ui_state::UiEdgeTarget {
+                    target: link.to.clone(),
+                    side: spec.side,
+                    at: spec.at,
+                    from: spec.from,
+                    to: spec.to,
+                    crossable: self.cfg.master_enabled
+                        && self.links.contains(link)
+                        && self.peer_has_files(&link.to),
+                })
+                .collect(),
             source,
             focus,
             health: self.health.clone(),

@@ -252,6 +252,10 @@ pub enum PlatformEvent {
     SwitchTarget,
     RawCaptureFailed(Arc<raw::RawOperation>),
     Capture(CaptureEvent),
+    /// A native file drag was released on the armed edge `edge_id`. The engine offers the
+    /// selection to the machine across that edge. Portal-granted documents carry an open
+    /// file because their path is only valid while the granting drag session lives.
+    FileDrop { edge_id: u32, items: Vec<(std::path::PathBuf, Option<Arc<std::fs::File>>)> },
     /// Physical (non-injected) local input observed → engine may claim sourceness.
     /// Debounced ≥50 ms by the backend.
     PhysicalActivity,

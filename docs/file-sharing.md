@@ -6,13 +6,17 @@ Open **Files** in Splice to show the file shelf. Both computers need a matching 
 
 Choose the receiving computer, then drop files or folders into the shelf. Splice sends their names and sizes. The files stay on your computer, and their contents are not sent yet.
 
+You can also drag files toward the screen edge that faces the receiving computer. A drop ribbon appears along that edge; release the files on it to offer them to the computer across it, without opening the shelf. The receiving computer picks the offer up the same way as any other. This works on KDE and other layer-shell compositors, and on macOS. Contents are still only sent after the other computer accepts.
+
 On the receiving computer, the offer appears in its shelf. Choose how to receive it:
 
 - **Save to…** chooses a folder and starts the copy.
 - **Receive to clipboard** downloads the selection and puts the received files on the local clipboard. Paste them into a file manager afterward.
 - Drag the offer into a supported application. A fresh click and drag starts the receiving computer's native drag. The copy starts when the application requests the files after the drop.
 
-Dropping into Splice and picking up on the other computer are separate gestures. You can cross the screen boundary normally between them.
+Dropping into Splice and picking up on the other computer are separate gestures. You can cross the screen boundary normally between them. When an offer arrives, the receiving shelf opens on its own so the offer is waiting when you cross.
+
+A held file drag cannot follow the cursor across the boundary in one continuous motion. The computer running the drag owns the pointer until you release, so releasing onto the edge is what hands the files to Splice.
 
 ## Copy and paste
 

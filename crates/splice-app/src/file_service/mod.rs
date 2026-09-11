@@ -236,6 +236,7 @@ struct Runner {
     offers_snapshot: Option<String>,
     receipts_sent: Option<(u64, Option<TransferId>)>,
     peers_snapshot: Option<String>,
+    announced_offers: HashSet<FileOfferId>,
 }
 
 async fn disabled(
@@ -365,6 +366,7 @@ async fn run(
         offers_snapshot: None,
         receipts_sent: None,
         peers_snapshot: None,
+        announced_offers: HashSet::new(),
     };
     for view in runner.content.restored_views() {
         runner.restore_view(view);
@@ -1937,6 +1939,18 @@ impl Runner {
                 state: desc_state,
                 expires_at: Some((record.expires_unix_ms / 1000) as i64),
             });
+        }
+        let fresh: Vec<FileOfferId> = available
+            .iter()
+            .copied()
+            .filter(|id| !self.announced_offers.contains(id))
+            .collect();
+        self.announced_offers.retain(|id| available.contains(id));
+        if !fresh.is_empty() {
+            for id in fresh {
+                self.announced_offers.insert(id);
+            }
+            self.open_shelf();
         }
         let encoded = serde_json::to_string(&offers).unwrap_or_default();
         if self.offers_snapshot.as_deref() != Some(encoded.as_str()) {

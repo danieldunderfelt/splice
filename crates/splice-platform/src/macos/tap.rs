@@ -331,6 +331,9 @@ impl TapState {
     }
 
     fn edge_hit(&self, loc: CGPoint) -> Option<(u32, f64)> {
+        if super::file_drag_at_edge() {
+            return None;
+        }
         for (cx, cy) in self.corners.read().iter() {
             if (loc.x - cx).abs() <= CORNER_DEAD_ZONE && (loc.y - cy).abs() <= CORNER_DEAD_ZONE {
                 return None;

@@ -179,6 +179,53 @@ impl LocalSelection {
         }
     }
 
+    /// Builds a selection from dropped paths. A path that came with an open file is a
+    /// portal-granted document and is read through that file, never by path.
+    pub fn from_descriptors(
+        items: Vec<(PathBuf, Option<Arc<std::fs::File>>)>,
+    ) -> Result<Self, String> {
+        if items.is_empty() {
+            return Err("the selection contains no local files".into());
+        }
+        if items.len() > splice_proto::files::MAX_ROOTS {
+            return Err(format!(
+                "the selection has more than {} items",
+                splice_proto::files::MAX_ROOTS
+            ));
+        }
+        let mut roots = Vec::with_capacity(items.len());
+        for (path, file) in items {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| splice_proto::files::valid_name(name))
+                .ok_or_else(|| format!("{} has an unsupported name", path.display()))?
+                .to_owned();
+            let kind = match &file {
+                Some(file) => file
+                    .metadata()
+                    .map_err(|error| format!("{name}: {error}"))?
+                    .file_type(),
+                None => {
+                    if !path.is_absolute() {
+                        return Err(format!("{} is not an absolute path", path.display()));
+                    }
+                    std::fs::symlink_metadata(&path)
+                        .map_err(|error| format!("{}: {error}", path.display()))?
+                        .file_type()
+                }
+            };
+            if !kind.is_file() && !kind.is_dir() {
+                return Err(format!("{} is not a regular file or directory", path.display()));
+            }
+            roots.push(match file {
+                Some(file) => SelectedRoot::Open { name, file },
+                None => SelectedRoot::Path(path),
+            });
+        }
+        Ok(LocalSelection { roots, access: None })
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.roots.is_empty() && self.roots.len() <= splice_proto::files::MAX_ROOTS,

@@ -41,6 +41,19 @@ pub struct UiEdge {
     pub crossable: bool,
 }
 
+/// An armed local edge and the machine behind it, in this machine's logical coordinates.
+/// Native shells use it to place file drop targets on the edges.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UiEdgeTarget {
+    pub target: MachineId,
+    pub side: splice_platform::EdgeSide,
+    pub at: i32,
+    pub from: i32,
+    pub to: i32,
+    /// True when files released here reach `target` right now.
+    pub crossable: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum UiFocus {
     Local,
@@ -79,6 +92,8 @@ pub struct UiState {
     pub clipboard_sync: bool,
     pub machines: Vec<UiMachine>,
     pub edges: Vec<UiEdge>,
+    #[serde(default)]
+    pub edge_targets: Vec<UiEdgeTarget>,
     /// Which machine currently holds sourceness (None until first physical input).
     pub source: Option<MachineId>,
     pub focus: UiFocus,
@@ -114,6 +129,7 @@ impl UiState {
             clipboard_sync: true,
             machines: Vec::new(),
             edges: Vec::new(),
+            edge_targets: Vec::new(),
             source: None,
             focus: UiFocus::Local,
             health: HealthReport::default(),

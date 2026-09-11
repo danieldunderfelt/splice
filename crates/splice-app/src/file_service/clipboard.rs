@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use splice_core::files::{LocalSelection, ReceivedLease, SelectedRoot, TransferId};
+use splice_core::files::{LocalSelection, ReceivedLease, TransferId};
 use splice_core::EngineHandle;
 use splice_platform::linux::{fileclip, fileportal};
 use splice_platform::{ClipFetch, Clipboard, ClipboardOffer, ClipboardClock, ClipboardGuard, ClipboardObserver, Platform};
@@ -241,42 +241,12 @@ pub fn selection_with_descriptors(paths: Vec<PathBuf>, fds: Vec<OwnedFd>) -> Res
 }
 
 pub fn local_selection(items: Vec<(PathBuf, Option<OwnedFd>)>) -> Result<LocalSelection, String> {
-    if items.is_empty() {
-        return Err("the selection contains no local files".into());
-    }
-    if items.len() > splice_proto::files::MAX_ROOTS {
-        return Err(format!("the selection has more than {} items", splice_proto::files::MAX_ROOTS));
-    }
-    let mut roots = Vec::with_capacity(items.len());
-    for (path, fd) in items {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| splice_proto::files::valid_name(name))
-            .ok_or_else(|| format!("{} has an unsupported name", path.display()))?
-            .to_owned();
-        match fd {
-            Some(fd) => {
-                let file = std::fs::File::from(fd);
-                let kind = file.metadata().map_err(|error| format!("{name}: {error}"))?.file_type();
-                if !kind.is_file() && !kind.is_dir() {
-                    return Err(format!("{name} is not a regular file or directory"));
-                }
-                roots.push(SelectedRoot::Open { name, file: Arc::new(file) });
-            }
-            None => {
-                if !path.is_absolute() {
-                    return Err(format!("{} is not an absolute path", path.display()));
-                }
-                let kind = std::fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?.file_type();
-                if !kind.is_file() && !kind.is_dir() {
-                    return Err(format!("{} is not a regular file or directory", path.display()));
-                }
-                roots.push(SelectedRoot::Path(path));
-            }
-        }
-    }
-    Ok(LocalSelection { roots, access: None })
+    LocalSelection::from_descriptors(
+        items
+            .into_iter()
+            .map(|(path, fd)| (path, fd.map(|fd| Arc::new(std::fs::File::from(fd)))))
+            .collect(),
+    )
 }
 
 struct Representations {
@@ -380,6 +350,7 @@ pub async fn portal_available(shared: &ClipboardShared) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use splice_core::files::SelectedRoot;
     use std::sync::atomic::Ordering;
 
     #[test]

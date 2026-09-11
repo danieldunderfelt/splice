@@ -1037,7 +1037,7 @@ fn read_receivers(pb: &NSPasteboard) -> Vec<Retained<NSFilePromiseReceiver>> {
         .collect()
 }
 
-fn pasteboard_has_files(pb: &NSPasteboard) -> bool {
+pub(crate) fn pasteboard_has_files(pb: &NSPasteboard) -> bool {
     let Some(types) = pb.types() else { return false };
     let promise_types = NSFilePromiseReceiver::readableDraggedTypes();
     types.iter().any(|t| {
@@ -1188,6 +1188,7 @@ pub struct ShelfUi {
     user_hidden: bool,
     drags_active: usize,
     deferred: Option<Vec<RowModel>>,
+    edge_drops: super::edge_drop::EdgeDropPanels,
 }
 
 pub fn with_ui(ctx: &Arc<ShelfCtx>, f: impl FnOnce(&mut ShelfUi)) {
@@ -1301,6 +1302,7 @@ impl ShelfUi {
             user_hidden: false,
             drags_active: 0,
             deferred: None,
+            edge_drops: super::edge_drop::EdgeDropPanels::default(),
         }
     }
 
@@ -1366,6 +1368,10 @@ impl ShelfUi {
         let text = self.snapshot_error.clone().unwrap_or_default();
         self.status.setStringValue(&ns(&text));
         self.status.setToolTip(Some(&ns(&text)));
+    }
+
+    pub fn set_edge_targets(&mut self, targets: Vec<crate::file_shelf::EdgeTarget>) {
+        self.edge_drops.apply(self.mtm, &self.ctx, targets);
     }
 
     pub fn set_visible_by_user(&mut self, visible: bool) {

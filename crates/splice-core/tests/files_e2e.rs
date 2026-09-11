@@ -1795,3 +1795,82 @@ async fn early_native_invalidation_retires_source_before_slow_capture_finishes()
     assert_ne!(old, new);
     assert_eq!(a.engine.files().state().borrow().payload_bytes_sent, 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_dropped_on_an_edge_are_offered_to_the_machine_across_it() {
+    let _serial = FILE_TEST_LOCK.lock().await;
+    let (a, b) = pair().await;
+    let source = tempfile::tempdir().unwrap();
+    let one = source.path().join("edge-one.txt");
+    let two = source.path().join("edge-two.txt");
+    std::fs::write(&one, b"first").unwrap();
+    std::fs::write(&two, b"second").unwrap();
+
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    until("source edge armed", || {
+        !a.mock.state.lock().edges.is_empty()
+    })
+    .await;
+    let edge = a.mock.state.lock().edges[0].clone();
+
+    a.mock
+        .events
+        .send(PlatformEvent::FileDrop {
+            edge_id: edge.id,
+            items: vec![(one.clone(), None), (two.clone(), None)],
+        })
+        .unwrap();
+
+    until("edge-drop offer delivered", || {
+        b.engine
+            .files()
+            .state()
+            .borrow()
+            .offers
+            .iter()
+            .any(|offer| {
+                offer.recipient == MachineId("files-b".into())
+                    && offer.owner == MachineId("files-a".into())
+                    && {
+                        let roots: std::collections::BTreeSet<&str> = offer
+                            .manifest
+                            .entries
+                            .iter()
+                            .filter(|entry| entry.parent.is_none())
+                            .map(|entry| entry.name.as_str())
+                            .collect();
+                        roots.contains("edge-one.txt") && roots.contains("edge-two.txt")
+                    }
+            })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_dropped_on_an_edge_to_a_disconnected_peer_make_no_offer() {
+    let _serial = FILE_TEST_LOCK.lock().await;
+    let (a, _b) = pair().await;
+    let source = tempfile::tempdir().unwrap();
+    let file = source.path().join("lonely.txt");
+    std::fs::write(&file, b"nobody home").unwrap();
+
+    a.mock.events.send(PlatformEvent::PhysicalActivity).unwrap();
+    until("source edge armed", || {
+        !a.mock.state.lock().edges.is_empty()
+    })
+    .await;
+
+    a.mock
+        .events
+        .send(PlatformEvent::FileDrop {
+            edge_id: 4242,
+            items: vec![(file, None)],
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        a.engine.files().state().borrow().offers.is_empty(),
+        "an unknown edge must not create an offer"
+    );
+}

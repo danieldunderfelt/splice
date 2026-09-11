@@ -35,18 +35,26 @@ use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use smithay_client_toolkit::data_device_manager::data_device::{DataDevice, DataDeviceHandler};
+use smithay_client_toolkit::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
+use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
+use smithay_client_toolkit::data_device_manager::{DataDeviceManagerState, WritePipe};
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer,
+    delegate_compositor, delegate_data_device, delegate_layer, delegate_output, delegate_pointer,
     delegate_pointer_constraints, delegate_registry, delegate_relative_pointer, delegate_seat,
     delegate_shm, registry_handlers,
 };
 use splice_proto::{InputEvent, PointerButton, Vec2};
 use tokio::sync::oneshot;
 use wayland_client::globals::{registry_queue_init, GlobalList};
-use wayland_client::protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
+use wayland_client::protocol::wl_data_device_manager::DndAction;
+use wayland_client::protocol::{
+    wl_data_device, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
+    wl_surface,
+};
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
@@ -59,11 +67,21 @@ use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v
 
 use super::backends::Driven;
 use super::{PanicRelease, Shared, Stop};
+use crate::files::{parse_uri_list, MIME_URI_LIST};
 use crate::{Capture, CaptureEvent, EdgeSide, EdgeSpec, PlatformError, PlatformEvent, Result};
 
 /// Strip thickness in logical px. 1 px strips are unreachable on fractionally scaled
 /// outputs on some compositors; 2 px is lan-mouse's field-tested value.
 const STRIP_THICKNESS: u32 = 2;
+/// Thickness of the drop ribbon a strip blooms into when a native file drag reaches the
+/// edge: wide enough to release onto comfortably, gone the moment the drag ends.
+const CATCH_THICKNESS: u32 = 72;
+/// Premultiplied ARGB8888 little-endian bytes for the drop ribbon: translucent accent blue.
+const CATCH_FILL: [u8; 4] = [147, 78, 35, 153];
+/// Longest the capture thread will wait on a dropped file list before giving up.
+const DROP_READ_BUDGET: Duration = Duration::from_millis(500);
+/// A `text/uri-list` for a file selection is small; never buffer an unbounded stream.
+const MAX_DROP_LIST: usize = 64 * 1024;
 /// After handing the pointer back, the strip stays disarmed until the pointer leaves
 /// it, or this long: most compositors clamp the position hint to the strip itself.
 const REARM_TIMEOUT: Duration = Duration::from_millis(750);
@@ -231,6 +249,10 @@ struct State {
     pressed: HashSet<u32>,
     /// Strip disarmed after a release until the pointer leaves it or the deadline passes.
     rearm: Option<(wl_surface::WlSurface, Instant)>,
+    data_device_manager: DataDeviceManagerState,
+    data_device: Option<DataDevice>,
+    /// Index of the strip a native file drag is currently hovering, bloomed into a ribbon.
+    catching: Option<usize>,
     running: bool,
 }
 
@@ -314,6 +336,7 @@ impl State {
         self.strips.clear();
         self.focus = None;
         self.rearm = None;
+        self.catching = None;
         let outputs: Vec<(wl_output::WlOutput, OutputInfo)> = self
             .outputs
             .outputs()
@@ -371,7 +394,13 @@ impl State {
             self.shared.set_health(|h| h.capture = Some("cannot allocate edge strip buffer".into()));
             return;
         };
-        canvas.fill(0);
+        if self.catching == Some(index) {
+            for pixel in canvas.as_chunks_mut::<4>().0 {
+                *pixel = CATCH_FILL;
+            }
+        } else {
+            canvas.fill(0);
+        }
         let strip = &self.strips[index];
         let surface = strip.layer.wl_surface();
         if buffer.attach_to(surface).is_err() {
@@ -512,6 +541,65 @@ impl State {
         self.apply_pending_edges(qh);
     }
 
+    /// Grow the strip at `index` into a drop ribbon (or restore it) and repaint. The
+    /// ribbon grows inward from the anchored edge, so the pointer, held at the edge by the
+    /// drag, stays over the surface and the compositor keeps it as the drag target.
+    fn set_catch(&mut self, index: usize, active: bool) {
+        let Some(strip) = self.strips.get(index) else {
+            return;
+        };
+        let span = (strip.geom.edge.to - strip.geom.edge.from).max(1) as u32;
+        let thick = if active { CATCH_THICKNESS } else { STRIP_THICKNESS };
+        let size = match strip.geom.edge.side {
+            EdgeSide::Left | EdgeSide::Right => (thick, span),
+            EdgeSide::Top | EdgeSide::Bottom => (span, thick),
+        };
+        self.strips[index].geom.size = size;
+        self.strips[index].layer.set_size(size.0, size.1);
+        self.catching = active.then_some(index);
+        self.strips[index].layer.commit();
+        self.paint(index);
+    }
+
+    fn clear_catch(&mut self) {
+        if let Some(index) = self.catching.take() {
+            self.set_catch(index, false);
+        }
+    }
+
+    /// A native file drag was released on a strip: read its file list, open any
+    /// portal-granted documents while the session is still alive, and offer the
+    /// selection to the machine across that edge.
+    fn deliver_drop(&mut self, conn: &Connection, index: usize) {
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else {
+            self.clear_catch();
+            return;
+        };
+        let edge_id = match self.strips.get(index) {
+            Some(strip) => strip.geom.edge.id,
+            None => {
+                self.clear_catch();
+                return;
+            }
+        };
+        let list = match read_offer(conn, &offer, MIME_URI_LIST) {
+            Ok(list) => list,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot read the dropped file list");
+                offer.finish();
+                self.clear_catch();
+                return;
+            }
+        };
+        offer.finish();
+        let items = collect_items(&parse_uri_list(&list));
+        self.clear_catch();
+        if items.is_empty() {
+            return;
+        }
+        self.shared.emit(PlatformEvent::FileDrop { edge_id, items });
+    }
+
     fn forward(&self, ev: InputEvent) {
         self.shared.emit(PlatformEvent::Capture(CaptureEvent::Input(ev)));
     }
@@ -592,6 +680,8 @@ fn run(
         let constraints = PointerConstraintsState::bind(&globals, &qh);
         let relative = RelativePointerState::bind(&globals, &qh);
         let shortcuts = bind_shortcuts_inhibit(&globals, &qh);
+        let data_device_manager = DataDeviceManagerState::bind(&globals, &qh)
+            .map_err(|e| unavailable("wl_data_device_manager", &e))?;
         let event_loop: EventLoop<State> =
             EventLoop::try_new().map_err(|e| unavailable("event loop", &e))?;
         WaylandSource::new(conn.clone(), queue)
@@ -622,6 +712,9 @@ fn run(
             locked: None,
             pressed: HashSet::new(),
             rearm: None,
+            data_device_manager,
+            data_device: None,
+            catching: None,
             running: true,
         };
         for seat in state.seats.seats().collect::<Vec<_>>() {
@@ -721,8 +814,9 @@ impl SeatHandler for State {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seats
     }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.seat.is_none() {
+            self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
             self.seat = Some(seat);
         }
     }
@@ -967,6 +1061,145 @@ impl Dispatch<ZwpKeyboardShortcutsInhibitorV1, ()> for State {
     fn event(_: &mut Self, _: &ZwpKeyboardShortcutsInhibitorV1, _: zwp_keyboard_shortcuts_inhibitor_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 
+/// Reads a drag offer representation without ever blocking the capture thread past
+/// `DROP_READ_BUDGET`: the pipe is polled non-blocking so a stalled source cannot freeze
+/// edge crossing. A uri-list is tiny and normally arrives in well under a millisecond.
+fn read_offer(conn: &Connection, offer: &DragOffer, mime: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    let pipe = offer.receive(mime.to_owned())?;
+    let _ = conn.flush();
+    let mut file = std::fs::File::from(std::os::fd::OwnedFd::from(pipe));
+    let fd = file.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let deadline = Instant::now() + DROP_READ_BUDGET;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the drag source did not send its file list in time",
+                    ));
+                }
+                let mut poll_fd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+                unsafe {
+                    libc::poll(&mut poll_fd, 1, millis);
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+        if body.len() > MAX_DROP_LIST {
+            break;
+        }
+    }
+    Ok(body)
+}
+
+fn portal_doc_path(path: &std::path::Path) -> bool {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
+        .is_some_and(|dir| path.starts_with(std::path::PathBuf::from(dir).join("doc")))
+}
+
+/// Turn dropped `file://` paths into offer roots. A portal-granted document path is only
+/// valid while the drag session lives, so its file is opened now and carried by descriptor.
+fn collect_items(
+    paths: &[std::path::PathBuf],
+) -> Vec<(std::path::PathBuf, Option<Arc<std::fs::File>>)> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            if portal_doc_path(path) {
+                match std::fs::File::open(path) {
+                    Ok(file) => Some((path.clone(), Some(Arc::new(file)))),
+                    Err(err) => {
+                        tracing::warn!(path = %path.display(), error = %err, "cannot open dropped portal document");
+                        None
+                    }
+                }
+            } else {
+                Some((path.clone(), None))
+            }
+        })
+        .collect()
+}
+
+impl DataDeviceHandler for State {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_device::WlDataDevice,
+        _: f64,
+        _: f64,
+        surface: &wl_surface::WlSurface,
+    ) {
+        let Some(index) = self.strips.iter().position(|s| s.layer.wl_surface() == surface) else {
+            return;
+        };
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else {
+            return;
+        };
+        if !offer.with_mime_types(|mimes| mimes.iter().any(|m| m == MIME_URI_LIST)) {
+            offer.accept_mime_type(offer.serial, None);
+            return;
+        }
+        offer.accept_mime_type(offer.serial, Some(MIME_URI_LIST.to_owned()));
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        self.set_catch(index, true);
+    }
+
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        self.clear_catch();
+    }
+
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice, _: f64, _: f64) {
+        if self.catching.is_some() {
+            if let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) {
+                offer.set_actions(DndAction::Copy, DndAction::Copy);
+            }
+        }
+    }
+
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
+
+    fn drop_performed(&mut self, conn: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {
+        let Some(index) = self.catching else {
+            return;
+        };
+        self.deliver_drop(conn, index);
+    }
+}
+
+impl DataOfferHandler for State {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, offer: &mut DragOffer, _: DndAction) {
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+    }
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+}
+
+impl DataSourceHandler for State {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: Option<String>) {}
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: String, _: WritePipe) {}
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {}
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_source::WlDataSource, _: DndAction) {}
+}
+
 delegate_compositor!(State);
 delegate_output!(State);
 delegate_shm!(State);
@@ -975,6 +1208,7 @@ delegate_pointer!(State);
 delegate_relative_pointer!(State);
 delegate_pointer_constraints!(State);
 delegate_layer!(State);
+delegate_data_device!(State);
 delegate_registry!(State);
 
 #[cfg(test)]
